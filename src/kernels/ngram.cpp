@@ -371,4 +371,7 @@ void PleTable::gather(const uint32_t* rows16, float* out2560) const {
     for (int h = 0; h < PLE_N_HEADS; ++h) read_row(rows16[h], out2560 + (size_t) h * PLE_HEAD_DIM);
 }
 
+uint32_t PleTable::row_bytes() const { return impl_->row_bytes; }
+const char* PleTable::format_name() const { return impl_->q8 ? "Q8_0" : "IQ4_NL"; }
+
 }  // namespace strata::kernels
