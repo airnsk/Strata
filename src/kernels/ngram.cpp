@@ -201,7 +201,8 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
         delete impl_->file;
         impl_->file = nullptr;
         impl_->data = nullptr;
-        if (!impl_->reader.open(gguf_path, table_offset, n_rows, io.max_inflight, io.cache_rows, err, io.io_thread)) {
+        if (!impl_->reader.open(gguf_path, table_offset, n_rows, impl_->row_bytes, io.max_inflight,
+                                io.cache_rows, err, io.io_thread)) {
             close();
             return false;
         }

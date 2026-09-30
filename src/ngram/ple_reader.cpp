@@ -143,6 +143,7 @@ struct PleReader::Impl {
     }
 
     bool finish(const Completion& c) {
+        Impl& m = *this;
         const uint32_t s = (uint32_t) c.tag;
         Job& j = inflight[s];
         if (!c.ok) {
