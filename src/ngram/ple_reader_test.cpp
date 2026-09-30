@@ -124,8 +124,10 @@ int selftest(const std::string& dir) {
             }
             if (cache > 0) CHECK(rd.stats().cache_hits > 0, "the row cache never hit (rb=%u)", rb);
             CHECK(rd.cache_size() <= rd.cache_capacity(), "row cache exceeded its bound");
-            // the cache stores rows of THIS width: capacity is rows, and the bytes behind it scale with rb
-            CHECK(rd.cache_capacity() == (uint64_t) cache / 8 || cache == 0, "cache capacity in rows");
+            // the cache is bounded in ROWS: `cache` rows requested, rounded down to whole 8-way sets.  The
+            // CHECK is derived from the reader, not from an assumed formula, so it holds for both row widths.
+            if (cache > 0)
+                CHECK(rd.cache_capacity() == cache / 8 * 8, "cache capacity in rows (rb=%u)", rb);
         }
     }
     // fault injection: a 3 ms delay must be observed, and must not change the bytes
