@@ -2178,8 +2178,9 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata generate: the PLE run is not ready after construction\n");
                 return 1;
             }
-            std::fprintf(stderr, "strata generate: PLE on, table %llu rows of %s\n",
-                         (unsigned long long) ple_table.rows(), o.ple_gguf.c_str());
+            std::fprintf(stderr, "strata generate: PLE on, table %llu rows of %s (%s, %u B/row)\n",
+                         (unsigned long long) ple_table.rows(), o.ple_gguf.c_str(), ple_table.format_name(),
+                         (unsigned) ple_table.row_bytes());
         }
     }
     for (size_t i = 0; i < stages.size(); ++i) {
