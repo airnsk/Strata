@@ -175,8 +175,18 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
         close();
         return false;
     }
-    if (std::strcmp(t->type_name(), "IQ4_NL") != 0) {
-        err = std::string("per_layer_token_embd.weight is ") + t->type_name() + ", not IQ4_NL";
+    // THE TYPE GATE. Two artifacts of the same table exist and both are legitimate: the 28.8 GB IQ4_NL shard
+    // (90 B/row) and the 54.4 GB Q8_0 one (170 B/row). The width is taken from the tensor's own type; any
+    // other type is refused HERE rather than decoded as if it were one of these two.
+    const char* tn = t->type_name();
+    if (std::strcmp(tn, "IQ4_NL") == 0) {
+        impl_->q8 = false;
+        impl_->row_bytes = (uint32_t) PLE_ROW_BYTES_IQ4_NL;
+    } else if (std::strcmp(tn, "Q8_0") == 0) {
+        impl_->q8 = true;
+        impl_->row_bytes = (uint32_t) PLE_ROW_BYTES_Q8_0;
+    } else {
+        err = std::string("per_layer_token_embd.weight is ") + tn + ", not IQ4_NL or Q8_0";
         close();
         return false;
     }
@@ -191,15 +201,15 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
     // assumed.  A wrong data offset would leave a different remainder.
     // A shard may hold other tensors too (Swift 1.5's shard 1 holds layers 0-12 and the table): the table must
     // then fit inside the file at its own offset; alone in its shard (the original's shard 2) it fills it exactly.
-    const uint64_t need = impl_->n_rows * (uint64_t) PLE_ROW_BYTES;
+    const uint64_t need = impl_->n_rows * (uint64_t) impl_->row_bytes;
     const uint64_t have = impl_->file->file_size() - impl_->file->data_start();
     const bool alone = impl_->file->tensors().size() == 1;
     if (alone ? need != have : t->offset + need > have) {
         char buf[256];
         std::snprintf(buf, sizeof buf,
-                      "PLE table size mismatch: %llu rows x %d B = %llu at offset %llu, but the file holds %llu from "
+                      "PLE table size mismatch: %llu rows x %u B = %llu at offset %llu, but the file holds %llu from "
                       "data_start %llu",
-                      (unsigned long long) impl_->n_rows, PLE_ROW_BYTES, (unsigned long long) need,
+                      (unsigned long long) impl_->n_rows, (unsigned) impl_->row_bytes, (unsigned long long) need,
                       (unsigned long long) t->offset, (unsigned long long) have,
                       (unsigned long long) impl_->file->data_start());
         err = buf;
@@ -294,8 +304,8 @@ bool PleTable::issue(const uint32_t* rows16) {
         ULONG_PTR n = 0;
         for (int h = 0; h < PLE_N_HEADS; ++h) {
             if (rows16[h] >= impl_->n_rows) continue;
-            ranges[n].VirtualAddress = (PVOID) (impl_->data + (size_t) rows16[h] * PLE_ROW_BYTES);
-            ranges[n].NumberOfBytes = PLE_ROW_BYTES;
+            ranges[n].VirtualAddress = (PVOID) (impl_->data + (size_t) rows16[h] * impl_->row_bytes);
+            ranges[n].NumberOfBytes = impl_->row_bytes;
             ++n;
         }
         if (n > 0) (void) PrefetchVirtualMemory(GetCurrentProcess(), n, ranges, 0);
