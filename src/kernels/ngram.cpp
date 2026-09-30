@@ -128,11 +128,19 @@ struct PleTable::Impl {
     // Direct mode (plan v0.3 P2): the mapping above is released after the header parse and every row comes
     // from an unbuffered SSD read into `raw`.
     PleIo mode = PleIo::Mmap;
+    bool q8 = false;                               // the table's quant: false = IQ4_NL (90 B), true = Q8_0 (170 B)
+    uint32_t row_bytes = PLE_ROW_BYTES;            // taken from the tensor type, never assumed
     strata::ngram::PleReader reader;
     strata::ngram::PleReader::Ticket ticket;
     bool pending = false;
     uint32_t rows[PLE_N_HEADS] = {};
-    uint8_t raw[PLE_N_HEADS * PLE_ROW_BYTES] = {};
+    uint8_t raw[PLE_N_HEADS * PLE_ROW_BYTES_MAX] = {};
+
+    /// One raw row -> 160 floats, in the artifact's own quant. The only place the two formats differ.
+    void dequant(const uint8_t* row, float* out160) const {
+        if (q8) q8_0_dequant_row(row, out160);
+        else iq4nl_dequant_row(row, out160);
+    }
 };
 
 PleTable::PleTable() : impl_(new Impl) {}
