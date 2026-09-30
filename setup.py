@@ -19,7 +19,10 @@ What the first run does (each step is skipped when it is already done):
   6. prepares the model for Strata and fetches the MTP draft layer (~5 GB, from the original Qwen checkpoint)
   7. writes run-<model>.bat / run-<model>.sh and starts the model
 
-Options: --family qwen|swift, --model Q2_0|IQ2_XS|IQ3_XXS|IQ3_S, --context 32768, --vision yes|no|gpu|cpu, --port 8080, --yes (recommended
+Options: --family qwen|swift, --model Q2_0|IQ2_XS|IQ3_XXS|IQ3_S, --context 32768, --rope-scaling none|linear|yarn
+(--rope-scale F; past the trained 262144 the setup adds yarn and the factor is the final context over 262144,
+at least 1 - an explicit --rope-scaling none is refused for such a context), --vision yes|no|gpu|cpu, --port
+8080, --yes (recommended
 answers, no questions), --setup (install another model / change settings instead of starting), --no-start,
 --host 0.0.0.0 --api-key KEY (reach it from other devices on your network), --experimental-speed-projection on|off
 (EXPERIMENTAL, off by default),
@@ -58,7 +61,7 @@ PREBUILT_ASSET = "strata-windows-x64.zip" if WIN else "strata-linux-x64.zip"
 # the CUDA libraries the ready-made engine loads (the same CUDA 13.0 it is built with), from NVIDIA's pip packages
 CUDA_WHEELS = ["nvidia-cublas==13.0.2.14", "nvidia-cuda-runtime==13.0.96"]
 MIN_DRIVER = 580                       # CUDA 13.0
-MIN_ENGINE = (0, 1, 29)                # v0.1.29: sampled answers faster (split top-k), #154 correctness fixes; v0.1.28: the expert cache reserves the draft head, a cancelled request no longer fails the next; v0.1.27: RTX 20 (sm_75) in the ready-made engine, the HIP build without CUDA headers; v0.1.26: the draft layer's prompt pass in batches; v0.1.25: faster prompts (grouping off the copy engine, fused hyper-connection kernels), AMD HIP backend, --kv k8v4; v0.1.24: long prompts faster (QSA select on tensor cores); v0.1.23: image requests honor sampling, 8 GB cards start, batched verify window; v0.1.22: faster prompts (tensor-core attention), multi-GPU across images/steering/KV streaming; v0.1.21: multi-GPU layer split (--gpus); v0.1.20: system-prompt checkpoint, PCIe probe, hit rate; v0.1.19: penalties
+MIN_ENGINE = (0, 1, 30)                # v0.1.30: short prompts faster (streaming from 1024 tokens), resident low-RAM variant, multi-GPU session carve, RDNA4; v0.1.29: sampled answers faster (split top-k), #154 correctness fixes; v0.1.28: the expert cache reserves the draft head, a cancelled request no longer fails the next; v0.1.27: RTX 20 (sm_75) in the ready-made engine, the HIP build without CUDA headers; v0.1.26: the draft layer's prompt pass in batches; v0.1.25: faster prompts (grouping off the copy engine, fused hyper-connection kernels), AMD HIP backend, --kv k8v4; v0.1.24: long prompts faster (QSA select on tensor cores); v0.1.23: image requests honor sampling, 8 GB cards start, batched verify window; v0.1.22: faster prompts (tensor-core attention), multi-GPU across images/steering/KV streaming; v0.1.21: multi-GPU layer split (--gpus); v0.1.20: system-prompt checkpoint, PCIe probe, hit rate; v0.1.19: penalties
 PY_PACKAGES = ["numpy", "jinja2", "regex", "pyyaml", "tqdm", "requests", "cmake", "ninja", "pillow", "psutil"]
 
 MODELS = {
@@ -77,7 +80,12 @@ MODELS = {
     "IQ1_M": {"about": "the Coder's only size: half the experts, stored like IQ3_S (3.5 bits)", "download_gb": 58.4,
               "ram_gb": 32, "arena_gb": 23.4, "families": ("coder",)},
 }
-CONTEXTS = [8192, 32768, 65536, 131072, 262144]
+# Contexts past 262144 (the model's trained length) extend it by rope scaling: for the context it will
+# serve the setup resolves the method (yarn, or one question when interactive) and derives the factor
+# from the final context (final / 262144, at least 1) itself (below), keeps an explicit
+# --rope-scaling/--rope-scale, and refuses an explicit --rope-scaling none there - the stock angles past
+# the trained range are out of spec.
+CONTEXTS = [8192, 32768, 65536, 131072, 262144, 393216, 524288]
 # The model families: the same architecture, weights in the same three GSQ-RCO sizes, different files.
 FAMILIES = {
     "qwen": {"title": "Qwen3.8-Flash-Next", "by": "Qwen; GSQ-RCO quants by ISTA-DASLab",
@@ -701,13 +709,22 @@ def cuda_lib_dirs():
 
 
 # ------------------------------------------------------------------------------------------------ AMD (experimental)
-# The RX 7900 XT / XTX (gfx1100) on Linux, through the HIP backend (docs/AMD_HIP.md).  There is no ready-made AMD
-# engine: ROCm comes from AMD's TheRock Python wheels into .venv (no sudo; a system ROCm in /opt/rocm is used when it
-# has hipcc and hipBLAS) and the engine is compiled here.  One GPU, no images yet.
-ROCM_INDEX = os.environ.get("STRATA_ROCM_INDEX", "https://rocm.nightlies.amd.com/v2/gfx110X-dgpu/")
+# The RX 7900 XT / XTX (gfx1100) and the RX 9070 series / Radeon AI PRO R9700 (gfx1201) on Linux, through the HIP
+# backend (docs/AMD_HIP.md).  There is no ready-made AMD engine: ROCm comes from AMD's TheRock Python wheels into .venv
+# (no sudo; a system ROCm 7 in /opt/rocm is used when it has hipcc and hipBLAS) and the engine is compiled here for
+# the card.  One GPU, no images yet.
+ROCM_INDEXES = {"gfx1100": "https://rocm.nightlies.amd.com/v2/gfx110X-dgpu/",   # TheRock's wheels per GPU family
+                "gfx1201": "https://rocm.nightlies.amd.com/v2/gfx120X-all/"}
 ROCM_VERSION = os.environ.get("STRATA_ROCM_VERSION", "7.10.0a20251120")   # what Strata's HIP build was tested with
-AMD_ARCHS = ("gfx1100",)
-AMD_NAMES = {"gfx1100": "AMD Radeon RX 7900 series (gfx1100)"}   # when sysfs has no product name
+ROCM_SYSTEM_MIN = (7, 0)       # an older system ROCm is passed over for the wheels (gfx1201 needs ROCm 6.4 or newer)
+AMD_ARCHS = ("gfx1100", "gfx1201")
+AMD_NAMES = {"gfx1100": "AMD Radeon RX 7900 series (gfx1100)",   # when sysfs has no product name
+             "gfx1201": "AMD Radeon RX 9070 series / AI PRO R9700 (gfx1201)"}
+AMD_CARDS = "the RX 7900 XT / XTX (gfx1100) and the RX 9070 / 9070 XT / Radeon AI PRO R9700 (gfx1201)"
+
+
+def rocm_index(arch):
+    return os.environ.get("STRATA_ROCM_INDEX") or ROCM_INDEXES[arch]
 
 
 def amd_gpus():
@@ -747,33 +764,86 @@ def amd_gpus():
 
 def amd_problem(g):
     if g["arch"] not in AMD_ARCHS:
-        return (f"not supported - Strata's AMD backend runs on the RX 7900 XT / XTX ({', '.join(AMD_ARCHS)}) only, "
-                f"this is {g['arch']}")
+        return f"not supported - Strata's AMD backend runs on {AMD_CARDS} only, this is {g['arch']}"
     return None
 
 
-def rocm_root():
-    """ROCm for compiling and running the HIP engine: (root, library folders).  A system ROCm with hipcc and hipBLAS,
-    else AMD's TheRock wheels (ROCM_VERSION, from ROCM_INDEX) installed into .venv."""
+def rocm_version(root):
+    """(major, minor) of a ROCm install, from rocm-core's header; None when it has none."""
+    try:
+        text = (Path(root) / "include" / "rocm-core" / "rocm_version.h").read_text()
+        return tuple(int(re.search(rf"#define\s+ROCM_VERSION_{k}\s+(\d+)", text).group(1)) for k in ("MAJOR", "MINOR"))
+    except (OSError, AttributeError, ValueError):
+        return None
+
+
+def rocm_root(arch):
+    """ROCm for compiling and running the HIP engine for `arch`: (root, library folders).  A system ROCm 7 with hipcc
+    and hipBLAS, else AMD's TheRock wheels (ROCM_VERSION, from the card family's index) installed into .venv."""
     sysroot = Path(os.environ.get("ROCM_PATH") or "/opt/rocm")
     if (sysroot / "bin" / "hipcc").exists() and list((sysroot / "lib").glob("libhipblas.so*")):
-        return sysroot, [str(sysroot / "lib")]
+        ver = rocm_version(sysroot)
+        if ver is None or ver >= ROCM_SYSTEM_MIN:
+            return sysroot, [str(sysroot / "lib")]
+        warn(f"the ROCm in {sysroot} is {ver[0]}.{ver[1]}; Strata needs {ROCM_SYSTEM_MIN[0]}.{ROCM_SYSTEM_MIN[1]} or "
+             "newer: using AMD's wheels in .venv instead")
+    index = rocm_index(arch)
     stamp = Path(sys.prefix) / ".strata-rocm.json"
-    if not stamp.exists() or json.loads(stamp.read_text()).get("version") != ROCM_VERSION:
+    have = json.loads(stamp.read_text()) if stamp.exists() else {}
+    if have.get("version") != ROCM_VERSION or have.get("index") != index:
         say(f"  Installing ROCm {ROCM_VERSION} for AMD GPUs into .venv (AMD's TheRock wheels, ~10 GB, no sudo) ...")
-        run([sys.executable, "-m", "pip", "install", "--quiet", "--disable-pip-version-check", "--index-url",
-             ROCM_INDEX, f"rocm[libraries,devel]=={ROCM_VERSION}"])
-        stamp.write_text(json.dumps({"version": ROCM_VERSION, "index": ROCM_INDEX}))
+        pip = [sys.executable, "-m", "pip", "install", "--quiet", "--disable-pip-version-check", "--index-url", index]
+        if have.get("version") == ROCM_VERSION:        # the same version for another GPU family: its own libraries
+            run(pip + ["--force-reinstall", "--no-deps", f"rocm=={ROCM_VERSION}"])
+        run(pip + [f"rocm[libraries,devel]=={ROCM_VERSION}"])
+        stamp.write_text(json.dumps({"version": ROCM_VERSION, "index": index}))
     sdk = Path(sys.executable).parent / "rocm-sdk"
     root = Path(out([str(sdk), "path", "--root"]).strip())
     if not (root / "llvm" / "bin" / "clang++").exists():
         fail(f"ROCm was installed but its compiler is missing ({root})",
              f"remove {stamp} and run this again; or install ROCm 7 system-wide")
+    # the card family's libraries only (gfx120X-all -> _rocm_sdk_libraries_gfx120X_all): another family's
+    # libhipblaslt.so first on the path would have no kernels for this card
+    family = "_rocm_sdk_libraries_" + index.rstrip("/").rsplit("/", 1)[-1].replace("-", "_")
     dirs = [str(root / "lib")]
     for sp in {Path(p) for p in sys.path if p.endswith("site-packages")}:
-        dirs += [str(d / "lib") for d in sorted(sp.glob("_rocm_sdk_libraries_*")) if (d / "lib").is_dir()]
+        libs = sorted(sp.glob("_rocm_sdk_libraries_*"))
+        libs = [d for d in libs if d.name.lower() == family.lower()] or libs
+        dirs += [str(d / "lib") for d in libs if (d / "lib").is_dir()]
     ok(f"ROCm: {root}")
     return root, list(dict.fromkeys(dirs))
+
+
+def hipblaslt_version(lib_dirs):
+    """The installed hipBLASLt's version as the engine reads it (hipblasLtGetVersion: 1.4.1 -> 100401), from the
+    header of the ROCm whose libraries the engine loads; None when not found."""
+    for d in lib_dirs:
+        try:
+            text = (Path(d).parent / "include" / "hipblaslt" / "hipblaslt-version.h").read_text()
+            v = [int(re.search(rf"#define\s+HIPBLASLT_VERSION_{k}\s+(\d+)", text).group(1))
+                 for k in ("MAJOR", "MINOR", "PATCH")]
+        except (OSError, AttributeError, ValueError):
+            continue
+        return v[0] * 100000 + v[1] * 100 + v[2]
+    return None
+
+
+def hipblaslt_table(arch, lib_dirs):
+    """tools/hip/<arch>-hipblaslt-<version>.txt for this card AND the installed hipBLASLt, else None: its solution
+    ids are valid only for that pair (the engine refuses any other table and uses plain hipBLAS)."""
+    ver = hipblaslt_version(lib_dirs)
+    table = ROOT / "tools" / "hip" / f"{arch}-hipblaslt-{ver}.txt"
+    if ver is not None and table.exists():
+        head = table.read_text().split("\n", 2)[:2]
+        if f"STRATA_HIPBLASLT_TUNING_V1 {arch} {ver}" in (h.strip() for h in head):
+            ok(f"hipBLASLt tuning table: {table.name} (faster prompts)")
+            return table
+    have = sorted(p.name for p in (ROOT / "tools" / "hip").glob(f"{arch}-hipblaslt-*.txt"))
+    warn(f"no hipBLASLt tuning table for {arch} with hipBLASLt {ver or '(version unknown)'}"
+       + (f" (have: {', '.join(have)})" if have else "")
+       + ": the prompt's dense matrix products use plain hipBLAS (tools/hip/tune_hipblaslt makes a table: "
+         "docs/AMD_HIP.md, Tuning table)")
+    return None
 
 
 def build_engine_hip(gpu, llama) -> Path:
@@ -783,13 +853,13 @@ def build_engine_hip(gpu, llama) -> Path:
     stamp = eng / "BUILD.json"
     meta = json.loads(stamp.read_text()) if stamp.exists() else {}
     src = source_hash(ENGINE_SOURCES)
-    if meta.get("backend") == "hip" and (eng / EXE).exists() and meta.get("src") == src:
+    if meta.get("backend") == "hip" and (eng / EXE).exists() and meta.get("src") == src and             gpu["arch"] in meta.get("archs", []):
         ok("engine already built for this PC")
         return eng
     if not (shutil.which("c++") or shutil.which("g++")) or not shutil.which("git"):
         fail("a C++ compiler and git are needed to compile the AMD engine",
              "Ubuntu/Debian: sudo apt install build-essential git   Fedora: sudo dnf install gcc-c++ git")
-    root, dirs = rocm_root()
+    root, dirs = rocm_root(gpu["arch"])
     libs = [str(Path(d).parent) for d in dirs[1:]]
     bitcode = next((p for p in (root / "lib" / "llvm" / "amdgcn" / "bitcode", root / "amdgcn" / "bitcode") if p.is_dir()),
                    root / "amdgcn" / "bitcode")
@@ -798,7 +868,7 @@ def build_engine_hip(gpu, llama) -> Path:
     os.environ["LD_LIBRARY_PATH"] = os.pathsep.join(dirs + [os.environ.get("LD_LIBRARY_PATH", "")]).rstrip(os.pathsep)
     os.environ["PATH"] = os.pathsep.join([str(root / "bin"), str(root / "llvm" / "bin"), os.environ.get("PATH", "")])
     say("  The engine's source changed: compiling it again (only what changed, a few minutes) ..."
-        if meta.get("backend") == "hip" and (eng / EXE).exists()
+        if meta.get("backend") == "hip" and (eng / EXE).exists() and gpu["arch"] in meta.get("archs", [])
         else "  Compiling the Strata engine for your AMD GPU (10-20 minutes, once) ...")
     cmake_build(ROOT, ROOT / "build-hip", "strata",
                 ["-DSTRATA_ENABLE_HIP=ON", "-DSTRATA_ENABLE_CUDA=OFF", "-DSTRATA_BUILD_TESTS=OFF",
@@ -912,7 +982,8 @@ def update_installed_engine(url_base) -> None:
     if meta.get("backend") == "hip":                   # AMD: compiled here, again when its source changed
         if meta.get("src") != source_hash(ENGINE_SOURCES):
             try:
-                g = next((x for x in amd_gpus() if amd_problem(x) is None), None)
+                usable = [x for x in amd_gpus() if amd_problem(x) is None]
+                g = next((x for x in usable if x["arch"] in meta.get("archs", [])), usable[0] if usable else None)
                 if g is None:
                     raise RuntimeError("no supported AMD GPU found")
                 build_engine_hip(g, get_llama_cpp())
@@ -1119,6 +1190,7 @@ DATA_ITEMS = ("models", "packs", "mtp")
 
 
 LOW_RAM_HEADROOM_GB = 10   # RAM beside the experts: the OS, the engine's other buffers, the server
+RESIDENT_ENGINE = (0, 1, 30)   # the first engine with --resident-experts (the low-RAM mode's resident variant)
 
 
 def low_ram_needed(model, ram) -> bool:
@@ -1127,9 +1199,26 @@ def low_ram_needed(model, ram) -> bool:
     return ram < MODELS[model]["arena_gb"] + LOW_RAM_HEADROOM_GB
 
 
-def low_ram_gpu_share(model, vram_gb) -> float:
-    """About how much of the model's experts the GPU holds (VRAM minus ~5 GB for the dense weights, KV, buffers)."""
-    return max(0.0, min(1.0, (vram_gb - 5) / MODELS[model]["arena_gb"]))
+def low_ram_gpu_gb(model, vram_gb, ctx=32768, kv="int8") -> float:
+    """About how many GB of the model's experts the GPU's cache holds: its VRAM minus ~5 GB for the dense weights,
+    buffers and a 32K context's KV cache, minus the KV cache of a longer context (in VRAM in the low-RAM mode: its RAM
+    has no room for KV streaming)."""
+    kv_tok = 13 * (576 if kv == "q4_0" else 1056)       # bytes per context token: 12 QSA layers + the draft layer
+    longer = max(0, ctx - 32768) * kv_tok / 1e9
+    return max(0.0, min(MODELS[model]["arena_gb"], vram_gb - 5 - longer))
+
+
+def low_ram_gpu_share(model, vram_gb, ctx=32768, kv="int8") -> float:
+    """About how much of the model's experts the GPU holds."""
+    return low_ram_gpu_gb(model, vram_gb, ctx, kv) / MODELS[model]["arena_gb"]
+
+
+def low_ram_resident(model, ram, vram_gb, ctx=32768, kv="int8") -> bool:
+    """In the low-RAM mode: the experts the GPU does not hold fit the RAM with the usual room beside them, so they are
+    copied into RAM once (the resident variant, `--resident-experts`) instead of being read through the OS file cache
+    (plain `--mmap-experts`, which a PC this short of RAM keeps re-reading from the SSD)."""
+    rest = MODELS[model]["arena_gb"] - low_ram_gpu_gb(model, vram_gb, ctx, kv)
+    return ram >= rest + LOW_RAM_HEADROOM_GB
 
 
 def low_ram_fits(model, ram, vram_gb) -> bool:
@@ -1517,6 +1606,11 @@ def start(cfg_path: Path, port: int | None, gpu: int | list | None = None, open_
     say("  restart). That is normal: please wait and don't close this window - the browser opens when it is ready.")
     say("  Later, closing this window stops the model.")
     say("  " + "-" * 100)
+    if not WIN and os.environ.get("STRATA_EXECV"):
+        # Replace this process instead of spawning a child. The Docker image sets STRATA_EXECV=1,
+        # so there the server is PID 1 and docker stop's SIGTERM reaches the process that can
+        # answer the engine with QUIT. Normal Linux starts keep spawning the server as a child.
+        os.execv(cmd[0], cmd)
     return subprocess.call(cmd)
 
 
@@ -1582,12 +1676,56 @@ def write_run_script(model, cfg_path, port):
     return script
 
 
+# ------------------------------------------------------------------------------------------------ the rope config
+def derived_factor(ctx: int, trained: int = 262144) -> float:
+    """The automatic extension factor: the FINAL context over the trained one, at least 1.
+
+    Factor 1 removes the automatic expansion - the trained angles stand as they are - but it is not a
+    switch for rope as a whole: an explicitly chosen method's settings keep their defined behavior.
+    """
+    return max(1.0, float(ctx) / float(trained))
+
+
+def resolve_rope(ctx: int, scaling, scale, trained: int = 262144):
+    """The rope config for the context ACTUALLY SERVED: (scaling, scale); scaling None = no scaling flags.
+
+    An explicit --rope-scaling/--rope-scale always wins - a user-supplied factor is kept verbatim even
+    when a reduction changed the context.  Past the trained range an omitted method defaults to yarn -
+    llama.cpp's extension method: the trained angles survive on the high-frequency pairs and the
+    magnitude correction keeps the attention temperature - and an omitted factor is derived from the
+    final context (final / trained, at least 1), as is an explicitly chosen method's missing factor
+    inside the trained range: factor 1, the trained angles, no expansion.  An explicit none is refused
+    past the trained range (the setup will not configure a run it knows is out of spec) rather than
+    silently overridden.
+    """
+    if ctx <= trained:
+        if scale is not None and scaling in (None, "none"):
+            raise ValueError("--rope-scale needs --rope-scaling linear or yarn (the chosen context fits the "
+                             "trained 262144, so there is nothing to scale)")
+        if scaling in (None, "none"):
+            return None, None          # the stock model, by choice or by default
+        return scaling, scale if scale is not None else derived_factor(ctx, trained)
+    if scaling == "none":
+        raise ValueError(f"a {ctx // 1024}K context is past the model's trained 262144, and --rope-scaling none "
+                         "keeps the stock angles there - the model has never seen those positions, so the setup "
+                         "refuses the combination instead of quietly overriding it. Pick --rope-scaling yarn or "
+                         "linear, or rerun with --context 262144 or lower")
+    return scaling or "yarn", scale if scale is not None else derived_factor(ctx, trained)
+
+
 # ------------------------------------------------------------------------------------------------ main
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--family", choices=list(FAMILIES), help="qwen = Qwen3.8-Flash-Next, swift = Swift 1.5")
     ap.add_argument("--model", choices=list(MODELS))
     ap.add_argument("--context", type=int)
+    ap.add_argument("--rope-scaling", choices=["none", "linear", "yarn"],
+                    help="the RoPE extension for a context past the model's trained 262144: linear (position "
+                         "interpolation) or yarn - llama.cpp's types. Omitted with a scaled context, the setup "
+                         "picks yarn; 'none' is refused for such a context")
+    ap.add_argument("--rope-scale", type=float,
+                    help="the extension factor (default: the final context over the trained 262144, at least 1 - "
+                         "1.5 for 384K, 2 for 512K, 1 inside the trained range)")
     ap.add_argument("--kv", choices=["int8", "q4_0", "k8v4"],
                     help="KV cache precision above 8K context: int8 (default), q4_0 (half the memory, a little less "
                          "precise) or k8v4 (hybrid: INT8 K + 4-bit V, 816 B/cell)")
@@ -1623,11 +1761,13 @@ def main() -> int:
     ap.add_argument("--draft-vocab", choices=list(DRAFT_VOCABS),
                     help="the draft layer's tokens: cjk = with Chinese, Japanese and Korean (default), en = English "
                          "and code only (~110 MiB less VRAM, English answers 1-2%% faster)")
-    ap.add_argument("--low-ram", choices=["auto", "on", "off"], default="auto",
-                    help="map the model's experts from its folder instead of copying them into RAM (for a PC with a big "
-                         "GPU and little RAM); auto: when the experts would not fit the RAM")
+    ap.add_argument("--low-ram", choices=["auto", "on", "off", "resident", "mmap"], default="auto",
+                    help="read the model's experts from one file in its folder instead of copying them all into RAM "
+                         "(for a PC with a big GPU and little RAM); auto: when the experts would not fit the RAM. In "
+                         "this mode the experts the GPU does not hold are copied into RAM once when they fit (resident), "
+                         "else read through the OS file cache (mmap); resident / mmap force one of the two")
     ap.add_argument("--backend", choices=["cuda", "hip"],
-                    help="cuda = NVIDIA (default), hip = AMD RX 7900 XT/XTX on Linux (experimental; chosen by itself "
+                    help="cuda = NVIDIA (default), hip = AMD RX 7900 XT/XTX or RX 9070 / AI PRO R9700 on Linux (experimental; chosen by itself "
                          "when the PC has no NVIDIA card Strata can use)")
     ap.add_argument("--skip-build", action="store_true", help=argparse.SUPPRESS)
     a = ap.parse_args()
@@ -1725,7 +1865,7 @@ def main() -> int:
             say(f"    GPU {g['index']}: {g['name']}, {g['vram_gb']:.0f} GB VRAM - " + (amd_problem(g) or "can be used"))
         usable = [g for g in amd if amd_problem(g) is None]
         if not usable:
-            fail("no AMD GPU Strata can use", "the AMD backend runs on the RX 7900 XT / XTX (gfx1100) on Linux")
+            fail("no AMD GPU Strata can use", f"the AMD backend runs on {AMD_CARDS} on Linux")
         if a.gpus:
             fail("several GPUs sharing one model: NVIDIA only for now", "use one AMD card (--gpu N)")
         if a.gpu is not None:
@@ -1742,7 +1882,7 @@ def main() -> int:
         if not found:
             fail("no NVIDIA GPU found (nvidia-smi did not answer)",
                  "install the NVIDIA driver from https://www.nvidia.com/drivers and restart the PC"
-                 + ("; an AMD RX 7900 XT/XTX: --backend hip" if amd else ""))
+                 + ("; an AMD RX 7900 XT/XTX or RX 9070 / AI PRO R9700: --backend hip" if amd else ""))
         if len(found) > 1 or gpu_problem(found[0]) is not None:
             gpu_table(found)
         sel = choose_gpus(a, found)                    # asked when two or more cards can share the model
@@ -1786,7 +1926,8 @@ def main() -> int:
             verdict = "fits" if ram >= d["ram_gb"] else "tight" if ram >= d["ram_gb"] - 8 else "does not fit"
             if low_ram_needed(m, ram) and low_ram_fits(m, ram, gpu["vram_gb"]) and a.low_ram != "off":
                 verdict = (f"fits in the low-RAM mode (the GPU holds ~{100 * low_ram_gpu_share(m, gpu['vram_gb']):.0f}% "
-                           "of its experts)")
+                           "of its experts, " + ("the rest stays in RAM)" if low_ram_resident(m, ram, gpu["vram_gb"])
+                                                 else "the rest is read from the SSD as needed)"))
             say(f"  {m:8s} needs ~{d['ram_gb']} GB RAM: {verdict}")
         say("\nThis PC can run Strata. Run it again without --check to install.")
         return 0
@@ -1813,22 +1954,17 @@ def main() -> int:
         d = MODELS[m]
         fit = "" if ram >= d["ram_gb"] else f"   <- needs {d['ram_gb']} GB RAM, you have {ram:.0f}"
         if low_ram_needed(m, ram) and low_ram_fits(m, ram, gpu["vram_gb"]) and a.low_ram != "off":
-            fit = f"   <- fits in the low-RAM mode (the GPU holds ~{100 * low_ram_gpu_share(m, gpu['vram_gb']):.0f}%)"
+            fit = (f"   <- fits in the low-RAM mode (the GPU holds ~{100 * low_ram_gpu_share(m, gpu['vram_gb']):.0f}%, "
+                   + ("the rest in RAM)" if low_ram_resident(m, ram, gpu["vram_gb"]) else "the rest from the SSD)"))
         say(f"  {i}) {m:8s} {d['about']}; download {d['download_gb']:.0f} GB, uses ~{d['arena_gb']:.0f} GB of RAM{fit}")
     rec = str(names.index("IQ3_XXS") + 1) if ram >= 60 and "IQ3_XXS" in names else "1"
     model = a.model or names[int(ask("Which size?", [str(i) for i in range(1, len(names) + 1)], rec, a.yes)) - 1]
-    low_ram = a.low_ram == "on" or (a.low_ram == "auto" and low_ram_needed(model, ram))
+    low_ram = a.low_ram in ("on", "resident", "mmap") or (a.low_ram == "auto" and low_ram_needed(model, ram))
     if low_ram and multi:
         warn("the low-RAM mode runs on one GPU: using " + gpu_name(gpu) + " only")
         multi, sel, chosen = [], [gpu["index"]], [gpu]
-    if low_ram:
-        share = low_ram_gpu_share(model, gpu["vram_gb"])
-        ok(f"low-RAM mode: {model}'s experts ({MODELS[model]['arena_gb']:.0f} GB) are read from the model folder "
-           f"through the OS file cache instead of a copy in RAM ({ram:.0f} GB); the GPU holds ~{100 * share:.0f}% of them")
-        if share < 0.6:
-            warn("most of the experts are read from the SSD while it answers: expect it to be much slower than with "
-                 "enough RAM (a faster SSD and a smaller size help)")
-    elif ram < MODELS[model]["ram_gb"] - 4:
+    # (the low-RAM mode's variant is decided once the context is known, below)
+    if not low_ram and ram < MODELS[model]["ram_gb"] - 4:
         # #125: a warning and a question, not a stop: the user may accept paging (asked, "no" by default, so an
         # unattended --yes install still stops here)
         need_gb, arena = MODELS[model]["ram_gb"], MODELS[model]["arena_gb"]
@@ -1851,17 +1987,43 @@ def main() -> int:
         say("  Context length = how much text the model can see at once (your chat, files, tool output).")
         say("  Longer needs more VRAM for it, so fewer experts fit on the GPU:")
         for i, c in enumerate(CONTEXTS, 1):
-            say(f"  {i}) {c // 1024}K tokens" + ("   (recommended for your GPU)" if c == rec_ctx else ""))
-        ctx = CONTEXTS[int(ask("Context?", [str(i) for i in range(1, 6)], str(CONTEXTS.index(rec_ctx) + 1), a.yes)) - 1]
-    # The experts' arena plus the context's KV (in RAM from 64K up: ~13.7 KB/token at 8 bits) must fit, with room
-    # for everything else. Counted, not a fixed 90 GB: 24 GB of room keeps the rule for 64 GB PCs as it was (128K
-    # for both 3-bit models), while a box with ~84 GB keeps the 262K it asked for (measured: a Colab A100-40G runs
-    # IQ3_S at 262K with images in 56 of its 83.5 GiB).
+            note = ("   (recommended for your GPU)" if c == rec_ctx else "") + \
+                   ("   (experimental: setup adds rope scaling)" if c > 262144 else "")
+            say(f"  {i}) {c // 1024}K tokens{note}")
+        ctx = CONTEXTS[int(ask("Context?", [str(i) for i in range(1, len(CONTEXTS) + 1)],
+                               str(CONTEXTS.index(rec_ctx) + 1), a.yes)) - 1]
+    # the RAM limit comes FIRST: the rope config must cover the context the engine will actually serve -
+    # a reduced 384K can land back inside the trained 262144, and then nothing needs scaling (§4).  Counted,
+    # not a fixed 90 GB (the 0.1.29 arithmetic): arena + the context's KV + 24 GB of room for everything else.
+    asked_ctx = ctx
     need_gb = MODELS[model].get("arena_gb", 0) + ctx * 13 * 1056 / 1e9 + 24
     if model in ("IQ3_XXS", "IQ3_S") and ram < need_gb and ctx > 131072:
         warn(f"{model} with a {ctx // 1024}K context needs about {need_gb:.0f} GB of RAM "
              f"({MODELS[model]['arena_gb']:.0f} GB of experts + the context + room for the rest): using 128K")
         ctx = 131072
+    scaling = a.rope_scaling
+    if ctx > 262144 and scaling is None and not a.yes:
+        # the interactive path: one question, yarn preselected (llama.cpp's extension method, recall-tested
+        # here at 512K).  With --yes nothing prints: resolve_rope takes yarn below and the ok() line says so.
+        say()
+        say(f"  A {ctx // 1024}K context runs the model past its trained 262,144 positions: the rotary angles")
+        say("  get rescaled (llama.cpp's RoPE extension). yarn keeps the trained angles on the high-frequency")
+        say("  pairs and corrects the magnitudes; linear shrinks every angle. Override any time with")
+        say("  --rope-scaling.")
+        scaling = ask("RoPE extension method?", ["yarn", "linear"], "yarn", a.yes)
+    try:
+        scaling, rope_scale = resolve_rope(ctx, scaling, a.rope_scale)
+    except ValueError as e:
+        fail(str(e))
+    if scaling is not None:
+        origin = ("final context / trained 262144; override with --rope-scale" if a.rope_scale is None
+                  else "as requested")
+        ok(f"rope scaling: {scaling}, factor {rope_scale:g} ({origin})")
+    elif asked_ctx > 262144:
+        ok(f"the RAM limit brings the context to {ctx // 1024}K, inside the trained 262,144: no rope scaling")
+    if scaling is not None and asked_ctx > 262144 and ctx <= 262144:
+        warn(f"the RAM limit reduced the context to {ctx // 1024}K, inside the trained 262,144; keeping your "
+             f"explicit rope scaling ({scaling}) anyway - drop --rope-scaling for the completely stock model")
     ok(f"context: {ctx} tokens")
     # the KV cache (the model's memory of the conversation): 8-bit, or 4-bit after a Hadamard rotation (PR #21)
     kv = "fp16" if ctx <= 8192 else (a.kv or "int8")
@@ -1886,6 +2048,27 @@ def main() -> int:
         say("  download and keeps ~1.4 GB of VRAM free for the image encoder, so text is a few % slower.")
         vision = "gpu" if ask("Do you want images?", ["y", "n"], "n", a.yes) == "y" else "none"
     ok("images: " + {"none": "off", "gpu": "on", "cpu": "on (encoder on the CPU)"}[vision])
+    # The low-RAM mode's two variants.  resident: the experts the GPU's cache does not hold (and, as far as RAM allows,
+    # the ones the prompt path borrows cache room from) are copied from the pack's experts.bin into RAM once, so
+    # nothing is read from the SSD while it answers (engine 0.1.30, --resident-experts; the engine falls back to mmap
+    # with a warning when they do not fit the RAM it finds free).  mmap: they are read through the OS file cache.
+    # The GPU's share: its VRAM less the dense weights and buffers, this context's KV cache and the image encoder's room.
+    resident = False
+    if low_ram:
+        arena = MODELS[model]["arena_gb"]
+        vram = gpu["vram_gb"] - (VISION[vision]["reserve_mib"] / 1024 if vision != "none" else 0)
+        share = low_ram_gpu_share(model, vram, ctx, kv)
+        rest = arena - low_ram_gpu_gb(model, vram, ctx, kv)
+        resident = a.low_ram == "resident" or (a.low_ram != "mmap" and low_ram_resident(model, ram, vram, ctx, kv))
+        if resident:
+            ok(f"low-RAM mode: the GPU holds ~{100 * share:.0f}% of {model}'s experts ({arena:.0f} GB) and the other "
+               f"~{rest:.0f} GB stay in RAM ({ram:.0f} GB), read once from a copy in the model folder")
+        else:
+            ok(f"low-RAM mode: {model}'s experts ({arena:.0f} GB) are read from the model folder through the OS file "
+               f"cache instead of a copy in RAM ({ram:.0f} GB); the GPU holds ~{100 * share:.0f}% of them")
+            if share < 0.6:
+                warn("most of the experts are read from the SSD while it answers: expect it to be much slower than "
+                     "with enough RAM (a faster SSD and a smaller size help)")
     # EXPERIMENTAL: the experimental-speed-projection control vector (data/experimental-speed-projection), off unless
     # chosen here; with it loaded, the web app and the API switch it off per request
     esp = None
@@ -2026,10 +2209,17 @@ def main() -> int:
             "--expert-profile", str(ROOT / "data" / fam.get("profile", "expert-profile.bin")), "--expert-cache", "auto",
             "--prefill", "auto", "--spec", "4", "--spec-min-p", "0.5", "--mtp", str(rt),
             "--max-context", str(ctx)]
+    if scaling is not None:     # the resolved config: explicit flags as given, or the automatic yarn+factor
+        args += ["--rope-scaling", scaling, "--rope-scale", f"{rope_scale:g}"]
     if ctx > 8192:
         args += ["--kv", kv]
-    if low_ram:
-        args += ["--mmap-experts"]   # the experts from the pack's experts.bin, not copied into RAM
+    engine_ver = tuple(int(x) for x in str(meta.get("version", "0")).split(".")[:3] if x.isdigit())
+    if resident and a.low_ram != "resident" and engine_ver < RESIDENT_ENGINE:
+        resident = False                               # an engine from before --resident-experts would refuse it
+        ok(f"low-RAM mode: engine {meta.get('version')} has no resident variant yet; the experts are read through "
+           "the OS file cache (run setup again after the next engine update)")
+    if low_ram:   # the experts from the pack's experts.bin: the ones the GPU does not hold copied into RAM, or mapped
+        args += ["--resident-experts" if resident else "--mmap-experts"]
     # KV streaming: from 64K up the whole KV cache lives in RAM and only the part the attention reads (32K positions
     # per layer) stays in VRAM; the VRAM it frees holds more experts (+6% at 128K, +23% at 262K with Q2_0). It
     # costs ~13.7 KB of RAM per context token with 8-bit KV (1.7 GB at 128K), 7.5 KB with 4-bit, so only when it fits.
@@ -2057,10 +2247,13 @@ def main() -> int:
     if hip:
         cfg["backend"] = "hip"
         # the dense prompt GEMMs through hipBLASLt with kernels measured on this GPU generation (tools/hip; +40-60%
-        # prompt speed on the 7900 XTX); the engine refuses a table made for another hipBLASLt version and falls back
-        tables = sorted((ROOT / "tools" / "hip").glob(f"{gpu['arch']}-hipblaslt-*.txt"))
-        if tables:
-            cfg["env"] = {"STRATA_HIPBLASLT_TUNING": str(tables[-1])}
+        # prompt speed on the 7900 XTX): only a table for this card's arch AND the installed hipBLASLt version (the
+        # engine refuses any other one and falls back to plain hipBLAS)
+        table = hipblaslt_table(gpu["arch"], lib_dirs)
+        if table:
+            cfg["env"] = {"STRATA_HIPBLASLT_TUNING": str(table)}
+        if resident:   # ROCm: large page-locked host allocations can fail or be slow for the CPU; keep the copy pageable
+            cfg.setdefault("env", {})["STRATA_RESIDENT_PIN"] = "0"
     if gpu["count"] > 1 or a.gpu is not None:
         cfg["gpu"] = gpu["index"]                      # the engine is told this card (issue #51)
         cfg["gpus_asked"] = True                       # chosen at setup: not asked again at start
