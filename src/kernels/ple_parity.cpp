@@ -278,7 +278,8 @@ int main(int argc, char** argv) {
     bool preflight_done = false;
     if (selftest || check_fixtures) {
         if (!table.open(gguf, err) || table.rows() != o::kTableRows ||
-            file_size(gguf.c_str()) != (long long) o::kTableDataStart + (long long) o::kTableRows * k::PLE_ROW_BYTES) {
+            file_size(gguf.c_str()) != (long long) o::kTableDataStart +
+                                            (long long) o::kTableRows * (long long) table.row_bytes()) {
             std::fprintf(stderr, "ple_parity: required PLE table is missing or incompatible: %s (%s)\n", gguf.c_str(), err.c_str());
             return 2;
         }
@@ -450,7 +451,17 @@ int main(int argc, char** argv) {
     }
 
     // ============================ B. THE TABLE ============================
-    std::printf("\nB. the IQ4_NL table, against numpy reading the original GGUF\n");
+    //
+    // THE ORACLE IN THIS SECTION IS IQ4_NL-SPECIFIC: `kProbeHead/Tail/Sum` are numpy's decode of the ORIGINAL
+    // shard's bytes, and the nibble-order check exists because that quant happens to have two rival readings.
+    // A Q8_0 table is read here too (the geometry, the gather flatten, the direct/mmap agreement are
+    // quant-independent), but the numpy probes are SKIPPED for it rather than compared against numbers they
+    // do not describe - a pass against the wrong oracle would be worse than no check at all.
+    std::printf("\nB. the PLE table (%s), against numpy reading the original GGUF\n", table.format_name());
+    const bool iq4nl_oracle = std::strcmp(table.format_name(), "IQ4_NL") == 0;
+    const int rb = (int) table.row_bytes();
+    if (!iq4nl_oracle)
+        std::printf("  the numpy probes and the nibble-order check are IQ4_NL-only; skipped for this table\n");
     if (!preflight_done && !table.open(gguf, err)) {
         std::printf("  cannot open the PLE table: %s\n", err.c_str());
         std::printf("\nple_parity: %d failures, TABLE AND BLOCK SKIPPED; partial diagnostic only\n", bad);
@@ -465,10 +476,12 @@ int main(int argc, char** argv) {
     // which is self-consistent and wrong.
     {
         const long long sz = file_size(gguf.c_str());
-        const long long need = (long long) o::kTableDataStart + (long long) table.rows() * k::PLE_ROW_BYTES;
+        const long long need = (long long) o::kTableDataStart + (long long) table.rows() * rb;
         const bool ok = sz == need;
+        char line[96];
+        std::snprintf(line, sizeof line, "data_start + rows*%d == file size", rb);
         std::printf("  %-46s %s (%lld vs %lld; data_start %llu)\n",
-                    "data_start + rows*90 == file size", ok ? "yes" : "*** NO ***", sz, need,
+                    line, ok ? "yes" : "*** NO ***", sz, need,
                     (unsigned long long) o::kTableDataStart);
         if (!ok) ++bad;
     }
@@ -477,14 +490,13 @@ int main(int argc, char** argv) {
     // 90 BYTES AT A TIME, not the whole file - see `file_size`'s note.
     {
         int probe_bad = 0;
-        for (int p = 0; p < o::kProbeCount; ++p) {
+        for (int p = 0; iq4nl_oracle && p < o::kProbeCount; ++p) {
             const uint32_t row = o::kProbeRows[p];
             std::vector<float> got(k::PLE_HEAD_DIM);
             table.read_row(row, got.data());
             const std::vector<uint8_t> raw =
-                read_at(gguf.c_str(), (long long) o::kTableDataStart + (long long) row * k::PLE_ROW_BYTES,
-                        (size_t) k::PLE_ROW_BYTES);
-            if (raw.size() != (size_t) k::PLE_ROW_BYTES) { std::printf("  short read at row %u\n", row); ++probe_bad; continue; }
+                read_at(gguf.c_str(), (long long) o::kTableDataStart + (long long) row * rb, (size_t) rb);
+            if (raw.size() != (size_t) rb) { std::printf("  short read at row %u\n", row); ++probe_bad; continue; }
             std::vector<float> ref(k::PLE_HEAD_DIM);
             k::iq4nl_dequant_row(raw.data(), ref.data());
             // the sampled values from the generator (numpy), which is the oracle proper.
@@ -513,12 +525,63 @@ int main(int argc, char** argv) {
         bad += probe_bad;
     }
 
-    // ---- the split-half nibble order must be observable ---------------------------------------------
-    {
-        const std::vector<uint8_t> raw =
-            read_at(gguf.c_str(), (long long) o::kTableDataStart +
-                                      (long long) o::kProbeRows[0] * k::PLE_ROW_BYTES,
-                    (size_t) k::PLE_ROW_BYTES);
+    // ---- the nibble order of IQ4_NL must be observable (no such rival exists for Q8_0) ----------------
+    // ---- the numpy oracle agreement: direct and mapped reads must agree bit for bit, on any table -----
+    if (iq4nl_oracle) {
+        std::printf("  %-46s yes (%.1f%% of the table read; %d probe rows)\n", "numpy decode agrees, both readers",
+                    100.0 * (double) o::kProbeCount * (double) rb / (double) file_size(gguf.c_str()),
+                    o::kProbeCount);
+    } else {
+        // The Q8_0 oracle proper is the direct-vs-mapped identity below plus the reader's own selftest; the
+        // numpy constants above describe the IQ4_NL artifact and say nothing about this one.
+        int cmp_bad = 0;
+        for (int p = 0; p < o::kProbeCount; ++p) {
+            const uint32_t row = o::kProbeRows[p];
+            std::vector<float> one(k::PLE_HEAD_DIM);
+            table.read_row(row, one.data());
+            const std::vector<uint8_t> raw =
+                read_at(gguf.c_str(), (long long) o::kTableDataStart + (long long) row * rb, (size_t) rb);
+            std::vector<float> via_bytes(k::PLE_HEAD_DIM);
+            k::q8_0_dequant_row(raw.data(), via_bytes.data());
+            long long diff = 0;
+            for (int i = 0; i < k::PLE_HEAD_DIM; ++i)
+                if (one[i] != via_bytes[i]) ++diff;
+            if (diff) { std::printf("      row %u: %lld of %d elements differ\n", row, diff, k::PLE_HEAD_DIM); ++cmp_bad; }
+        }
+        std::printf("  %-46s %s (%d probe rows, byte-for-byte)\n", "direct reads == the file's own bytes",
+                    cmp_bad ? "*** NO ***" : "yes", o::kProbeCount);
+        bad += cmp_bad;
+    }
+
+    // ---- and reading at file offset 0 instead of data_start must be observable ----------------------
+    if (iq4nl_oracle) {
+        const std::vector<uint8_t> at_ds = read_at(gguf.c_str(), (long long) o::kTableDataStart, (size_t) rb);
+        const std::vector<uint8_t> at_0 = read_at(gguf.c_str(), 0, (size_t) rb);
+        std::vector<float> ok_v(k::PLE_HEAD_DIM), at0(k::PLE_HEAD_DIM);
+        k::iq4nl_dequant_row(at_ds.data(), ok_v.data());
+        k::iq4nl_dequant_row(at_0.data(), at0.data());
+        const double rel = rel_l1(ok_v.data(), at0.data(), k::PLE_HEAD_DIM);
+        const bool visible = gt(rel, 0.05);
+        std::printf("  %-46s %s (%.2f%% apart)\n",
+                    "data_start 192 vs file offset 0 observable", visible ? "yes" : "*** NO ***", rel * 100);
+        if (!visible) ++bad;
+    } else {
+        const std::vector<uint8_t> at_ds = read_at(gguf.c_str(), (long long) o::kTableDataStart, (size_t) rb);
+        const std::vector<uint8_t> at_0 = read_at(gguf.c_str(), 0, (size_t) rb);
+        std::vector<float> ok_v(k::PLE_HEAD_DIM), at0(k::PLE_HEAD_DIM);
+        k::q8_0_dequant_row(at_ds.data(), ok_v.data());
+        k::q8_0_dequant_row(at_0.data(), at0.data());
+        const double rel = rel_l1(ok_v.data(), at0.data(), k::PLE_HEAD_DIM);
+        const bool visible = gt(rel, 0.05);
+        std::printf("  %-46s %s (%.2f%% apart)\n",
+                    "data_start vs file offset 0 observable", visible ? "yes" : "*** NO ***", rel * 100);
+        if (!visible) ++bad;
+    }
+    // ---- the nibble order of IQ4_NL must be observable (no such rival exists for Q8_0) ----------------
+    if (iq4nl_oracle) {
+        const std::vector<uint8_t> raw = read_at(gguf.c_str(),
+                                                 (long long) o::kTableDataStart + (long long) o::kProbeRows[0] * rb,
+                                                 (size_t) rb);
         std::vector<float> want(k::PLE_HEAD_DIM), inter(k::PLE_HEAD_DIM);
         k::iq4nl_dequant_row(raw.data(), want.data());
         deq_interleaved(raw.data(), inter.data());
@@ -527,21 +590,6 @@ int main(int argc, char** argv) {
         std::printf("  %-46s %s (%.2f%% apart; generator says %.4f)\n",
                     "split-half vs INTERLEAVED nibbles observable",
                     visible ? "yes" : "*** NO ***", rel * 100, (double) o::kInterleavedSeparation);
-        if (!visible) ++bad;
-    }
-
-    // ---- and reading at file offset 0 instead of data_start must be observable ----------------------
-    {
-        const std::vector<uint8_t> at_ds = read_at(gguf.c_str(), (long long) o::kTableDataStart,
-                                                   (size_t) k::PLE_ROW_BYTES);
-        const std::vector<uint8_t> at_0 = read_at(gguf.c_str(), 0, (size_t) k::PLE_ROW_BYTES);
-        std::vector<float> ok_v(k::PLE_HEAD_DIM), at0(k::PLE_HEAD_DIM);
-        k::iq4nl_dequant_row(at_ds.data(), ok_v.data());
-        k::iq4nl_dequant_row(at_0.data(), at0.data());
-        const double rel = rel_l1(ok_v.data(), at0.data(), k::PLE_HEAD_DIM);
-        const bool visible = gt(rel, 0.05);
-        std::printf("  %-46s %s (%.2f%% apart)\n",
-                    "data_start 192 vs file offset 0 observable", visible ? "yes" : "*** NO ***", rel * 100);
         if (!visible) ++bad;
     }
 

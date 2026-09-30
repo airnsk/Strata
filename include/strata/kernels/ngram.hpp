@@ -46,6 +46,19 @@ inline constexpr float NG_RMS_EPS = 1e-6f;
 inline constexpr uint64_t PLE_TABLE_ROWS = 320001536ull;
 inline constexpr int PLE_ROW_BYTES = (PLE_HEAD_DIM / 32) * 18;           // 90
 
+// THE ROW SIZE IS A PROPERTY OF THE TABLE'S QUANT, NOT A CONSTANT OF THE ENGINE.  Two artifacts of the same
+// table exist and one binary must read both, because the A/B switch is a line in a config:
+//
+//   IQ4_NL  the 28.8 GB shard: 5 blocks of 18 B (nibbles + fp16 scale)   =  90 B/row  -> 26.8 GiB
+//   Q8_0    the 54.4 GB shard: 5 blocks of 34 B (32 int8 + fp16 scale)   = 170 B/row  -> 50.7 GiB
+//
+// `PLE_ROW_BYTES` stays the IQ4_NL value: the parity oracle constants (kTableDataStart, kTableRows, the numpy
+// dumps) are transcribed from THAT artifact, and the hash geometry is quant-independent.  Q8_0 is the only
+// other accepted width; any other type is rejected at `PleTable::open` rather than silently misread.
+inline constexpr int PLE_ROW_BYTES_IQ4_NL = PLE_ROW_BYTES;               // 90
+inline constexpr int PLE_ROW_BYTES_Q8_0 = (PLE_HEAD_DIM / 32) * 34;      // 170
+inline constexpr int PLE_ROW_BYTES_MAX = PLE_ROW_BYTES_Q8_0;             // scratch buffers in the table
+
 /// The artifact's own hash constants, transcribed from `docs/gguf-dump-shard1.txt`:
 ///
 ///     layer_multipliers = [23703573157769, 20109073645365, 8052911324071]
@@ -96,6 +109,13 @@ int iq4nl_code(int code);
 /// a perfectly plausible embedding of the wrong 160 values.
 void iq4nl_dequant_row(const uint8_t* row, float* out160);
 
+/// One 170-byte Q8_0 row -> 160 floats: 5 CONSECUTIVE blocks of `{fp16 d, 32 int8}`, element j is `d * qs[j]`.
+///
+/// Q8_0 has one scale per 32-element block and no codebook, so there is no nibble order to get wrong; the two
+/// readings (blocks left to right, codes in order) are the natural ones and are what `dequantize_q8_0` in
+/// `artifact/dequant.hpp` - the function the S-form parity already trusts - does.  No `min` term (Q8_0 has none).
+void q8_0_dequant_row(const uint8_t* row, float* out160);
+
 /// How the table's rows are read (plan v0.3 P2). `Direct` is the default: unbuffered 4 KiB reads from the SSD,
 /// so the table never occupies RAM or the OS file cache. `Mmap` is the earlier memory-mapped path, kept as the
 /// A/B arm; it returns the same bytes.
@@ -108,7 +128,7 @@ enum class PleIo { Direct, Mmap };
 struct PleIoOptions {
     PleIo mode = PleIo::Direct;
     uint32_t max_inflight = 64;      ///< outstanding SSD reads (decode needs 16; prefill chunks use more)
-    uint64_t cache_rows = 1u << 20;  ///< bounded row cache: 1,048,576 rows x 90 B ~ 95 MB; 0 disables
+    uint64_t cache_rows = 1u << 20;  ///< bounded row cache: 1,048,576 rows x row_bytes (95 MB IQ4_NL / 178 MB Q8_0); 0 disables
     bool io_thread = true;           ///< reads submitted by a worker thread, not the caller
 };
 
@@ -145,6 +165,11 @@ public:
     void close();
     bool is_open() const;
     uint64_t rows() const;
+
+    /// The table's row width in bytes and the quant it was opened as ("IQ4_NL" | "Q8_0"), both taken from the
+    /// tensor's type in the GGUF - never guessed from the file name or the size.
+    uint32_t row_bytes() const;
+    const char* format_name() const;
 
     /// 16 row indices -> 2560 floats.  The gathered rows are flattened HEAD-SLOWEST: row h's 160 values
     /// occupy `out[h*160, (h+1)*160)`, which is what `ggml_get_rows` does and what makes the result a plain
