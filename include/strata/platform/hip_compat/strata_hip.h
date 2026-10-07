@@ -50,6 +50,7 @@
 #define cudaStreamCaptureStatusActive hipStreamCaptureStatusActive
 #define cudaEventDisableTiming hipEventDisableTiming
 #define cudaEventDefault hipEventDefault
+#define cudaEventBlockingSync hipEventBlockingSync
 #define cudaHostAllocDefault hipHostMallocDefault
 #define cudaHostAllocPortable hipHostMallocPortable
 #define cudaHostAllocMapped hipHostMallocMapped

@@ -541,6 +541,140 @@ bool grow(uint16_t*& p, int64_t& have, int64_t want) {   // `have`, `want`: 2-by
 constexpr int64_t kXSliceElems = 16ll << 20;   // 32 MiB of FP16 activations per slice (64 MiB as fp32)
 }  // namespace
 #endif
+#if defined(__HIPCC__)
+// STRATA_PREFILL_GEMM_F16=1: send Gemm::bf16's product through the FP16 path instead of BF16.
+// Measured on the MI50 stand 05.10 (~/gemmhc.cu: the engine's own shapes called through the engine's own cublas
+// shim): on gfx906 hipBLAS BF16 is 2.06-3.35x slower than FP16 at these shapes - hc down T=8192 17.01 ms vs
+// 5.07 ms, hc up 8.87 vs 4.31.  The part has no BF16 unit; its FP16 path (v_fma_mix_f32) reaches 90-97% of our
+// measured FP32-VALU issue ceiling (13 538 GFLOP/s, ~/mb906.cu).  Off unless the variable is set.
+inline int gemm_f16_mode() {
+    static const int v = [] {
+        const char* e = std::getenv("STRATA_PREFILL_GEMM_F16");
+        return e != nullptr ? std::atoi(e) : 0;
+    }();
+    return v;
+}
+// BF16 bits (1-8-7) widened to FP16 bits (1-5-10): decode to float, then round-to-nearest to half.
+// Out-of-range exponents saturate to inf/0 - that is why this path is opt-in and needs a greedy-text check.
+__global__ void cvt_bf16_to_f16_k(const uint16_t* __restrict__ in, uint16_t* __restrict__ out, int64_t n8) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n8) return;
+    const uint4 v = reinterpret_cast<const uint4*>(in)[i];
+    const uint16_t w[8] = { (uint16_t)(v.x & 0xffff), (uint16_t)(v.x >> 16), (uint16_t)(v.y & 0xffff),
+                            (uint16_t)(v.y >> 16), (uint16_t)(v.z & 0xffff), (uint16_t)(v.z >> 16),
+                            (uint16_t)(v.w & 0xffff), (uint16_t)(v.w >> 16) };
+    uint4 o;
+    uint16_t* od = reinterpret_cast<uint16_t*>(&o);
+    for (int k = 0; k < 8; ++k) {
+        const float f = __uint_as_float(((uint32_t) w[k]) << 16);
+        od[k] = __half_as_ushort(__float2half_rn(f));
+    }
+    reinterpret_cast<uint4*>(out)[i] = o;
+}
+
+// Grow-once device scratch for the widened copies: weights are a few MB, activations one chunk block.
+// Two independent slots (X and W) so the two conversions never alias.
+bool cvt_bf16_to_f16(const uint16_t* src, int64_t elems, void* stream, uint16_t** dst, int slot) {
+    static uint16_t* buf[2] = { nullptr, nullptr };
+    static int64_t cap[2] = { 0, 0 };
+    if (elems <= 0 || (elems & 7) != 0) return false;            // the kernel works on 8-element vectors
+    if (cap[slot] < elems) {
+        if (buf[slot]) cudaFree(buf[slot]);
+        buf[slot] = nullptr; cap[slot] = 0;
+        if (cudaMalloc((void**) &buf[slot], (size_t) elems * 2) != cudaSuccess) {
+            cudaGetLastError();
+            return false;
+        }
+        cap[slot] = elems;
+    }
+    const int64_t n8 = elems / 8;
+    cvt_bf16_to_f16_k<<<(unsigned) ((n8 + 255) / 256), 256, 0, (cudaStream_t) stream>>>(src, buf[slot], n8);
+    *dst = buf[slot];
+    return true;
+}
+
+// STRATA_PREFILL_ACT_HIST=1: histogram the BF16 exponent field of both operands of Gemm::bf16, so the FP16
+// range risk of the f16 path is measured on the engine's real values instead of assumed.  Sampling pass:
+// at most ACT_HIST_SAMPLE elements per operand per call, uniform stride (the counts are reported together
+// with the number of samples taken).
+inline int act_hist_mode() {
+    static const int v = [] {
+        const char* e = std::getenv("STRATA_PREFILL_ACT_HIST");
+        return e != nullptr ? std::atoi(e) : 0;
+    }();
+    return v;
+}
+
+// GEMM_FDOT2_SW: the swizzled-LDS fdot2 kernel standalone-benched at 13.63/11.02 TFLOP/s on
+// 16384x10240x320 / 16384x320x10240 (PMC: LDS bank conflicts 8.0 -> 2.0 per LDS inst).
+#define FSW_BM 64
+#define FSW_BN 64
+#define FSW_BK 16
+#define FSW_TM 4
+#define FSW_TN 4
+#define FSW_THREADS 256
+__device__ __forceinline__ float fsw_fdot2(__half2 a, __half2 b, float c) {
+    return __builtin_amdgcn_fdot2(a, b, c, false);
+}
+__global__ void __launch_bounds__(FSW_THREADS) gemm_fdot2_sw(const __half* __restrict__ A, const __half* __restrict__ B,
+                                                             float* __restrict__ C, int M, int N, int K) {
+    __shared__ __half sA[FSW_BM][FSW_BK + 2];   // row pitch = BK+2 halves = 9 dwords
+    __shared__ __half sB[FSW_BN][FSW_BK + 2];
+    const int tid = threadIdx.x;
+    const int tm = tid / 16, tn = tid % 16;
+    const int m0 = blockIdx.y * FSW_BM, n0 = blockIdx.x * FSW_BN;
+    float acc[FSW_TM][FSW_TN];
+#pragma unroll
+    for (int i = 0; i < FSW_TM; ++i)
+#pragma unroll
+        for (int j = 0; j < FSW_TN; ++j) acc[i][j] = 0.f;
+    for (int k0 = 0; k0 < K; k0 += FSW_BK) {
+#pragma unroll
+        for (int step = 0; step < 2; ++step) {
+            const int dw = tid + step * FSW_THREADS;
+            const int r1 = dw / (FSW_BK / 2), c1 = dw % (FSW_BK / 2);
+            *reinterpret_cast<__half2*>(&sA[r1][c1 * 2]) =
+                *reinterpret_cast<const __half2*>(&A[(size_t)(m0 + r1) * K + k0 + c1 * 2]);
+            *reinterpret_cast<__half2*>(&sB[r1][c1 * 2]) =
+                *reinterpret_cast<const __half2*>(&B[(size_t)(n0 + r1) * K + k0 + c1 * 2]);
+        }
+        __syncthreads();
+        const int rm = tm * FSW_TM, rn = tn * FSW_TN;
+#pragma unroll
+        for (int kk = 0; kk < FSW_BK; kk += 2) {
+            __half2 a[FSW_TM], b[FSW_TN];
+#pragma unroll
+            for (int i = 0; i < FSW_TM; ++i) a[i] = *reinterpret_cast<const __half2*>(&sA[rm + i][kk]);
+#pragma unroll
+            for (int j = 0; j < FSW_TN; ++j) b[j] = *reinterpret_cast<const __half2*>(&sB[rn + j][kk]);
+#pragma unroll
+            for (int i = 0; i < FSW_TM; ++i)
+#pragma unroll
+                for (int j = 0; j < FSW_TN; ++j) acc[i][j] = fsw_fdot2(a[i], b[j], acc[i][j]);
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int i = 0; i < FSW_TM; ++i)
+#pragma unroll
+        for (int j = 0; j < FSW_TN; ++j) C[(size_t)(m0 + tm * FSW_TM + i) * N + (n0 + tn * FSW_TN + j)] = acc[i][j];
+}
+
+static bool GEMM_FDOT2_SW_route() {
+    return std::getenv("STRATA_FDOT2_SW") != nullptr;
+}
+static bool GEMM_FDOT2_SW_form(int64_t T, int64_t N, int64_t K) {
+    static const int64_t frms[][4] = {  // verified: see research/mi50-gfx906 per-shape table 07.10
+        {10240, 320, 0, 0}, {320, 10240, 0, 0},
+        {10240, 2560, 0, 0}, {6144, 2560, 0, 0}, {12288, 2560, 0, 0},
+        {2560, 6144, 0, 0}, {2560, 640, 0, 0},
+        {640, 2560, 0, 0}, {512, 2560, 0, 0},
+    };
+    for (auto& f : frms) if (f[0] == N && f[1] == K) return true;
+    return false;
+}
+#endif // __HIPCC__
+
 bool Gemm::bf16_hcd_exact(const uint16_t* X, int64_t ldx, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K) {
 #if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
     static std::atomic<bool> told{false};
@@ -573,6 +707,21 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
     if (T <= 0 || N <= 0) return;
     if (ldy <= 0) ldy = N;
     if (ldx <= K) ldx = 0;
+#if defined(__HIPCC__)
+    if (gemm_f16_mode() != 0) {
+        uint16_t *xs = nullptr, *ws = nullptr;
+        if (cvt_bf16_to_f16(X, (int64_t) T * K, stream_, &xs, 0) &&
+            cvt_bf16_to_f16(W, (int64_t) N * K, stream_, &ws, 1)) {
+            f16(xs, ws, Y, T, N, K, ldy, beta);
+            return;
+        }
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            std::fprintf(stderr, "prefill gemm: the BF16->FP16 scratch did not fit; staying on the BF16 path\n");
+        }
+    }
+#endif
 #ifdef STRATA_USE_HIP
     // #313 (opt-in STRATA_WMMA_GEMM=1; STRATA_WMMA_BF16=0 excludes bf16): RDNA3 / RDNA3.5 WMMA dense GEMM, before
     // hipBLASLt; it returns false for shapes it does not take (and off gfx11) and this falls through
@@ -652,6 +801,15 @@ void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_
                float beta) {
     if (T <= 0 || N <= 0) return;
     if (ldy <= 0) ldy = N;
+    if (GEMM_FDOT2_SW_route() && beta == 0.0f && ldy == N && T % 64 == 0 &&
+        GEMM_FDOT2_SW_form(T, N, K)) {
+        if (std::getenv("STRATA_FDOT2_SW_VERBOSE") != nullptr)
+            std::fprintf(stderr, "GEMMSWFIRED T=%lld N=%lld K=%lld\n", (long long) T, (long long) N, (long long) K);
+        gemm_fdot2_sw<<<dim3((unsigned) (N / 64), (unsigned) (T / 64)), FSW_THREADS, 0, (hipStream_t) stream_>>>
+            (reinterpret_cast<const __half*>(X), reinterpret_cast<const __half*>(W), Y, (int) T, (int) N, (int) K);
+        STRATA_ABSORB_HIPBLAS_STICKY("GEMM_FDOT2_SW");
+        return;
+    }
 #ifdef STRATA_USE_HIP
     // #313 (opt-in STRATA_WMMA_GEMM=1): RDNA3 / RDNA3.5 WMMA dense GEMM, before hipBLASLt (falls through when false)
     static const bool wmma_on = [] { const char* v = std::getenv("STRATA_WMMA_GEMM"); return v && v[0] != 0 && v[0] != '0'; }();
