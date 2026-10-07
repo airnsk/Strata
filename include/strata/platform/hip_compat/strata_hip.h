@@ -51,6 +51,7 @@
 #define cudaEventDisableTiming hipEventDisableTiming
 #define cudaEventBlockingSync hipEventBlockingSync
 #define cudaEventDefault hipEventDefault
+#define cudaEventBlockingSync hipEventBlockingSync
 #define cudaHostAllocDefault hipHostMallocDefault
 #define cudaHostAllocPortable hipHostMallocPortable
 #define cudaHostAllocMapped hipHostMallocMapped
