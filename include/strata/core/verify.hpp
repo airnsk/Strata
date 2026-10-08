@@ -268,6 +268,10 @@ public:
     /// STRATA_VERIFY_PROFILE=1 - GPU stage times of the windows since the last call (ms per
     /// window), as one line; empty when off.
     std::string profile_report();
+    /// STRATA_VERIFY_PHASE=1 - run()'s host-side phase balance since the last call, ms per window,
+    /// one line per window size T: non-overlapping brackets around the waits/syncs/work that already
+    /// exists (no new GPU synchronization; the numbers are summed in memory and printed per request).
+    std::string verify_phase_report();
 
 private:
     RemoteExpertOpt* remote_opt_ = nullptr;
@@ -381,6 +385,16 @@ private:
     std::vector<unsigned long long> prof_h_;
     double prof_sum_[2][kProfPer] = {};   // [GDN / QSA layers][stage]
     int64_t prof_windows_ = 0;
+    // STRATA_VERIFY_PHASE: run()'s segments summed per T; n windows.  The segments tile the call's
+    // wall with no overlap (each bracket only braces work that was already there); "rest" (the wall
+    // minus the sum) is what none of them covers.
+    struct VerifyPhase {
+        double cap = 0, stage = 0, launch = 0, wait = 0, lay_cpu = 0, ple = 0, sync_fin = 0, copy_wait = 0,
+               sample = 0, out = 0, wall = 0;
+        uint64_t n = 0, captures = 0, ple_n = 0;
+    };  // cap brackets capture/capture_commit only: refresh_ar() runs BEFORE the wall timer starts (review 08.10)
+    bool vph_on_ = false;
+    std::vector<VerifyPhase> vph_;
 
     const WeightTable* wt_ = nullptr;
     const ModelGeometry* g_ = nullptr;

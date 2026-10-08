@@ -140,6 +140,12 @@ public:
     double ms_draft = 0, ms_prefill = 0;
     int64_t rounds = 0;
 
+    /// STRATA_MTP_PHASE=1 - draft()'s host-side phase balance since the last call (ms per round), one
+    /// line per round length T: non-overlapping brackets around existing waits/launches; no new GPU
+    /// synchronization anywhere.  The labels are host brackets on the drafter's stream (`stream()`):
+    /// the GPU may compute inside any of them, and 'wait' IS the GPU computing a step the host spun on.
+    std::string mtp_phase_report();
+
     /// E-9: the prompt path computes this layer's prompt K/V in batches (Prefill::draft_kv): its tensors, its K/V
     /// state, the first cell a round can still read, its device, and a wait for its own stream.
     const float* tensor_f32(const char* name) const { return f32(name); }
@@ -190,6 +196,15 @@ private:
     const NativeHead* head_ = nullptr;
     const float* window_R_ = nullptr;
     int max_t_ = 0;
+    // STRATA_MTP_PHASE: draft()'s segments summed per T (the round's window size); n rounds, steps drafts.
+    // All segments are host brackets on one thread and never overlap each other; 'rest' (wall minus sum)
+    // is bookkeeping slivers.  GPU timelines are NOT derived from these numbers.
+    struct PhaseTot {
+        double cap = 0, prep = 0, l_round = 0, l_steps = 0, gap = 0, wait = 0, prefetch = 0, fin = 0, wall = 0;
+        uint64_t n = 0, steps = 0;
+    };
+    bool mph_on_ = false;
+    std::vector<PhaseTot> mph_;
     int device_ = -1;   ///< the device `load` ran on: the public calls switch to it (layer split)
     int max_drafts_ = 1 << 30;
     bool hnorm_stream_ = false;

@@ -249,6 +249,7 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     if (ple_ss_ == nullptr) ple_ss_ = &ss;
     max_t_ = max_t;
     rt_dir_ = rt_dir;
+    mph_on_ = std::getenv("STRATA_MTP_PHASE") != nullptr;
     if (max_t < 1 || max_t > strata::kernels::kVerifyMaxT) { err = "mtp: max_t out of range"; return false; }
     if (shared != nullptr) {
         if (shared->device_ != device_ || shared->g_ != &g || shared->dense_ == nullptr ||
@@ -1251,10 +1252,14 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     // rows is not caught up - no later read reaches a cell past the one being drafted and the next round writes it first
     if (!mtp_catchup_all()) T = a + 1;
     const bool cp = coupled_active_;   // coupled draft sampling for this request: its own graphs
+    const bool mph = mph_on_;
+    if (mph && (int) mph_.size() <= T) mph_.resize((size_t) max_t_ + 1);
+    const Clock::time_point vt_c = mph ? Clock::now() : (Clock::time_point) Clock::duration::zero();
     if (!capture_round(T, cp, err)) return false;
     const int max_steps = std::min(max_t_ - 1, max_drafts_);
     for (int j = 1; j < max_steps; ++j)
         if (!capture_step(j, cp, err)) return false;
+    if (mph) mph_[(size_t) T].cap += ms_since(vt_c);
     const Clock::time_point t0 = Clock::now();
     const int64_t NH = g_->n_head;
     auto put = [&](int row, int64_t cell) {
@@ -1277,6 +1282,8 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     if (h_force_ != nullptr) for (int j = 0; j < 16; ++j) h_force_[j] = -1;   // the forcing kernels: no-ops here
     std::atomic_thread_fence(std::memory_order_seq_cst);
     if (!stage_source_R(T, err)) return false;
+    if (mph) mph_[(size_t) T].prep += ms_since(t0);
+    Clock::time_point vt_prev = t0;
 
     SessionState* const pss = ple_ss_ ? ple_ss_ : ss_;
     const bool do_ple = pss != nullptr && pss->ple.ready() && pss->ple.table != nullptr;
@@ -1292,6 +1299,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
 
     int n = 0;
     if (min_p <= 0.0f && max_steps > 0) {
+        const Clock::time_point vt_r = mph ? Clock::now() : (Clock::time_point) Clock::duration::zero();
         if (cudaGraphLaunch(cp ? round_exec_c_[T] : round_exec_[T], cs_) != cudaSuccess) {
             err = std::string("mtp draft: ") + cudaGetErrorString(cudaGetLastError());
             return false;
@@ -1303,9 +1311,11 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
             }
         }
         (void) cudaStreamQuery(cs_);
+        if (mph) { mph_[(size_t) T].l_round += ms_since(vt_r); }
         prefetch_ple(tokens[a]);
         for (int j = 0; j + 1 < max_steps; ++j) {
             uint32_t spins = 0;
+            const Clock::time_point vt_w = mph ? Clock::now() : (Clock::time_point) Clock::duration::zero();
             while (((volatile int32_t*) h_out_)[j] < 0) {
 #if defined(_WIN32) || defined(__x86_64__)
                 _mm_pause();
@@ -1314,8 +1324,12 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
             }
             drafts[j] = ((volatile int32_t*) h_out_)[j];
             if (probs) probs[j] = ((volatile float*) h_prob_)[j];
+            if (mph) mph_[(size_t) T].wait += ms_since(vt_w);
+            const Clock::time_point vt_p = mph ? Clock::now() : (Clock::time_point) Clock::duration::zero();
             prefetch_ple(drafts[j]);
+            if (mph) mph_[(size_t) T].prefetch += ms_since(vt_p);
         }
+        const Clock::time_point vt_f = mph ? Clock::now() : (Clock::time_point) Clock::duration::zero();
         if (cudaStreamSynchronize(cs_) != cudaSuccess) {
             err = std::string("mtp draft: ") + cudaGetErrorString(cudaGetLastError());
             return false;
@@ -1324,14 +1338,19 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         drafts[last] = ((volatile int32_t*) h_out_)[last];
         if (probs) probs[last] = ((volatile float*) h_prob_)[last];
         prefetch_ple(drafts[last]);
+        if (mph) mph_[(size_t) T].fin += ms_since(vt_f);
         n = max_steps;
     } else if (max_steps > 0) {
+        Clock::time_point vt_r = mph ? Clock::now() : (Clock::time_point) Clock::duration::zero();
         if (cudaGraphLaunch(cp ? round_exec_c_[T] : round_exec_[T], cs_) != cudaSuccess) {
             err = std::string("mtp draft: ") + cudaGetErrorString(cudaGetLastError());
             return false;
         }
         (void) cudaStreamQuery(cs_);
+        if (mph) { mph_[(size_t) T].l_round += ms_since(vt_r); vt_prev = Clock::now(); }
+        vt_r = mph ? Clock::now() : (Clock::time_point) Clock::duration::zero();
         prefetch_ple(tokens[a]);
+        if (mph) { mph_[(size_t) T].prefetch += ms_since(vt_r); vt_prev = Clock::now(); }
         auto wait_step = [&](int j) {
             uint32_t spins = 0;
             while (((volatile int32_t*) h_out_)[j] < 0) {
@@ -1341,35 +1360,73 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
                 if ((++spins & 1023u) == 0 && cudaStreamQuery(cs_) != cudaErrorNotReady) break;
             }
         };
+        vt_r = mph ? Clock::now() : (Clock::time_point) Clock::duration::zero();
         wait_step(0);
         drafts[0] = ((volatile int32_t*) h_out_)[0];
         float pj = ((volatile float*) h_prob_)[0];
         if (probs) probs[0] = pj;
         n = 1;
+        if (mph) { mph_[(size_t) T].wait += ms_since(vt_r); vt_prev = Clock::now(); }
         for (int j = 1; j < max_steps && pj >= min_p; ++j) {
+            if (mph) mph_[(size_t) T].gap += ms_since(vt_prev);
+            vt_r = mph ? Clock::now() : (Clock::time_point) Clock::duration::zero();
             if (cudaGraphLaunch(cp ? step_exec_c_[j] : step_exec_[j], cs_) != cudaSuccess) {
                 err = std::string("mtp draft step: ") + cudaGetErrorString(cudaGetLastError());
                 return false;
             }
             (void) cudaStreamQuery(cs_);
+            if (mph) mph_[(size_t) T].l_steps += ms_since(vt_r);
+            vt_r = mph ? Clock::now() : (Clock::time_point) Clock::duration::zero();
             prefetch_ple(drafts[j - 1]);
+            if (mph) { mph_[(size_t) T].prefetch += ms_since(vt_r); vt_prev = Clock::now(); }
+            vt_r = mph ? Clock::now() : (Clock::time_point) Clock::duration::zero();
             wait_step(j);
             drafts[j] = ((volatile int32_t*) h_out_)[j];
             pj = ((volatile float*) h_prob_)[j];
             if (probs) probs[j] = pj;
             ++n;
+            if (mph) { mph_[(size_t) T].wait += ms_since(vt_r); vt_prev = Clock::now(); }
         }
+        if (mph) mph_[(size_t) T].gap += ms_since(vt_prev);
+        vt_r = mph ? Clock::now() : (Clock::time_point) Clock::duration::zero();
         prefetch_ple(drafts[n - 1]);
         if (cudaStreamSynchronize(cs_) != cudaSuccess) {
             err = std::string("mtp draft: ") + cudaGetErrorString(cudaGetLastError());
             return false;
         }
+        if (mph) mph_[(size_t) T].fin += ms_since(vt_r);
     }
     for (int j = n; j < max_t_ - 1; ++j) { drafts[j] = 0; if (probs) probs[j] = 0.0f; }
     if (n_drafts) *n_drafts = n;
     ms_draft += ms_since(t0);
     ++rounds;
+    if (mph) { PhaseTot& B = mph_[(size_t) T]; B.wall += ms_since(vt_c); ++B.n; B.steps += (uint64_t) n; }
     return true;
+}
+
+// STRATA_MTP_PHASE: draft()'s host-side segment balance per round length T, as in Verifier's phase
+// balance.  Host brackets on the drafter's stream; the GPU may compute inside each.  'gap' is the host
+// turnaround between a result being read and the next step's launch (the host round-trip candidate);
+// 'wait' is the host spinning on the mapped result while the GPU computes that step.
+std::string MtpDrafter::mtp_phase_report() {
+    if (!mph_on_ || mph_.empty()) return std::string();
+    std::string s;
+    char b[512];
+    for (size_t T = 1; T < mph_.size(); ++T) {
+        const PhaseTot& v = mph_[T];
+        if (v.n == 0) continue;
+        const double w = (double) v.n;
+        const double sum = v.cap + v.prep + v.l_round + v.l_steps + v.gap + v.wait + v.prefetch + v.fin;
+        std::snprintf(b, sizeof b,
+                      "strata mtp phase T=%zu: %lld rounds, %.2f steps/round, wall %.2f ms/r = cap %.2f + prep %.2f "
+                      "+ launch-round %.2f + launches %.2f + gap %.2f (host between read and next launch) + wait %.2f "
+                      "(host waiting a step's result, GPU computes inside) + prefetch %.2f + fin-sync %.2f -> rest %.2f\n",
+                      T, (long long) v.n, (double) v.steps / w, v.wall / w, v.cap / w, v.prep / w, v.l_round / w,
+                      v.l_steps / w, v.gap / w, v.wait / w, v.prefetch / w, v.fin / w, (v.wall - sum) / w);
+        s += b;
+    }
+    for (auto& v : mph_) v = PhaseTot{};   // printed per request, then fresh
+    return s;
 }
 
 bool MtpDrafter::stage_source_R(int T, std::string& err) {

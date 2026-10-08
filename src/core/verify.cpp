@@ -579,6 +579,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
 #endif
     }
     prof_on_ = std::getenv("STRATA_VERIFY_PROFILE") != nullptr;
+    vph_on_ = std::getenv("STRATA_VERIFY_PHASE") != nullptr;
     if (prof_on_) {
         const size_t np = (size_t) g.n_layers * kProfPer + 4;
         if (cudaMalloc((void**) &prof_, np * 8) != cudaSuccess) { prof_on_ = false; prof_ = nullptr; cudaGetLastError(); }
@@ -1654,6 +1655,34 @@ std::string Verifier::profile_report() {
     return out;
 }
 
+// STRATA_VERIFY_PHASE: run()'s host-side segment balance, ms per window, one line per window size T.
+// The segments are non-overlapping brackets around waits/syncs/work that was already there (no new GPU
+// synchronization anywhere; everything is summed in memory and printed per request, then reset).
+// "rest" (the wall minus the printed sum) is what no bracket covers: launch post-checks, loop
+// bookkeeping, progress output, the state checks between phases.
+std::string Verifier::verify_phase_report() {
+    if (!vph_on_ || vph_.empty()) return std::string();
+    std::string s;
+    char b[512];
+    for (size_t T = 1; T < vph_.size(); ++T) {
+        const VerifyPhase& v = vph_[T];
+        if (v.n == 0) continue;
+        const double w = (double) v.n;
+        const double sum = v.cap + v.stage + v.launch + v.wait + v.lay_cpu + v.ple + v.sync_fin + v.copy_wait +
+                           v.sample + v.out;
+        std::snprintf(b, sizeof b,
+                      "strata verify phase T=%zu: %lld windows, wall %.2f ms/w = cap %.2f (real captures %lld) "
+                      "+ stage %.2f + launch %.2f + wait %.2f (per-layer GPU reach) + layCPU %.2f + PLE %.2f "
+                      "(gather %lld of %lld) + final-sync %.2f + copy %.2f + sample %.2f + out %.2f -> rest %.2f\n",
+                      T, (long long) v.n, v.wall / w, v.cap / w, (long long) v.captures, v.stage / w, v.launch / w,
+                      v.wait / w, v.lay_cpu / w, v.ple / w, (long long) v.ple_n, (long long) v.n, v.sync_fin / w,
+                      v.copy_wait / w, v.sample / w, v.out / w, (v.wall - sum) / w);
+        s += b;
+    }
+    for (auto& v : vph_) v = VerifyPhase{};   // printed once per request, then fresh buckets
+    return s;
+}
+
 // #871: is the zero-doorbell graph right for the next window?  Only while every expert of [lb_, le_) is in VRAM now
 // (the host table is the one the device copy was uploaded from; a loan, a VRAM shrink or a swap in flight has
 // marked some -1).  Not: the doorbell graph, which asks the pool for what the device does not hold.
@@ -1700,6 +1729,7 @@ bool Verifier::capture(int T, std::string& err) {
         err = std::string("verify: end capture: ") + cudaGetErrorString(ce);
         return false;
     }
+    if (vph_on_ && !vph_.empty() && T < (int) vph_.size()) ++vph_[(size_t) T].captures;
 #if !defined(STRATA_USE_HIP)   // a CUDA debug listing (node types, kernel names)
     if (std::getenv("STRATA_VERIFY_NODES") != nullptr) {   // what the window graph holds
         size_t nn = 0;
@@ -1914,8 +1944,12 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     const ModelGeometry& g = *g_;
     SessionState& ss = *ss_;
     if (pos0 + T > ss.qsa_states[ss.qsa_primary()].max_cells) { err = "verify: the window runs past the context"; return false; }
-    refresh_ar();
+    const bool vph = vph_on_;
+    if (vph && (int) vph_.size() <= T) vph_.resize((size_t) max_t_ + 1);
+    refresh_ar();   // review 08.10: outside the wall timer, so 'cap' brackets capture only (matches the report text)
+    const Clock::time_point vt_run = vph ? Clock::now() : (Clock::time_point) Clock::duration::zero();
     if (!capture(T, err) || !capture_commit(err)) return false;
+    if (vph) vph_[(size_t) T].cap += ms_since(vt_run);
     VDBG("captured; staging\n");
     const Clock::time_point t0 = Clock::now();
     if (!staged_) stage_inputs(T, tokens, pos0);
@@ -1935,13 +1969,16 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     std::atomic_thread_fence(std::memory_order_seq_cst);
     trace_ev("WINDOW", -1, -1, pos0 * 16 + T);
     ms_host += ms_since(t0);
+    if (vph) vph_[(size_t) T].stage += ms_since(t0);
     VDBG("staged; launching\n");
+    const Clock::time_point vt_l = vph ? Clock::now() : (Clock::time_point) Clock::duration::zero();
     if (ar_on() && h_plan_err_ != nullptr) *(volatile uint32_t*) h_plan_err_ = 0;
     const cudaError_t le = cudaGraphLaunch(ar_off_ ? exec_nr_[T] : exec_[T], cs_);
     trace_ev("LAUNCHED", -1, -1, (int64_t) le);
     if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
     (void) cudaStreamQuery(cs_);
     VDBG("launched\n");
+    if (vph) vph_[(size_t) T].launch += ms_since(vt_l);
     volatile uint32_t* const seq = h_seq_;
     volatile uint32_t* const flag = h_flag_;
     const int G = groups_[T] > 0 ? groups_[T] : 1;
@@ -1955,7 +1992,9 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             std::atomic_thread_fence(std::memory_order_seq_cst);
             _mm_sfence();
             *flag = 1;
-            ms_host += ms_since(tp);
+            const double gms = ms_since(tp);
+            ms_host += gms;
+            if (vph) { vph_[(size_t) T].ple += gms; ++vph_[(size_t) T].ple_n; }
         } else {
             *flag = 1;
         }
@@ -2029,16 +2068,27 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         // By collecting PLE here at k == 0 (after publishing flagA/flagB for Layer 0 so the GPU can run
         // Layer 0's VRAM experts, and before raising *flag = 1), the NVMe PLE reads overlap with both
         // MtpDrafter::draft and Layer 0's attention + router + expert execution!
+        double ple_ms = 0.0;
         if (k == 0 && do_ple) {
             const Clock::time_point tp = Clock::now();
             if (!ss.ple.table->gather_batch(ple_rows, (size_t) T, h_ple_, err)) return false;
             std::atomic_thread_fence(std::memory_order_seq_cst);
             _mm_sfence();
-            ms_host += ms_since(tp);
+            ple_ms = ms_since(tp);
+            ms_host += ple_ms;
         }
         if (!(test_stall && k + 1 == steps)) *flag = want;
         ms_wait += std::chrono::duration<double, std::milli>(b - a).count();
-        ms_pool += ms_since(b);
+        // the host PLE gather (k == 0) is already in ms_host: ms_pool keeps only the segments around it,
+        // and the phase balance books it once as its own segment
+        const double seg = std::chrono::duration<double, std::milli>(Clock::now() - b).count() - ple_ms;
+        ms_pool += seg;
+        if (vph) {
+            VerifyPhase& vb = vph_[(size_t) T];
+            vb.wait += std::chrono::duration<double, std::milli>(b - a).count();
+            vb.lay_cpu += seg;
+            if (ple_ms > 0) { vb.ple += ple_ms; ++vb.ple_n; }
+        }
     }
     // (#646 staged the next stage's inputs here; 0.1.39b keeps the layer split's order: each stage stages its own)
     progress_at("verify window: waiting for the GPU to finish the window (flags A/B/M raised)", (int64_t) T);
@@ -2048,7 +2098,9 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     // itself stays a blocking sync: a cudaStreamQuery poll here cost IQ3_S ~3% decode (a core calling the driver
     // beside the expert workers).
     trace_ev("SYNC", -1, -1, 0);
+    const Clock::time_point vt_s = vph ? Clock::now() : (Clock::time_point) Clock::duration::zero();
     const cudaError_t se = cudaStreamSynchronize(cs_);
+    if (vph) vph_[(size_t) T].sync_fin += ms_since(vt_s);
     trace_ev("SYNCED", -1, -1, (int64_t) se);
     if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
     if (ar_on() && h_plan_err_ != nullptr && *(volatile uint32_t*) h_plan_err_ != 0) {   // #871: refresh_ar saw the table whole
@@ -2059,7 +2111,9 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     commit_pending_ = false;
     progress_at("verify window: waiting for the expert copies", (int64_t) T);
     if (copy_used_) {
+        const Clock::time_point vt_c = vph ? Clock::now() : (Clock::time_point) Clock::duration::zero();
         cudaStreamSynchronize(copy_);   // no host function of this window may raise flag B in the next one
+        if (vph) vph_[(size_t) T].copy_wait += ms_since(vt_c);
         copy_used_ = false;
     }
     if (prof_on_ && G == 1) collect_profile();   // the window's GPU stage stamps
@@ -2068,11 +2122,13 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     // the POSITION it samples, not to how the text was cut into windows, so a seed replays the same text whatever
     // the drafts were. Exact: a rejected row's draw is discarded, and no kept decision depends on a reused draw.
     if (le_ < g.n_layers) {   // a layer split's earlier stage: the hand-off is written (synced above)
+        if (vph) { VerifyPhase& vb = vph_[(size_t) T]; vb.wall += ms_since(vt_run); ++vb.n; }
         ++windows;
         return next_ == nullptr || next_->run(T, tokens, pos0, pool, next_user_, out, err);
     }
     const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;
     if (head_sampling_ && (sampled || hist_d_ != nullptr)) {
+        const Clock::time_point vt_sm = vph ? Clock::now() : (Clock::time_point) Clock::duration::zero();
         SamplerParams sp = sampling_;
         sp.counter = (uint64_t) pos0;
         // STRATA_SPEC_PROB: the drafter's q lists for this window, judged by rejection sampling (spec_prob.hpp)
@@ -2103,8 +2159,11 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             err = "verify: the head sampling failed";
             return false;
         }
+        if (vph) vph_[(size_t) T].sample += ms_since(vt_sm);
     }
+    const Clock::time_point vt_o = vph ? Clock::now() : (Clock::time_point) Clock::duration::zero();
     for (int t = 0; t < T; ++t) out[t] = ((volatile int32_t*) h_out_)[t];
+    if (vph) vph_[(size_t) T].out += ms_since(vt_o);
     if (static const bool dbg = std::getenv("STRATA_DBG_NAN") != nullptr; dbg) {   // debug: the first non-finite head
         static bool reported = false;
         if (!reported) {
@@ -2121,6 +2180,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             }
         }
     }
+    if (vph) { VerifyPhase& vb = vph_[(size_t) T]; vb.wall += ms_since(vt_run); ++vb.n; }
     VDBG("window done\n");
     ++windows;
     progress_at("decode");

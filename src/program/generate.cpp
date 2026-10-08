@@ -10788,6 +10788,14 @@ int main(int argc, char** argv) {
                              (d1.actq - ds0.actq) / w, (d1.jobs - ds0.jobs) / w, (d1.run - ds0.run) / w,
                              (d1.host - ds0.host) / w, dt_commit / w, dt_draft / w, (d1.misses - ds0.misses) / (w * L),
                              (d1.entries - ds0.entries) / (w * L), (d1.hits - ds0.hits) / (w * L), (d1.pcie - ds0.pcie) / (w * L));
+                if (std::getenv("STRATA_VERIFY_PHASE") != nullptr) {   // the same windows' non-overlapping host balance per T
+                    const std::string vp = ver.verify_phase_report();
+                    if (!vp.empty()) std::fputs(vp.c_str(), stderr);
+                }
+                if (std::getenv("STRATA_MTP_PHASE") != nullptr) {   // draft()'s host-side balance per round length T
+                    const std::string mp = mtp.mtp_phase_report();
+                    if (!mp.empty()) std::fputs(mp.c_str(), stderr);
+                }
                 for (int st = 0; st < n_stages; ++st) {   // every stage's GPU profile, not only the first card's
                     const std::string pr = stage_ver(st).profile_report();
                     if (pr.empty()) continue;
