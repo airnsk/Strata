@@ -1,9 +1,30 @@
 # Experimental Castagna-inspired gfx906 port
 
-Status: implementation prepared, GPU build, numerical parity and performance **not yet validated**.
+Status (2026-10-09): HIP 7.2.4 build and model-free bitwise parity **passed on two MI50 cards**.
+Performance acceptance **failed**: this first implementation is approximately 4.6–9.8 times slower than
+the checked production HC path in the supplied stage benchmark. Keep it disabled; do not deploy it.
+Whole-model parity and performance have not been tested.
 This is the first stage of a larger decode optimization effort. It does not establish a 30–50% decode gain.
 The engine's existing path remains the default. The build flag also defaults to OFF so an unused experimental
 kernel cannot consume VRAM under eager loading and change default expert-cache residency.
+
+## First hardware result
+
+Commit `634b6614`, two gfx906 MI50 32 GiB cards, HIP runtime `70253211`. Both cards passed
+32 HC configurations, 32 router configurations, 24 graph replays per case, subgroup offsets,
+T=5–8/Q8 fallbacks and isolated streams. This establishes only the tested model-free cases.
+
+Representative GPU 0 graph timings (microseconds, median of five alternating pairs):
+
+| T | Router experts | Checked baseline | Persistent |
+|---|---:|---:|---:|
+| 1 | none | 48.725 | 445.664 |
+| 4 | 256 | 85.922 | 530.235 |
+| 4 | 512 | 123.257 | 564.132 |
+
+GPU 1 showed the same regression. Timings include the stream interval for repeated submissions;
+they do not isolate kernel-body execution from cooperative-launch scheduling or host submission gaps.
+The failure requires diagnosis, not another whole-model A/B run with this unchanged kernel.
 
 ## What this stage changes
 
@@ -124,3 +145,46 @@ g++ -std=c++17 -O2 -Wall -Wextra -Werror -Iinclude \
    Castagna's all-reduce alone would not make both cards compute each layer concurrently.
 
 Each stage needs repeatable parity/quality checks and end-to-end measurements before changing a default.
+
+### Standalone launch/barrier diagnostic
+
+After the two-card parity pass and performance failure, isolate launch scheduling
+from math before another full-model run. This probe needs no Strata rebuild,
+model files, or external downloads. In the same ROCm 7.2.4 environment:
+
+```sh
+/opt/rocm/bin/hipcc -O3 -std=c++17 --offload-arch=gfx906 -x hip \
+  tests/hip/hc_persistent_diag.cpp -o /tmp/hc_persistent_diag
+HIP_VISIBLE_DEVICES=0 timeout --signal=TERM --kill-after=10s 120s \
+  /tmp/hc_persistent_diag 100
+```
+
+For the existing read-only Docker run, keep its image, device flags and repository
+mount, compile and execute inside that container, and leave the output binary in
+its writable `/tmp`. One idle MI50 is enough for this diagnostic.
+
+The same zero-barrier probe runs with ordinary and cooperative launch. Other
+probes add one, two, or three grid barriers. The small matrix uses 60/160 blocks,
+256 threads, and 5/20 KiB dynamic LDS; configurations beyond reported cooperative
+occupancy are skipped. It prints function attributes, event and wall time per
+launch, and raw `clock64` cycle deltas for each block in the last launch. Raw cycles
+are not converted using an assumed frequency.
+
+Three submission modes are compared: eager, one-node graph replay, and a graph
+containing 100 serial nodes replayed three times. The last tests caller replay
+overhead; cooperative graph nodes can still be host-dispatched by the runtime.
+Graph construction, warmup and readback are outside the timed interval.
+
+Interpretation:
+
+- Slow cooperative zero-barrier launches with short in-kernel cycle counts place
+  most time outside the measured kernel body. They do not alone distinguish
+  queue switching, runtime dispatch and GWS initialization.
+- A large cost added by one/two/three barriers implicates barrier handling.
+- Fast empty probes mean the actual HC bodies and their resource usage need the
+  next inspection. These probes do not reproduce HC register pressure, spills,
+  static LDS or arithmetic, and do not prove a speedup.
+
+This diagnostic has host C++ syntax checking and source review only in the
+assistant environment, which has no HIP compiler or GPU. HIP compilation and
+hardware results are still required.
