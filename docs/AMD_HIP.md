@@ -505,6 +505,13 @@ For comparison on the same machine: llama.cpp (3cf0325, ROCm) on the same Coder 
 same gfx906 ISA; not run), a single-card run, the tensor-split experiment (the halves of every layer on two cards;
 it works but is not part of this build).
 
+**Experimental Castagna-inspired HC/router fusion:** build with `-DSTRATA_HC_PERSIST_BUILD=ON`, then
+`STRATA_HC_PERSIST=1` combines the verify window's BF16
+hyper-connection read and, where eligible, its router projection in one cooperative kernel. This branch's first
+stage is opt-in, requires gfx906 and a graph-capable HIP runtime >= 6.4, and has not yet passed a GPU build or
+hardware parity/performance checks. ROCm 6.3.3 keeps the existing kernels. Use a separate build/runtime and the
+model-free acceptance harness before model testing; see [CASTAGNA_PORT.md](CASTAGNA_PORT.md).
+
 ## Tuning table
 
 A hipBLASLt table holds solution ids that are valid only for one GPU architecture and one hipBLASLt version, so it

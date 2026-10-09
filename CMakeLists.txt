@@ -62,6 +62,15 @@ option(STRATA_ENABLE_CUDA "Build the CUDA targets (Phase 2+)" OFF)
 # separate from STRATA_ENABLE_HIP (the wave32 RDNA backend): with it on, STRATA_ENABLE_CUDA is on and
 # STRATA_ENABLE_HIP stays off, so every "CUDA" branch of the tree is the one taken.
 option(STRATA_HIP_GFX906 "Build the CUDA targets for AMD gfx906 through HIP (wave64 compat layer)" OFF)
+# Keep experimental device code out of default EAGER-loading builds: even an unused
+# kernel can otherwise change the VRAM budget and expert-cache residency.
+option(STRATA_HC_PERSIST_BUILD "Build the experimental Castagna-inspired gfx906 HC/router kernel" OFF)
+if(STRATA_HC_PERSIST_BUILD)
+  if(NOT STRATA_HIP_GFX906)
+    message(FATAL_ERROR "STRATA_HC_PERSIST_BUILD requires STRATA_HIP_GFX906=ON")
+  endif()
+  add_compile_definitions(STRATA_HC_PERSIST_BUILD=1)
+endif()
 if(STRATA_HIP_GFX906)
   if(STRATA_ENABLE_HIP)
     message(FATAL_ERROR "STRATA_HIP_GFX906 and STRATA_ENABLE_HIP are separate backends; enable only one")
@@ -236,6 +245,10 @@ target_link_libraries(strata-dequant PRIVATE strata_artifact)
 # this file is now nothing but the CLI entry point, and its inherited guard spells that as a "selftest"
 target_compile_definitions(strata-dequant PRIVATE STRATA_DEQUANT_SELFTEST)
 if(STRATA_BUILD_TESTS)
+  # No GPU dependency: reject unsupported persistent-HC dispatches before launch.
+  add_executable(hc_persistent_policy tests/hip/hc_persistent_policy.cpp)
+  target_link_libraries(hc_persistent_policy PRIVATE strata_artifact)
+  add_test(NAME hc_persistent_policy COMMAND hc_persistent_policy)
   # the reader refuses a duplicate tensor name at open, naming it (a synthetic GGUF: no model, no GPU)
   add_executable(gguf_reader_test src/artifact/gguf_reader_test.cpp)
   target_link_libraries(gguf_reader_test PRIVATE strata_artifact)
@@ -353,6 +366,17 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/ngram/ple_reader.cpp
                           src/platform/direct_file.cpp)
   target_link_libraries(strata_kernels PUBLIC strata_core strata_artifact)
+  # Model-free acceptance gate for the opt-in Castagna-inspired persistent HC path.
+  # Available in opt-in gfx906 builds, including published source without tests/CMakeLists.txt.
+  if(STRATA_HC_PERSIST_BUILD)
+    add_executable(hc_persistent tests/hip/hc_persistent.cpp)
+    target_include_directories(hc_persistent PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(hc_persistent PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    if(STRATA_BUILD_TESTS)
+      add_test(NAME hc_persistent COMMAND hc_persistent)
+      set_tests_properties(hc_persistent PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+    endif()
+  endif()
   # perf-review D-1: the tensor-core prompt attention vs the FP32 kernel and FP64 (GPU, synthetic, no model); with
   # the tests, or alone with -DSTRATA_PARITY_PROMPT_ATTN=ON.  CUDA only: HIP compiles the tensor-core kernel out.
   if((STRATA_BUILD_TESTS OR STRATA_PARITY_PROMPT_ATTN) AND STRATA_ENABLE_CUDA)

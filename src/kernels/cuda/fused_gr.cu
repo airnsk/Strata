@@ -8,6 +8,10 @@
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#if defined(STRATA_HC_PERSIST_BUILD)
+#include <hip/hip_cooperative_groups.h>
+#include "strata/kernels/hc_persistent_policy.hpp"
+#endif
 
 #include <atomic>
 #include <cstdio>
@@ -1646,8 +1650,43 @@ int g_gr_fast = -1;
 #endif
 void fused_gr_set_fast(int on) { g_gr_fast = on; }
 
+#if defined(STRATA_HC_PERSIST_BUILD)
+namespace {
+#include "hc_persistent.cuh"
+}
+#endif
+
+void fused_gr_set_persistent(int on) {
+#if defined(STRATA_HC_PERSIST_BUILD)
+    hcp_override.store(on < 0 ? -1 : (on != 0), std::memory_order_relaxed);
+#else
+    (void) on;
+#endif
+}
+bool fused_gr_persistent_supported(int n_tok) {
+#if defined(STRATA_HC_PERSIST_BUILD)
+    return hcp_blocks(n_tok) > 0;
+#else
+    (void) n_tok;
+    return false;
+#endif
+}
+unsigned long long fused_gr_persistent_launches() {
+#if defined(STRATA_HC_PERSIST_BUILD)
+    return hcp_launch_count;
+#else
+    return 0;
+#endif
+}
+
 bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream, unsigned long long* stamp_buf,
                          int stamp_i0) {
+    return fused_gr_read_multi_router(a, n_tok, xn_scratch, stream, stamp_buf, stamp_i0, nullptr, nullptr);
+}
+
+bool fused_gr_read_multi_router(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream,
+                         unsigned long long* stamp_buf, int stamp_i0, const FusedGrRouter* router, bool* router_written) {
+    if (router_written) *router_written = false;
     if (n_tok < 1 || n_tok > kFusedGrMaxT || xn_scratch == nullptr) {
         std::fprintf(stderr, "fused_gr_read_multi: invalid arguments\n");
         std::exit(1);
@@ -1672,6 +1711,15 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
     m.xn = xn_scratch;
     m.T = n_tok;
     cudaStream_t st = (cudaStream_t) stream;
+#if defined(STRATA_HC_PERSIST_BUILD)
+    if (launch_hcp(m, st, router_written ? router : nullptr, router_written)) {
+        // A persistent call has no separate down/up timing boundaries. Overall
+        // HC timings remain meaningful; phase-stamp slots are left to the caller.
+        return q8;
+    }
+#else
+    (void) router;
+#endif
     if (a[0].q8_down != nullptr && a[0].q8_up != nullptr) {   // inject: Q8_0 copy, or the BF16 rows
         launch_q8(m, xn_scratch, st, stamp_buf, stamp_i0);   // S23 experiment: STRATA_HC_Q8=1
         const cudaError_t eq = cudaGetLastError();

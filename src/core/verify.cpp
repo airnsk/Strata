@@ -14,6 +14,9 @@
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/native_router.hpp"
+#if defined(STRATA_HC_PERSIST_BUILD)
+#include "strata/kernels/router_top10.hpp"
+#endif
 #include "strata/kernels/native_moe.hpp"
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/elementwise.hpp"
@@ -421,6 +424,13 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     release_gpu_fn().store(&release_live_verifiers);
     cudaGetDevice(&device_);   // a layer split's stage on another GPU: its streams, graphs and buffers live there
     strata::kernels::fused_gr_check();   // once per card: which bitwise-equal hyper-connection read runs there
+#if defined(STRATA_HC_PERSIST_BUILD)
+    // Resolve cooperative capability/kernel occupancy outside graph capture.
+    // Off by default: do not query the experimental kernel for ordinary sessions.
+    const char* hc_persist = std::getenv("STRATA_HC_PERSIST");
+    if (hc_persist && std::strcmp(hc_persist, "1") == 0)
+        for (int n = 1; n <= 4; ++n) (void) strata::kernels::fused_gr_persistent_supported(n);
+#endif
     wt_ = &wt;
     g_ = &g;
     ss_ = &ss;
@@ -919,6 +929,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             }
             pending = false;
         }
+#if defined(STRATA_HC_PERSIST_BUILD)
+        bool persistent_router_written = false;
+#endif
         auto gr_read_group = [&](int half, bool apply, float* inj_prev, float* inj_out) {
             FusedGrArgs fa[kFusedGrMaxT];
             for (int t = tb; t < te; ++t) {
@@ -937,8 +950,26 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     else if (strata::kernels::cpu::expert_layout().native) a.q8_mixed = nat_xq_ + (size_t) t * (N / 32) * 36;
                 }
             }
+#if defined(STRATA_HC_PERSIST_BUILD)
+            // HC -> router is one persistent grid when eligible. Top-k, expert
+            // ownership/planning and the CPU doorbell retain their original order.
+            // Respect routing A/B controls and LFUSE's auxiliary shared-gate path.
+            FusedGrRouter router{};
+            const WeightRef* wr = half == 1 ? v.get("ffn_gate_inp.weight") : nullptr;
+            if (wr && wr->kind == WeightKind::Bf16InF32 && dec_batch && !lfuse_on(n) &&
+                !std::getenv("STRATA_ROUTE_PER_TOKEN") && !std::getenv("STRATA_ROUTE_PROJ_PER_TOKEN") &&
+                (NE == 256 || NE == 512)) {
+                router.weights = (const uint16_t*) wr->data;
+                router.logits = logits_ + tb * NE;
+                router.n_expert = (int) NE;
+            }
+            return fused_gr_read_multi_router(fa, n, xn_ + (size_t) tb * HC * N, cs, (prof_on_ && grp == 0) ? prof_ : nullptr,
+                                (int) (l * kProfPer + (half == 0 ? 27 : 30)), &router,
+                                half == 1 ? &persistent_router_written : nullptr);
+#else
             return fused_gr_read_multi(fa, n, xn_ + (size_t) tb * HC * N, cs, (prof_on_ && grp == 0) ? prof_ : nullptr,
                                 (int) (l * kProfPer + (half == 0 ? 27 : 30)));
+#endif
         };
         const bool q8_attn = gr_read_group(0, pending, inj2_, inj_);   // true: xq_ holds mixed's q8_1 (STRATA_QFUSE)
         if (inputs_pending) {   // the window's steps and positions, before the first mixer reads them
@@ -1291,6 +1322,17 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         // move into the combine, gate + up share one launch (all bitwise; resident combine path, 2-8 rows only)
         const WeightRef* w_sgi = lfuse_on(n) && g_lfuse_gate() ? v.get("ffn_gate_inp_shexp.weight") : nullptr;
         bool sg_ready = false;
+#if defined(STRATA_HC_PERSIST_BUILD)
+        if (persistent_router_written) {
+            // Never infer this from the environment flag: a runtime/shape fallback
+            // must still run the ordinary projection below.
+            try {
+                if (native_router_enabled() && NE == 512 && K == 10)
+                    native_router_top10_multi(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n, cs);
+                else router_top10(logits_ + tb * NE, n, (int) NE, (int) K, ids_ + tb * K, w_ + tb * K, cs);
+            } catch (const std::exception& e) { err = "verify persistent router: " + std::string(e.what()); return false; }
+        } else
+#endif
         if (dec_batch && n > 1 && w_router != nullptr && native_router_enabled() && NE == 512 && K == 10) {
             try {
                 if (w_sgi != nullptr)

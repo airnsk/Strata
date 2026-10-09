@@ -59,6 +59,32 @@ constexpr int kFusedGrMaxT = 8;
 bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream,
                          unsigned long long* stamp_buf = nullptr, int stamp_i0 = 0);
 
+struct FusedGrRouter {
+    const uint16_t* weights = nullptr; ///< BF16 [n_expert][2560], FP32 activations
+    float* logits = nullptr;           ///< contiguous [n_tok][n_expert]
+    int n_expert = 0;                   ///< 256 or 512
+};
+/// An optional router projection is folded into the persistent read only. With
+/// router_written != nullptr, it is reset to false and set true ONLY when the
+/// logits were produced; the caller must run its ordinary projection otherwise.
+bool fused_gr_read_multi_router(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream,
+                         unsigned long long* stamp_buf = nullptr, int stamp_i0 = 0,
+                         const FusedGrRouter* router = nullptr, bool* router_written = nullptr);
+
+/// Experimental Castagna-inspired persistent HC, gfx906 only, 1..4 tokens and BF16
+/// HC weights. Build with STRATA_HC_PERSIST_BUILD=ON, then STRATA_HC_PERSIST=1
+/// enables it; otherwise the original path is unchanged.
+/// Unsupported devices, runtimes, token counts or Q8 HC overrides retain the original
+/// kernels. Requires ROCm >= 6.4 and a supported cooperative launch. No token-path
+/// allocation or device-global scratch. Configure before capture, never concurrently.
+/// Test override: -1 = environment (default), 0 = off, 1 = on.
+void fused_gr_set_persistent(int on);
+/// Runtime/occupancy capability only, independent of the opt-in and weight format.
+bool fused_gr_persistent_supported(int n_tok);
+/// Test coverage: successful persistent submissions on this host thread. Capturing
+/// a graph counts once; replay is submitted by the graph runtime and does not count.
+unsigned long long fused_gr_persistent_launches();
+
 /// The bench only: the AMD latency-hidden kernels on (1) or off (0); -1 = STRATA_GR_FAST.
 void fused_gr_set_fast(int on);
 /// The multi read's variants (#315; not main's opt-in STRATA_GR_V3 read, which sums in another order), all computing
