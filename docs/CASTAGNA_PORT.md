@@ -1,9 +1,11 @@
 # Experimental Castagna-inspired gfx906 port
 
-Status (2026-10-09): the first implementation built with HIP 7.2.4 and passed model-free bitwise parity on two MI50 cards.
-The current resource-bounded candidate below is **not yet HIP-compiled or hardware-validated**.
-Performance acceptance **failed**: this first implementation is approximately 4.6–9.8 times slower than
-the checked production HC path in the supplied stage benchmark. Keep it disabled; do not deploy it.
+Status (2026-10-09): candidate `4579439` compiled with HIP 7.2.4 and passed the
+model-free parity suite on one idle MI50. Broad performance acceptance **failed**:
+only T=1 with the fused 512-expert router beat the checked baseline in batched
+graphs. The original implementation had passed parity on both MI50 cards but was
+approximately 4.6–9.8 times slower. Both build/runtime features remain OFF by
+default. Do not enable this path broadly or treat the isolated win as deployment approval.
 Whole-model parity and performance have not been tested.
 This is the first stage of a larger decode optimization effort. It does not establish a 30–50% decode gain.
 The engine's existing path remains the default. The build flag also defaults to OFF so an unused experimental
@@ -240,8 +242,8 @@ const-reference helpers used 185 registers and zero local bytes. Both selected
 422.198 to 62.395 us; T=4 fell from 470.355 to 94.934 us. With 512 router rows,
 T=1 fell from 433.750 to 96.896 us and T=4 from 527.304 to 171.945 us. This
 establishes a large argument-passing regression and its fix, but not an advantage
-over the checked baseline. The current resource redesign still needs HIP
-compilation and full hardware parity/performance checks.
+over the checked baseline. Candidate `4579439` subsequently completed those model-free checks; its measured
+performance and remaining limits are recorded below.
 
 
 ### Resource-bounded candidate after the argument-copy fix
@@ -283,6 +285,65 @@ external router, and candidate fused router. Each graph contains 100 complete HC
 stages, and timings are normalized per stage. All three paths compute the same
 requested outputs. Eager timings remain available separately.
 
-The expected mechanism is lower register pressure, fewer LDS conflicts and more
-resident blocks; achieved register counts, zero-spill status, residency and speed
-must be measured. There is no claimed candidate speedup or whole-model gain.
+The resource changes were intended to lower register pressure and LDS conflicts.
+Hardware confirmed zero reported local bytes for every specialization and two
+resident blocks per CU at T=1; T=2–4 still select one block per CU. The measurements
+below supersede the initial unvalidated resource expectations.
+
+
+### Candidate `4579439`: measured outcome and stopping point
+
+On one idle gfx906 MI50 with HIP runtime `70253211`, compilation and the complete
+model-free suite passed: HC/router bitwise parity, q8 bytes, pending writes,
+subgroup offsets, graph replay, forced-external router parity, isolated streams,
+launch coverage, and T=5–8/Q8 fallbacks. A second-card repeat was not requested:
+the same-card performance comparison already rejects broad activation.
+
+Compiled resources (HC-only / fused-router register counts):
+
+| T | Registers | Local bytes | Active blocks/CU | Selected grid |
+|---|---:|---:|---:|---:|
+| 1 | 100 / 102 | 0 | 2 | 120 |
+| 2 | 146 / 148 | 0 | 1 | 60 |
+| 3 | 188 / 190 | 0 | 1 | 60 |
+| 4 | 230 / 232 | 0 | 1 | 60 |
+
+Representative equal-work batched-graph timings, microseconds per HC stage,
+median of five rotating comparisons, 100 stages per graph:
+
+| T | Router experts | Checked baseline | Candidate HC + external router | Candidate fused router |
+|---|---:|---:|---:|---:|
+| 1 | none | 40.294 | 52.963 | — |
+| 1 | 256 | 46.190 | 59.427 | 61.475 |
+| 1 | 512 | 87.216 | 99.827 | 66.902 |
+| 2 | 512 | 96.342 | 115.334 | 98.293 |
+| 3 | 512 | 105.718 | 124.446 | 113.629 |
+| 4 | none | 69.078 | 86.090 | — |
+| 4 | 512 | 114.850 | 133.117 | 128.074 |
+
+Only T=1/fused-router-512 won: 20.314 us less stage time, approximately 23.3%
+less time or 1.304× stage throughput. All other measured batched-graph cases lost.
+The T=2/router-512 eager result appeared slightly positive, but its fair batched
+graph result was slower; it is not counted as a win. No selective activation or
+default change was made, and there is no whole-model throughput claim.
+
+Further HC tuning stops here. The next work area is the full expert FFN and
+tensor-parallel execution, with the experimental features still disabled. Lessons
+for that work:
+
+- Large by-value helper aggregates can introduce severe per-thread private-memory
+  traffic; inspect compiled local bytes and registers rather than assume inlining
+  removes copies.
+- Eliminating local memory does not guarantee throughput. Exact-T expansion raised
+  registers from 100 to 230 across T=1–4; T>1 remained occupancy-limited despite
+  single-buffer LDS.
+- Cooperative submission has a measured roughly 16–18 us overhead in this setup.
+  Saving several ordinary launches alone was insufficient. Fusion must remove
+  enough actual work or memory traffic to outweigh scheduling and resource costs.
+- Router fusion helped only one tested shape. Keep HC, router, shared-expert and
+  routed-expert work explicit in comparisons, and preserve their exact semantics.
+- Use equal-work multi-stage graphs, output/parity checks, actual path assertions,
+  and compiled resource reports. Eager host-loop improvements alone can mislead.
+- Donor Q4/Q5 expert kernels do not directly cover Strata's IQ1/IQ3 layouts. A full
+  FFN/TP port still requires format-specific kernels, ownership/communication
+  integration, and end-to-end correctness and performance validation.
