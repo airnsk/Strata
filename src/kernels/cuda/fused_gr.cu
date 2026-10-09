@@ -1653,6 +1653,40 @@ void fused_gr_set_fast(int on) { g_gr_fast = on; }
 #if defined(STRATA_HC_PERSIST_BUILD)
 namespace {
 #include "hc_persistent.cuh"
+#include "hc_persistent_diagnostic.cuh"
+}
+#endif
+
+#if defined(STRATA_HC_PERSIST_BUILD)
+bool fused_gr_diagnostic_info(int variant, int n_tok, FusedGrDiagnosticInfo* info) {
+    const void* fn = hcp_diagnostic_function(variant);
+    if (!info || !fn || n_tok < 1 || n_tok > 4 || !hcp_blocks(n_tok)) return false;
+    hipFuncAttributes attr{};
+    int device = 0, active = 0;
+    hipDeviceProp_t prop{};
+    const size_t dynamic = (size_t) n_tok * 1280 * sizeof(float);
+    if (hipGetDevice(&device) != hipSuccess || hipGetDeviceProperties(&prop, device) != hipSuccess ||
+        hipFuncGetAttributes(&attr, fn) != hipSuccess ||
+        hipOccupancyMaxActiveBlocksPerMultiprocessor(&active, fn, THREADS, dynamic) != hipSuccess) return false;
+    info->registers = attr.numRegs; info->max_threads = attr.maxThreadsPerBlock;
+    info->static_lds_bytes = attr.sharedSizeBytes; info->local_bytes = attr.localSizeBytes;
+    info->dynamic_lds_bytes = dynamic; info->active_per_cu = active;
+    info->blocks = detail::hc_persistent_grid_blocks(n_tok, active, prop.multiProcessorCount);
+    return info->blocks > 0;
+}
+bool fused_gr_diagnostic_launch(const FusedGrArgs* a, int n_tok, float* xn, void* stream,
+                                const FusedGrRouter* requested_router, int variant, int blocks,
+                                unsigned long long* phase_cycles) {
+    FusedGrDiagnosticInfo info;
+    if (!a || !xn || !fused_gr_diagnostic_info(variant, n_tok, &info) || blocks < 1 || blocks > info.blocks ||
+        ((variant == 1 || variant == 3) && !phase_cycles)) return false;
+    GrMulti m;
+    for (int t = 0; t < n_tok; ++t) m.a[t] = a[t];
+    m.xn = xn; m.T = n_tok;
+    FusedGrRouter router = requested_router ? *requested_router : FusedGrRouter{};
+    void* args[] = {&m, &router, &phase_cycles};
+    return hipLaunchCooperativeKernel(hcp_diagnostic_function(variant), dim3(blocks), dim3(THREADS),
+                                      args, info.dynamic_lds_bytes, (hipStream_t) stream) == hipSuccess;
 }
 #endif
 

@@ -185,6 +185,57 @@ Interpretation:
   next inspection. These probes do not reproduce HC register pressure, spills,
   static LDS or arithmetic, and do not prove a speedup.
 
-This diagnostic has host C++ syntax checking and source review only in the
-assistant environment, which has no HIP compiler or GPU. HIP compilation and
-hardware results are still required.
+The standalone probe compiled and ran successfully on the user's idle MI50 with
+HIP 7.2.4. Batched graphs measured approximately 1.4–1.6 us for ordinary launches,
+17.5–17.8 us for cooperative launches without barriers, and 18.5–19.6 us for
+cooperative launches with three barriers. This rejects cooperative scheduling and
+empty grid barriers alone as an explanation for the roughly 400 us HC regression.
+It does not exclude slower barriers under the actual HC kernel's resource pressure.
+
+
+### Actual HC body and argument-passing diagnostic
+
+The next diagnostic runs only with the explicit test argument below. The original
+persistent kernel and its dispatch remain unchanged. Incrementally rebuild the
+existing experimental target in the same ROCm image, then run one idle MI50:
+
+```sh
+cmake --build build-hc-persist --target hc_persistent -j2
+HIP_VISIBLE_DEVICES=0 timeout --signal=TERM --kill-after=10s 300s \
+  build-hc-persist/hc_persistent --diagnose 100
+```
+
+This rebuild needs a writable build directory; unlike the standalone probe,
+compilation cannot use the earlier read-only repository mount. Runtime testing
+can still use that read-only mount after compilation.
+
+It compares four variants: the original production kernel, an instrumented
+by-value-helper clone, an untimed const-reference-helper clone, and an instrumented
+const-reference clone. The five copied helper bodies are identical except for
+names and the `GrMulti` argument's passing mode. This tests whether passing the
+large, dynamically indexed argument aggregate by value produces expensive private
+storage or copies. Inlining may eliminate those copies; the source alone does not
+establish that this is the cause.
+
+For T=1/4 and router=0/512, the test first checks bitwise output parity with pending
+writes and q8 enabled/disabled, including router selections. It reports actual
+compiled registers, local bytes, static/dynamic LDS, occupancy, and selected grid
+for every variant. Graph timings compare a shared grid within every variant's
+capacity, plus each variant's native grid when different. Instrumentation can
+change allocation and occupancy; the untimed const-reference clone is the primary
+performance comparison.
+
+Seven phase durations are reported in raw per-block `clock64` cycles: norm,
+barrier 1, down, barrier 2, up, optional barrier 3, and quantization/router tail.
+Only the final graph node's phase samples are retained. Active-block medians/maxima
+are printed separately from idle blocks. Do not add maxima or medians from
+separate CUs into a critical-path duration. Compiler-generated entry/exit work
+outside the first/last clock sample is not included. Timing samples are written
+only at the end of the kernel.
+
+This actual-body diagnostic has passed source review, host syntax checks using
+HIP declarations, normalized helper-body comparison, and whitespace checks. It
+has not yet been compiled with HIP or run on a GPU. A lower local-memory count
+plus a large untimed speedup would support the argument-copy hypothesis; otherwise
+use the phase/resource evidence to select the next fix. These results are not an
+end-to-end model throughput claim.

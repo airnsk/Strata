@@ -85,6 +85,21 @@ bool fused_gr_persistent_supported(int n_tok);
 /// a graph counts once; replay is submitted by the graph runtime and does not count.
 unsigned long long fused_gr_persistent_launches();
 
+#if defined(STRATA_HC_PERSIST_BUILD)
+// Explicit test diagnostics only. Variants: 0 original, 1 timed value helpers,
+// 2 untimed const-reference helpers, 3 timed const-reference helpers.
+struct FusedGrDiagnosticInfo {
+    int registers = 0, max_threads = 0, active_per_cu = 0, blocks = 0;
+    uint64_t static_lds_bytes = 0, local_bytes = 0, dynamic_lds_bytes = 0;
+};
+bool fused_gr_diagnostic_info(int variant, int n_tok, FusedGrDiagnosticInfo* info);
+// Test fixture must meet the usual BF16 T<=4 contract. `blocks` must be within
+// this variant's reported capacity; timed variants need blocks*7 device uint64s.
+bool fused_gr_diagnostic_launch(const FusedGrArgs* a, int n_tok, float* xn, void* stream,
+                                const FusedGrRouter* router, int variant, int blocks,
+                                unsigned long long* phase_cycles);
+#endif
+
 /// The bench only: the AMD latency-hidden kernels on (1) or off (0); -1 = STRATA_GR_FAST.
 void fused_gr_set_fast(int on);
 /// The multi read's variants (#315; not main's opt-in STRATA_GR_V3 read, which sums in another order), all computing

@@ -1,5 +1,6 @@
 // Opt-in gfx906 persistent hyper-connection read: exact parity and stage-only timing.
 // Run: hc_persistent [benchmark_iterations=100] [graph_replays=24]
+// Body/resource diagnostic only: hc_persistent --diagnose [iterations=100]
 // Exit 77 means the required device/runtime is unavailable; a fallback is a failure.
 // This test does not measure decode throughput or claim an end-to-end speedup.
 #include "strata/kernels/fused_gr.hpp"
@@ -454,6 +455,114 @@ double measure(Fixture& f, bool persistent, int iterations, bool graph_mode) {
     return 1000.0 * double(ms) / iterations;
 }
 
+
+#if defined(STRATA_HC_PERSIST_BUILD)
+void diagnose(const Weights& w, const Inputs& input, int iterations) {
+    const char* names[] = {"production", "value_timed", "ref_untimed", "ref_timed"};
+    const char* phases[] = {"norm", "barrier1", "down", "barrier2", "up", "barrier3", "tail"};
+    std::puts("HC BODY DIAGNOSTIC: original production code is unchanged; clones are explicit test launches.\n"
+              "Raw cycles are per-block deltas, never cross-CU timestamps or assumed-frequency microseconds.\n"
+              "Instrumented attributes/occupancy can differ; compare untimed reference clone to production.\n"
+              "Do not sum cross-CU phase medians/maxima; compiler entry/exit work is outside clock samples.\n"
+              "Timing uses a multi-node graph to reduce caller submission overhead.");
+    Fixture f;
+    Buffer<unsigned long long> stamps(160 * 7);
+    for (int t : {1, 4}) {
+        int common_blocks = 160;
+        K::FusedGrDiagnosticInfo info[4];
+        for (int v = 0; v < 4; ++v) {
+            require(K::fused_gr_diagnostic_info(v, t, &info[v]), "diagnostic resources unavailable");
+            common_blocks = std::min(common_blocks, info[v].blocks);
+            std::printf("T=%d variant=%s regs=%d local_bytes=%llu static_lds=%llu dynamic_lds=%llu active_per_cu=%d selected_blocks=%d max_threads=%d\n",
+                t, names[v], info[v].registers, (unsigned long long)info[v].local_bytes,
+                (unsigned long long)info[v].static_lds_bytes, (unsigned long long)info[v].dynamic_lds_bytes,
+                info[v].active_per_cu, info[v].blocks, info[v].max_threads);
+        }
+        std::printf("T=%d common_grid=%d; all common-grid comparisons use this size; native grids are reported separately.\n", t, common_blocks);
+        auto launch = [&](int v, int blocks) {
+            require(K::fused_gr_diagnostic_launch(f.args.data(), t, f.xn.p, f.stream.s,
+                f.router.n_expert ? &f.router : nullptr, v, blocks, stamps.p), "diagnostic launch failed");
+            check(cudaGetLastError(), "diagnostic launch status");
+        };
+        for (int experts : {0, 512}) {
+            // Include pending writes and q8 in one-shot bitwise checks, timing
+            // apply=false/q8=false below to match the first hardware benchmark.
+            for (bool apply : {false, true}) for (bool q8 : {false, true}) {
+                f.reset(input, w, t, apply, true, q8, experts);
+                f.launch(true);
+                if (experts) f.route();
+                const Snapshot wanted = f.read();
+                for (int v = 0; v < 4; ++v) {
+                    f.reset(input, w, t, apply, true, q8, experts);
+                    launch(v, common_blocks);
+                    if (experts) f.route();
+                    equal(wanted, f.read(), std::string("diagnostic ") + names[v]);
+                }
+            }
+            std::printf("T=%d router=%d: all four variants bitwise equal for apply=0/1 q8=0/1, including routing.\n", t, experts);
+            f.reset(input, w, t, false, true, false, experts);
+            for (int v = 0; v < 4; ++v) {
+                // Native occupancy can differ, so report both shared geometry and
+                // each variant's own selected grid rather than hiding the change.
+                for (int grid_mode = 0; grid_mode < 2; ++grid_mode) {
+                    const int blocks = grid_mode ? info[v].blocks : common_blocks;
+                    if (grid_mode && blocks == common_blocks) continue;
+                    cudaGraph_t graph = nullptr;
+                    cudaGraphExec_t exec = nullptr;
+                    check(cudaStreamBeginCapture(f.stream.s, cudaStreamCaptureModeThreadLocal), "diagnostic begin capture");
+                    for (int n = 0; n < iterations; ++n) launch(v, blocks);
+                    check(cudaStreamEndCapture(f.stream.s, &graph), "diagnostic end capture");
+                    check(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0), "diagnostic instantiate");
+                    for (int n = 0; n < 2; ++n) check(cudaGraphLaunch(exec, f.stream.s), "diagnostic warmup");
+                    check(cudaStreamSynchronize(f.stream.s), "diagnostic warmup sync");
+                    cudaEvent_t start, stop;
+                    check(cudaEventCreate(&start), "diagnostic create start");
+                    check(cudaEventCreate(&stop), "diagnostic create stop");
+                    std::array<float, 3> samples;
+                    for (float& ms : samples) {
+                        check(cudaEventRecord(start, f.stream.s), "diagnostic start");
+                        check(cudaGraphLaunch(exec, f.stream.s), "diagnostic replay");
+                        check(cudaEventRecord(stop, f.stream.s), "diagnostic stop");
+                        check(cudaEventSynchronize(stop), "diagnostic wait");
+                        check(cudaEventElapsedTime(&ms, start, stop), "diagnostic elapsed");
+                    }
+                    std::sort(samples.begin(), samples.end());
+                    std::printf("T=%d router=%d variant=%s grid=%s blocks=%d event_us=%.3f (median3, %d nodes/replay)\n",
+                        t, experts, names[v], grid_mode ? "native" : "common", blocks, 1000.0 * samples[1] / iterations, iterations);
+                    if (v == 1 || v == 3) {
+                        const auto raw = stamps.read();
+                        for (int phase = 0; phase < 7; ++phase) {
+                            std::vector<unsigned long long> busy, all;
+                            for (int b = 0; b < blocks; ++b) {
+                                const auto cycles = raw[b * 7 + phase];
+                                all.push_back(cycles);
+                                bool active = true;
+                                if (phase == 0) active = b < t;
+                                if (phase == 2) active = b < 41;
+                                if (phase == 4) active = b < 160;
+                                if (phase == 5 || phase == 6) active = experts != 0;
+                                if (active) busy.push_back(cycles);
+                            }
+                            std::sort(all.begin(), all.end());
+                            std::sort(busy.begin(), busy.end());
+                            std::printf("  phase=%s raw_cycles_all_min/med/max=%llu/%llu/%llu active_blocks=%zu active_med/max=%llu/%llu\n",
+                                phases[phase], all.front(), all[all.size()/2], all.back(), busy.size(),
+                                busy.empty() ? 0ull : busy[busy.size()/2], busy.empty() ? 0ull : busy.back());
+                        }
+                        stamps.guards("diagnostic stamps");
+                    }
+                    check(cudaEventDestroy(start), "diagnostic destroy start");
+                    check(cudaEventDestroy(stop), "diagnostic destroy stop");
+                    check(cudaGraphExecDestroy(exec), "diagnostic destroy executable");
+                    check(cudaGraphDestroy(graph), "diagnostic destroy graph");
+                }
+            }
+        }
+    }
+    std::puts("PASS: diagnostic clone parity, resource report and phase timing finished.");
+}
+#endif
+
 void benchmark(const Weights& w, const Inputs& input, int iterations) {
     Fixture f;
     K::fused_gr_set_fast(1);
@@ -491,10 +600,11 @@ int main(int argc, char** argv) {
     return 77;
 #else
     try {
-        const int iterations = argc > 1 ? std::atoi(argv[1]) : 100;
-        const int replays = argc > 2 ? std::atoi(argv[2]) : 24;
-        require(argc <= 3 && iterations > 0 && replays >= 20,
-                "usage: hc_persistent [positive benchmark_iterations] [graph_replays >= 20]");
+        const bool diagnostic = argc > 1 && std::strcmp(argv[1], "--diagnose") == 0;
+        const int iterations = diagnostic ? (argc > 2 ? std::atoi(argv[2]) : 100) : (argc > 1 ? std::atoi(argv[1]) : 100);
+        const int replays = !diagnostic && argc > 2 ? std::atoi(argv[2]) : 24;
+        require(argc <= 3 && iterations > 0 && iterations <= 10000 && replays >= 20,
+                "usage: hc_persistent [iterations] [graph_replays >= 20], or hc_persistent --diagnose [iterations]");
         // Keep the reference on its three-launch BF16 path, independent of the user's shell settings.
         setenv("STRATA_GR_V3", "0", 1);
         unsetenv("STRATA_GR_SPLIT");
@@ -523,6 +633,9 @@ int main(int argc, char** argv) {
         }
         const Weights weights;
         const Inputs input(73);
+#if defined(STRATA_HC_PERSIST_BUILD)
+        if (diagnostic) { diagnose(weights, input, iterations); return 0; }
+#endif
         parity(weights, input, replays);
         router_parity(weights, input, replays);
         subgroup_parity(weights, input, replays);
