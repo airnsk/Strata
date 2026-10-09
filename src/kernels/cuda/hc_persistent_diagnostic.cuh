@@ -274,12 +274,14 @@ __global__ void __launch_bounds__(THREADS) hc_diagnostic_kernel(GrMulti m, Fused
     }
 }
 
-const void* hcp_diagnostic_function(int variant) {
+const void* hcp_diagnostic_function(int variant, int tokens) {
     switch (variant) {
-    case 0: return reinterpret_cast<const void*>(hc_persistent_kernel);
+    case 0: return reinterpret_cast<const void*>(hc_persistent_legacy_kernel);
     case 1: return reinterpret_cast<const void*>(hc_diagnostic_kernel<false, true>);
     case 2: return reinterpret_cast<const void*>(hc_diagnostic_kernel<true, false>);
     case 3: return reinterpret_cast<const void*>(hc_diagnostic_kernel<true, true>);
+    case 4: return hcp_production_function(tokens, false);
+    case 5: return hcp_production_function(tokens, true);
     default: return nullptr;
     }
 }

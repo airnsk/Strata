@@ -86,8 +86,9 @@ bool fused_gr_persistent_supported(int n_tok);
 unsigned long long fused_gr_persistent_launches();
 
 #if defined(STRATA_HC_PERSIST_BUILD)
-// Explicit test diagnostics only. Variants: 0 original, 1 timed value helpers,
-// 2 untimed const-reference helpers, 3 timed const-reference helpers.
+// Explicit test diagnostics only. Legacy variants: 0 original value helpers,
+// 1 timed value, 2 untimed reference, 3 timed reference. Current production:
+// 4 HC without router, 5 HC with router (both specialized for exact T).
 struct FusedGrDiagnosticInfo {
     int registers = 0, max_threads = 0, active_per_cu = 0, blocks = 0;
     uint64_t static_lds_bytes = 0, local_bytes = 0, dynamic_lds_bytes = 0;

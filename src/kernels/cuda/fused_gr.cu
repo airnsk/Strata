@@ -1659,7 +1659,7 @@ namespace {
 
 #if defined(STRATA_HC_PERSIST_BUILD)
 bool fused_gr_diagnostic_info(int variant, int n_tok, FusedGrDiagnosticInfo* info) {
-    const void* fn = hcp_diagnostic_function(variant);
+    const void* fn = hcp_diagnostic_function(variant, n_tok);
     if (!info || !fn || n_tok < 1 || n_tok > 4 || !hcp_blocks(n_tok)) return false;
     hipFuncAttributes attr{};
     int device = 0, active = 0;
@@ -1685,7 +1685,7 @@ bool fused_gr_diagnostic_launch(const FusedGrArgs* a, int n_tok, float* xn, void
     m.xn = xn; m.T = n_tok;
     FusedGrRouter router = requested_router ? *requested_router : FusedGrRouter{};
     void* args[] = {&m, &router, &phase_cycles};
-    return hipLaunchCooperativeKernel(hcp_diagnostic_function(variant), dim3(blocks), dim3(THREADS),
+    return hipLaunchCooperativeKernel(hcp_diagnostic_function(variant, n_tok), dim3(blocks), dim3(THREADS),
                                       args, info.dynamic_lds_bytes, (hipStream_t) stream) == hipSuccess;
 }
 #endif
@@ -1699,7 +1699,11 @@ void fused_gr_set_persistent(int on) {
 }
 bool fused_gr_persistent_supported(int n_tok) {
 #if defined(STRATA_HC_PERSIST_BUILD)
-    return hcp_blocks(n_tok) > 0;
+    const int hc_blocks = hcp_blocks(n_tok, false);
+    // The verifier calls this before graph capture. Warm both specialized
+    // function/occupancy caches even when HC-only support determines the answer.
+    (void) hcp_blocks(n_tok, true);
+    return hc_blocks > 0;
 #else
     (void) n_tok;
     return false;

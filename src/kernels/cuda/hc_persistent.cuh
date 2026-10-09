@@ -256,7 +256,7 @@ __device__ __forceinline__ void hcp_router(GrMulti m, FusedGrRouter router, int 
         }
 }
 
-__global__ void __launch_bounds__(THREADS) hc_persistent_kernel(GrMulti m, FusedGrRouter router) {
+__global__ void __launch_bounds__(THREADS) hc_persistent_legacy_kernel(GrMulti m, FusedGrRouter router) {
     auto grid = cooperative_groups::this_grid();
     // Virtual work tiles, rather than a fixed number of CUs. Every thread reaches
     // both grid barriers even when this block had no work in the previous phase.
@@ -287,9 +287,11 @@ __global__ void __launch_bounds__(THREADS) hc_persistent_kernel(GrMulti m, Fused
     }
 }
 
+#include "hc_persistent_optimized.cuh"
+
 struct HcpDispatch { bool checked = false; int blocks = 0; };
 // Host-thread cache only. Device/session buffers and barrier state are never global.
-thread_local HcpDispatch hcp_dispatch[64][4];
+thread_local HcpDispatch hcp_dispatch[64][4][2];
 thread_local unsigned long long hcp_launch_count = 0;
 std::atomic<int> hcp_override{-1};
 
@@ -303,11 +305,11 @@ bool hcp_requested() {
     return requested;
 }
 
-int hcp_blocks(int tokens) {
+int hcp_blocks(int tokens, bool router = false) {
     if (tokens < 1 || tokens > 4) return 0;
     int device = -1;
     if (hipGetDevice(&device) != hipSuccess || device < 0 || device >= 64) return 0;
-    HcpDispatch& choice = hcp_dispatch[device][tokens - 1];
+    HcpDispatch& choice = hcp_dispatch[device][tokens - 1][router ? 1 : 0];
     if (choice.checked) return choice.blocks;
     choice.checked = true;
     hipDeviceProp_t prop{};
@@ -319,7 +321,7 @@ int hcp_blocks(int tokens) {
         hipDeviceGetAttribute(&cooperative, hipDeviceAttributeCooperativeLaunch, device) != hipSuccess ||
         !detail::hc_persistent_runtime_eligible(version, prop.gcnArchName, cooperative != 0)) return 0;
     const size_t shared = (size_t) tokens * 1280 * sizeof(float);
-    if (hipOccupancyMaxActiveBlocksPerMultiprocessor(&active, hc_persistent_kernel, THREADS, shared) != hipSuccess ||
+    if (hipOccupancyMaxActiveBlocksPerMultiprocessor(&active, hcp_production_function(tokens, router), THREADS, shared) != hipSuccess ||
         active <= 0) return 0;
     // Graph capture does not validate the cooperative bound on all HIP versions.
     // Account for the actual compiled kernel's registers, static LDS and dynamic
@@ -330,7 +332,13 @@ int hcp_blocks(int tokens) {
 
 bool launch_hcp(GrMulti m, cudaStream_t stream, const FusedGrRouter* requested_router, bool* router_written) {
     if (!hcp_requested() || m.T > 4 || m.a[0].q8_down || m.a[0].q8_up || m.a[0].q8_inject) return false;
-    const int blocks = hcp_blocks(m.T);
+    FusedGrRouter router{};
+    static const bool fuse_router = [] { const char* value = std::getenv("STRATA_HC_PERSIST_ROUTER"); return !value || std::strcmp(value, "0") != 0; }();
+    if (fuse_router && requested_router && requested_router->weights && requested_router->logits &&
+        (requested_router->n_expert == 256 || requested_router->n_expert == 512) &&
+        ((reinterpret_cast<uintptr_t>(requested_router->weights) & 3u) == 0) &&
+        ((reinterpret_cast<uintptr_t>(requested_router->logits) & 3u) == 0)) router = *requested_router;
+    const int blocks = hcp_blocks(m.T, router.weights != nullptr);
     if (!blocks) {
         static std::atomic<bool> warned{false};
         if (!warned.exchange(true))
@@ -338,14 +346,8 @@ bool launch_hcp(GrMulti m, cudaStream_t stream, const FusedGrRouter* requested_r
                                  "cooperative launch (requires gfx906, HIP >= 6.4 and occupancy); using the existing HC kernels\n");
         return false;
     }
-    FusedGrRouter router{};
-    if (requested_router && requested_router->weights && requested_router->logits &&
-        (requested_router->n_expert == 256 || requested_router->n_expert == 512) &&
-        ((reinterpret_cast<uintptr_t>(requested_router->weights) & 3u) == 0) &&
-        ((reinterpret_cast<uintptr_t>(requested_router->logits) & 3u) == 0))
-        router = *requested_router;
     void* args[] = {&m, &router};
-    const auto error = hipLaunchCooperativeKernel((const void*) hc_persistent_kernel, dim3(blocks), dim3(THREADS),
+    const auto error = hipLaunchCooperativeKernel(hcp_production_function(m.T, router.weights != nullptr), dim3(blocks), dim3(THREADS),
                                                   args, (size_t) m.T * 1280 * sizeof(float), stream);
     // A failed capture/launch can invalidate the stream. Never silently launch the
     // fallback into that stream or count a request as successful after this point.

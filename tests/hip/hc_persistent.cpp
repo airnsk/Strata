@@ -133,6 +133,7 @@ struct Fixture {
     K::FusedGrRouter router{};
     int tokens = 0, token_offset = 0;
     bool q8_enabled = false, inject_enabled = false, routed = false;
+    bool force_external_router = false;
 
     void reset(const Inputs& input, const Weights& weights, int t, bool apply, bool with_inject, bool with_q8,
                int experts = 0, int offset = 0) {
@@ -180,14 +181,14 @@ struct Fixture {
         bool wrote_q8;
         if (router.n_expert != 0) {
             wrote_q8 = K::fused_gr_read_multi_router(args.data(), tokens, xn.p + size_t(token_offset) * D, stream.s, nullptr, 0,
-                                                     &router, &router_written);
+                                                     force_external_router ? nullptr : &router, &router_written);
         } else {
             wrote_q8 = K::fused_gr_read_multi(args.data(), tokens, xn.p + size_t(token_offset) * D, stream.s);
             router_written = false;
         }
         check(cudaGetLastError(), "HC launch");
         require(wrote_q8 == q8_enabled, "incorrect mixed-q8 return value");
-        require(router_written == (expect_persistent && router.n_expert != 0), "incorrect router_written flag");
+        require(router_written == (expect_persistent && !force_external_router && router.n_expert != 0), "incorrect router_written flag");
         const auto after = K::fused_gr_persistent_launches();
         require(after - before == (expect_persistent ? 1u : 0u),
                 expect_persistent ? "persistent path silently fell back" : "fallback/baseline used the persistent path");
@@ -264,14 +265,16 @@ void equal(const Snapshot& a, const Snapshot& b, const std::string& label) {
 struct Graph {
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t executable = nullptr;
-    Graph(Fixture& f, bool persistent) {
+    Graph(Fixture& f, bool persistent, int stages = 1) {
         check(cudaStreamBeginCapture(f.stream.s, cudaStreamCaptureModeThreadLocal), "begin graph capture");
-        f.launch(persistent);
+        for (int i = 0; i < stages; ++i) f.launch(persistent);
         check(cudaStreamEndCapture(f.stream.s, &graph), "end graph capture");
         check(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0), "instantiate graph");
         size_t nodes = 0;
         check(cudaGraphGetNodes(graph, nullptr, &nodes), "count captured nodes");
-        const size_t expected_nodes = persistent ? 1u : (f.router.n_expert ? 4u : 3u);
+        const size_t nodes_per_stage = persistent ?
+            (f.router.n_expert && f.force_external_router ? 2u : 1u) : (f.router.n_expert ? 4u : 3u);
+        const size_t expected_nodes = size_t(stages) * nodes_per_stage;
         require(nodes == expected_nodes,
                 std::string(persistent ? "persistent" : "baseline") + " graph has " + std::to_string(nodes) +
                 " nodes; expected " + std::to_string(expected_nodes));
@@ -315,14 +318,15 @@ void parity(const Weights& w, const Inputs& input, int replays) {
     std::printf("Parity: %d configurations, including inactive rows, guards, null injection and q8 bytes.\n", cases);
 }
 
-void router_parity(const Weights& w, const Inputs& input, int replays) {
+void router_parity(const Weights& w, const Inputs& input, int replays, bool external = false) {
     Fixture reference, candidate;
+    candidate.force_external_router = external;
     for (int experts : {256, 512})
         for (int t = 1; t <= PersistentMaxT; ++t)
             for (bool apply : {false, true})
                 for (bool q8 : {false, true}) {
                     const bool injection = (t & 1) != 0;
-                    const std::string label = "router=" + std::to_string(experts) + " T=" + std::to_string(t) +
+                    const std::string label = std::string(external ? "external router=" : "fused router=") + std::to_string(experts) + " T=" + std::to_string(t) +
                         " apply=" + std::to_string(apply) + " q8=" + std::to_string(q8);
                     reference.reset(input, w, t, apply, injection, q8, experts, 2);
                     candidate.reset(input, w, t, apply, injection, q8, experts, 2);
@@ -435,10 +439,13 @@ double measure(Fixture& f, bool persistent, int iterations, bool graph_mode) {
     check(cudaEventCreate(&stop), "create stop event");
     float ms = 0.0f;
     if (graph_mode) {
-        Graph graph(f, persistent);
-        for (int i = 0; i < 12; ++i) graph.replay(f);
+        // Resolve all lazy dispatch/resource queries before capture. Timing fixtures use apply=false.
+        for (int i = 0; i < 12; ++i) f.launch(persistent);
+        check(cudaStreamSynchronize(f.stream.s), "benchmark warmup sync");
+        Graph graph(f, persistent, iterations);
+        for (int i = 0; i < 2; ++i) graph.replay(f);
         check(cudaEventRecord(start, f.stream.s), "record start");
-        for (int i = 0; i < iterations; ++i) graph.replay(f);
+        graph.replay(f);
         check(cudaEventRecord(stop, f.stream.s), "record stop");
         check(cudaEventSynchronize(stop), "wait for benchmark");
         check(cudaEventElapsedTime(&ms, start, stop), "elapsed graph time");
@@ -458,30 +465,34 @@ double measure(Fixture& f, bool persistent, int iterations, bool graph_mode) {
 
 #if defined(STRATA_HC_PERSIST_BUILD)
 void diagnose(const Weights& w, const Inputs& input, int iterations) {
-    const char* names[] = {"production", "value_timed", "ref_untimed", "ref_timed"};
+    const char* names[] = {"legacy_value", "legacy_value_timed", "legacy_ref_untimed", "legacy_ref_timed",
+                           "candidate_hc", "candidate_router"};
     const char* phases[] = {"norm", "barrier1", "down", "barrier2", "up", "barrier3", "tail"};
-    std::puts("HC BODY DIAGNOSTIC: original production code is unchanged; clones are explicit test launches.\n"
+    std::puts("HC BODY DIAGNOSTIC: frozen legacy clones versus candidate HC/router kernels.\n"
               "Raw cycles are per-block deltas, never cross-CU timestamps or assumed-frequency microseconds.\n"
-              "Instrumented attributes/occupancy can differ; compare untimed reference clone to production.\n"
+              "Instrumented attributes/occupancy can differ; candidate kernels use their native grid.\n"
               "Do not sum cross-CU phase medians/maxima; compiler entry/exit work is outside clock samples.\n"
               "Timing uses a multi-node graph to reduce caller submission overhead.");
     Fixture f;
     Buffer<unsigned long long> stamps(160 * 7);
     for (int t : {1, 4}) {
         int common_blocks = 160;
-        K::FusedGrDiagnosticInfo info[4];
-        for (int v = 0; v < 4; ++v) {
+        K::FusedGrDiagnosticInfo info[6];
+        for (int v = 0; v < 6; ++v) {
             require(K::fused_gr_diagnostic_info(v, t, &info[v]), "diagnostic resources unavailable");
-            common_blocks = std::min(common_blocks, info[v].blocks);
+            if (v < 4) common_blocks = std::min(common_blocks, info[v].blocks);
             std::printf("T=%d variant=%s regs=%d local_bytes=%llu static_lds=%llu dynamic_lds=%llu active_per_cu=%d selected_blocks=%d max_threads=%d\n",
                 t, names[v], info[v].registers, (unsigned long long)info[v].local_bytes,
                 (unsigned long long)info[v].static_lds_bytes, (unsigned long long)info[v].dynamic_lds_bytes,
                 info[v].active_per_cu, info[v].blocks, info[v].max_threads);
         }
-        std::printf("T=%d common_grid=%d; all common-grid comparisons use this size; native grids are reported separately.\n", t, common_blocks);
+        std::printf("T=%d common_grid=%d; legacy common-grid comparisons use this size; candidate grids are native.\n", t, common_blocks);
         auto launch = [&](int v, int blocks) {
             require(K::fused_gr_diagnostic_launch(f.args.data(), t, f.xn.p, f.stream.s,
                 f.router.n_expert ? &f.router : nullptr, v, blocks, stamps.p), "diagnostic launch failed");
+            if (v == 4 && f.router.n_expert)
+                K::bf16_gemv_fp32_mmvf_cols(f.mixed.p, f.router.weights, f.router.logits,
+                                           N, f.router.n_expert, t, f.stream.s);
             check(cudaGetLastError(), "diagnostic launch status");
         };
         for (int experts : {0, 512}) {
@@ -489,24 +500,27 @@ void diagnose(const Weights& w, const Inputs& input, int iterations) {
             // apply=false/q8=false below to match the first hardware benchmark.
             for (bool apply : {false, true}) for (bool q8 : {false, true}) {
                 f.reset(input, w, t, apply, true, q8, experts);
-                f.launch(true);
+                f.launch(false);
                 if (experts) f.route();
                 const Snapshot wanted = f.read();
-                for (int v = 0; v < 4; ++v) {
+                for (int v = 0; v < 6; ++v) {
                     f.reset(input, w, t, apply, true, q8, experts);
-                    launch(v, common_blocks);
+                    launch(v, v < 4 ? common_blocks : info[v].blocks);
                     if (experts) f.route();
                     equal(wanted, f.read(), std::string("diagnostic ") + names[v]);
                 }
             }
-            std::printf("T=%d router=%d: all four variants bitwise equal for apply=0/1 q8=0/1, including routing.\n", t, experts);
+            std::printf("T=%d router=%d: all six variants bitwise equal for apply=0/1 q8=0/1, including routing.\n", t, experts);
             f.reset(input, w, t, false, true, false, experts);
-            for (int v = 0; v < 4; ++v) {
+            for (int v = 0; v < 6; ++v) {
                 // Native occupancy can differ, so report both shared geometry and
                 // each variant's own selected grid rather than hiding the change.
                 for (int grid_mode = 0; grid_mode < 2; ++grid_mode) {
-                    const int blocks = grid_mode ? info[v].blocks : common_blocks;
-                    if (grid_mode && blocks == common_blocks) continue;
+                    const int blocks = (grid_mode || v >= 4) ? info[v].blocks : common_blocks;
+                    if (grid_mode && (v >= 4 || blocks == common_blocks)) continue;
+                    // Warm this exact launch configuration before entering capture.
+                    launch(v, blocks);
+                    check(cudaStreamSynchronize(f.stream.s), "diagnostic precapture warmup");
                     cudaGraph_t graph = nullptr;
                     cudaGraphExec_t exec = nullptr;
                     check(cudaStreamBeginCapture(f.stream.s, cudaStreamCaptureModeThreadLocal), "diagnostic begin capture");
@@ -527,8 +541,8 @@ void diagnose(const Weights& w, const Inputs& input, int iterations) {
                         check(cudaEventElapsedTime(&ms, start, stop), "diagnostic elapsed");
                     }
                     std::sort(samples.begin(), samples.end());
-                    std::printf("T=%d router=%d variant=%s grid=%s blocks=%d event_us=%.3f (median3, %d nodes/replay)\n",
-                        t, experts, names[v], grid_mode ? "native" : "common", blocks, 1000.0 * samples[1] / iterations, iterations);
+                    std::printf("T=%d router=%d variant=%s grid=%s blocks=%d event_us=%.3f (median3, %d HC stages/replay)\n",
+                        t, experts, names[v], (grid_mode || v >= 4) ? "native" : "common", blocks, 1000.0 * samples[1] / iterations, iterations);
                     if (v == 1 || v == 3) {
                         const auto raw = stamps.read();
                         for (int phase = 0; phase < 7; ++phase) {
@@ -571,23 +585,52 @@ void benchmark(const Weights& w, const Inputs& input, int iterations) {
     unsetenv("STRATA_HC_SPLIT");
     K::fused_gr_check();
     std::printf("HC stage-only timings, default checked variant %d, STRATA_GR_FAST=1; "
-                "median of 5 alternating A/B pairs; warm weights; no decode speed claim:\n", K::fused_gr_variant());
-    for (int experts : {0, 256, 512})
+                "median of 5 rotating comparisons; warm weights; graph captures %d HC stages/replay; "
+                "no decode speed claim:\n", K::fused_gr_variant(), iterations);
     for (int t = 1; t <= PersistentMaxT; ++t) {
-        // apply=false avoids changing the residual distribution during repeated timing.
-        f.reset(input, w, t, false, true, false, experts);
-        for (bool graph_mode : {false, true}) {
-            std::array<double, 5> times[2]{};
-            for (int round = 0; round < 5; ++round)
-                for (int order = 0; order < 2; ++order) {
-                    const int mode = (round + order) & 1;
-                    times[mode][round] = measure(f, mode != 0, iterations, graph_mode);
-                }
-            for (auto& samples : times) std::sort(samples.begin(), samples.end());
-            std::printf("  T=%d router=%d %-5s baseline %.3f us, persistent %.3f us, stage ratio %.3fx\n", t, experts,
-                        graph_mode ? "graph" : "eager", times[0][2], times[1][2], times[0][2] / times[1][2]);
+#if defined(STRATA_HC_PERSIST_BUILD)
+        for (int v : {4, 5}) {
+            K::FusedGrDiagnosticInfo info{};
+            require(K::fused_gr_diagnostic_info(v, t, &info), "candidate resources unavailable");
+            std::printf("  T=%d variant=%s regs=%d local_bytes=%llu static_lds=%llu dynamic_lds=%llu "
+                        "active_per_cu=%d selected_blocks=%d max_threads=%d\n", t,
+                        v == 4 ? "candidate_hc" : "candidate_router", info.registers,
+                        (unsigned long long)info.local_bytes, (unsigned long long)info.static_lds_bytes,
+                        (unsigned long long)info.dynamic_lds_bytes, info.active_per_cu, info.blocks, info.max_threads);
+        }
+#endif
+        for (int experts : {0, 256, 512}) {
+            const int modes = experts ? 3 : 2;
+            const char* names[] = {"baseline", "candidate_external_router", "candidate_fused_router"};
+            // Check precisely the paths being timed, including caller-owned external routing.
+            f.reset(input, w, t, false, true, false, experts);
+            f.force_external_router = false;
+            f.launch(false);
+            const Snapshot wanted = f.read();
+            for (int mode = 1; mode < modes; ++mode) {
+                f.reset(input, w, t, false, true, false, experts);
+                f.force_external_router = mode == 1;
+                f.launch(true);
+                equal(wanted, f.read(), std::string("benchmark path ") + names[mode]);
+            }
+            for (bool graph_mode : {false, true}) {
+                std::array<double, 5> times[3]{};
+                for (int round = 0; round < 5; ++round)
+                    for (int order = 0; order < modes; ++order) {
+                        const int mode = (round + order) % modes;
+                        f.force_external_router = mode == 1;
+                        times[mode][round] = measure(f, mode != 0, iterations, graph_mode);
+                    }
+                for (int mode = 0; mode < modes; ++mode) std::sort(times[mode].begin(), times[mode].end());
+                std::printf("  T=%d router=%d %-5s baseline %.3f us, candidate_hc+external %.3f us, ratio %.3fx",
+                            t, experts, graph_mode ? "graph" : "eager", times[0][2], times[1][2],
+                            times[0][2] / times[1][2]);
+                if (experts) std::printf(", candidate_fused %.3f us, ratio %.3fx", times[2][2], times[0][2] / times[2][2]);
+                std::puts("");
+            }
         }
     }
+    f.force_external_router = false;
 }
 }  // namespace
 #endif
@@ -606,6 +649,7 @@ int main(int argc, char** argv) {
         require(argc <= 3 && iterations > 0 && iterations <= 10000 && replays >= 20,
                 "usage: hc_persistent [iterations] [graph_replays >= 20], or hc_persistent --diagnose [iterations]");
         // Keep the reference on its three-launch BF16 path, independent of the user's shell settings.
+        setenv("STRATA_HC_PERSIST_ROUTER", "1", 1);
         setenv("STRATA_GR_V3", "0", 1);
         unsetenv("STRATA_GR_SPLIT");
         setenv("STRATA_HC_SPLIT", "0", 1);
@@ -638,6 +682,7 @@ int main(int argc, char** argv) {
 #endif
         parity(weights, input, replays);
         router_parity(weights, input, replays);
+        router_parity(weights, input, replays, true);
         subgroup_parity(weights, input, replays);
         fallback_parity(weights, input);
         concurrent(weights, replays);

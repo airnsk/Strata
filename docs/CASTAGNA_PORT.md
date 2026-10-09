@@ -1,6 +1,7 @@
 # Experimental Castagna-inspired gfx906 port
 
-Status (2026-10-09): HIP 7.2.4 build and model-free bitwise parity **passed on two MI50 cards**.
+Status (2026-10-09): the first implementation built with HIP 7.2.4 and passed model-free bitwise parity on two MI50 cards.
+The current resource-bounded candidate below is **not yet HIP-compiled or hardware-validated**.
 Performance acceptance **failed**: this first implementation is approximately 4.6–9.8 times slower than
 the checked production HC path in the supplied stage benchmark. Keep it disabled; do not deploy it.
 Whole-model parity and performance have not been tested.
@@ -195,8 +196,8 @@ It does not exclude slower barriers under the actual HC kernel's resource pressu
 
 ### Actual HC body and argument-passing diagnostic
 
-The next diagnostic runs only with the explicit test argument below. The original
-persistent kernel and its dispatch remain unchanged. Incrementally rebuild the
+The body diagnostic runs only with the explicit test argument below. It now keeps
+the original kernel as a named legacy comparison alongside the current candidate. Incrementally rebuild the
 existing experimental target in the same ROCm image, then run one idle MI50:
 
 ```sh
@@ -209,9 +210,8 @@ This rebuild needs a writable build directory; unlike the standalone probe,
 compilation cannot use the earlier read-only repository mount. Runtime testing
 can still use that read-only mount after compilation.
 
-It compares four variants: the original production kernel, an instrumented
-by-value-helper clone, an untimed const-reference-helper clone, and an instrumented
-const-reference clone. The five copied helper bodies are identical except for
+It compares four legacy variants (value, timed value, reference, timed reference)
+and two current production candidates (HC-only and fused router). The five copied helper bodies are identical except for
 names and the `GrMulti` argument's passing mode. This tests whether passing the
 large, dynamically indexed argument aggregate by value produces expensive private
 storage or copies. Inlining may eliminate those copies; the source alone does not
@@ -233,9 +233,56 @@ separate CUs into a critical-path duration. Compiler-generated entry/exit work
 outside the first/last clock sample is not included. Timing samples are written
 only at the end of the kernel.
 
-This actual-body diagnostic has passed source review, host syntax checks using
-HIP declarations, normalized helper-body comparison, and whitespace checks. It
-has not yet been compiled with HIP or run on a GPU. A lower local-memory count
-plus a large untimed speedup would support the argument-copy hypothesis; otherwise
-use the phase/resource evidence to select the next fix. These results are not an
-end-to-end model throughput claim.
+The legacy body diagnostic passed HIP compilation and bitwise hardware checks.
+Its original by-value kernel used 188 registers and 2240 local bytes per thread;
+const-reference helpers used 185 registers and zero local bytes. Both selected
+60 blocks at one resident block per CU. Batched T=1 HC-only timing fell from
+422.198 to 62.395 us; T=4 fell from 470.355 to 94.934 us. With 512 router rows,
+T=1 fell from 433.750 to 96.896 us and T=4 from 527.304 to 171.945 us. This
+establishes a large argument-passing regression and its fix, but not an advantage
+over the checked baseline. The current resource redesign still needs HIP
+compilation and full hardware parity/performance checks.
+
+
+### Resource-bounded candidate after the argument-copy fix
+
+The current opt-in production implementation uses const-reference helper arguments,
+exact T=1/2/3/4 specializations, and separate HC-only/router kernel specializations.
+The ordinary default HC path is unchanged. `STRATA_HC_PERSIST_ROUTER=0` disables
+router fusion so the caller performs the existing projection; configure this
+before the process's first persistent launch.
+
+The source-directed resource changes are:
+
+- Normalization uses the existing checked split-per-stream arithmetic: each
+  thread visits the same stream's values in the same order, then performs the
+  same logical-warp tree and ascending eight-warp sum. It no longer keeps ten
+  residual and ten gamma float4 values live per thread. Work is T*4 virtual tiles.
+- Down projection uses the existing staged kernel's two-plane LDS layout and
+  unpacks each BF16 weight chunk once across tokens. It uses one buffer, keeping
+  T=4 dynamic LDS at 20 KiB. A full double-buffer transplant would use 40 KiB and
+  prevent the intended two-block residency even after reducing registers.
+- Up projection processes its two independent row groups sequentially, keeping
+  one group's 20 weight dwords rather than both groups' 40 live. Each output's
+  dot8, XOR reduction and final channel-sum arithmetic remain in the same order.
+- Token specialization removes inactive accumulator/shared-array slots. Actual
+  occupancy is queried separately for every T/router specialization; both caches
+  are warmed before capture. No manual spin barrier or forced register cap is used.
+
+Run the ordinary full test after rebuilding:
+
+```sh
+HIP_VISIBLE_DEVICES=0 timeout --signal=TERM --kill-after=10s 300s \
+  build-hc-persist/hc_persistent 100 24
+```
+
+It retains parity, replay, subgroup, concurrency and fallback checks and adds
+forced-external router parity. The regular benchmark prints compiled candidate
+resources and compares the checked baseline, candidate HC plus the ordinary
+external router, and candidate fused router. Each graph contains 100 complete HC
+stages, and timings are normalized per stage. All three paths compute the same
+requested outputs. Eager timings remain available separately.
+
+The expected mechanism is lower register pressure, fewer LDS conflicts and more
+resident blocks; achieved register counts, zero-spill status, residency and speed
+must be measured. There is no claimed candidate speedup or whole-model gain.
