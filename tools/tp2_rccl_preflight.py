@@ -21,6 +21,7 @@ REQUIRED_SYMBOLS = (
 )
 HEADER_NAMES = ("include/rccl/rccl.h", "include/rccl.h", "include/nccl.h")
 LIB_DIRS = ("lib", "lib64", "lib/x86_64-linux-gnu")
+CHECK_VERSION_MARKER = "__STRATA_RCCL_CHECK_VERSION_V1__"
 
 
 def installed_roots() -> list[Path]:
@@ -68,6 +69,28 @@ def check_library(path: str) -> int:
     return version.value
 
 
+def parse_checked_version(stdout: str) -> int:
+    """Accept exactly one complete helper record, never native diagnostic numbers."""
+    records = [line for line in stdout.splitlines() if CHECK_VERSION_MARKER in line]
+    if len(records) != 1:
+        raise ValueError("Expected exactly one RCCL check version record")
+    match = re.fullmatch(re.escape(CHECK_VERSION_MARKER) + r"=([1-9][0-9]*)", records[0])
+    if match is None:
+        raise ValueError("Malformed RCCL check version record")
+    return int(match.group(1))
+
+
+def log_check_output(stdout, stderr):
+    """Retain native diagnostics on success, failure, and timeout."""
+    for name, output, stream in (("STDOUT", stdout, sys.stdout), ("STDERR", stderr, sys.stderr)):
+        if output:
+            if isinstance(output, bytes):  # TimeoutExpired may retain bytes in text mode.
+                output = output.decode(errors="replace")
+            print(f"RCCL_PREFLIGHT_CHECK_{name}_BEGIN\n" + output +
+                  ("" if output.endswith("\n") else "\n") +
+                  f"RCCL_PREFLIGHT_CHECK_{name}_END", file=stream, flush=True)
+
+
 def discover(roots: list[Path]) -> dict[str, str | int]:
     headers = unique_paths(root / name for root in roots for name in HEADER_NAMES)
     # torch/csrc/cuda/nccl.h is a C++ wrapper, not the RCCL C API header.
@@ -102,9 +125,13 @@ def discover(roots: list[Path]) -> dict[str, str | int]:
                 raise RuntimeError("unresolved dependency: " + deps.stdout.strip())
             checked = subprocess.run(
                 [sys.executable, str(Path(__file__).resolve()), "--check-library", str(library)],
-                env=env, text=True, capture_output=True, timeout=20, check=True)
-            version = int(checked.stdout.strip())
+                env=env, text=True, capture_output=True, timeout=20, check=False)
+            log_check_output(checked.stdout, checked.stderr)
+            checked.check_returncode()
+            version = parse_checked_version(checked.stdout)
         except (OSError, ValueError, subprocess.SubprocessError, RuntimeError) as exc:
+            if isinstance(exc, subprocess.TimeoutExpired):
+                log_check_output(exc.stdout, exc.stderr)
             detail = getattr(exc, "stderr", None) or str(exc)
             errors.append(f"{library}: {detail.strip()}")
             print(f"RCCL_PREFLIGHT_REJECT library={library} reason={detail.strip()}", flush=True)
@@ -138,7 +165,10 @@ def main() -> int:
     args = parser.parse_args()
     try:
         if args.check_library:
-            print(check_library(args.check_library))
+            version = check_library(args.check_library)
+            # Native libraries may write unterminated or buffered diagnostics.
+            # Give our record its own line and flush before native exit handlers.
+            print(f"\n{CHECK_VERSION_MARKER}={version}", flush=True)
             return 0
         if args.output is None:
             parser.error("--output is required")

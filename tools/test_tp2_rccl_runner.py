@@ -16,6 +16,7 @@ import tempfile
 import termios
 import time
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNNER = ROOT / "tools/run_tp2_rccl_probe_mi50.sh"
@@ -41,13 +42,29 @@ class DiscoveryTests(unittest.TestCase):
         self.header = self.root / "include/rccl/rccl.h"
         self.header.write_text("int ncclGetVersion(int*); int ncclSend(); int ncclRecv();\n")
 
-    def fake_library(self, symbols=None, version=22703):
+    def fake_library(self, symbols=None, version=22703, status=0, noisy=False, extra_c=""):
         compiler = shutil.which("cc")
         if compiler is None:
             self.skipTest("A host C compiler is needed to build the CPU-only fake shared library")
         symbols = PREFLIGHT.REQUIRED_SYMBOLS if symbols is None else symbols
-        code = "\n".join(f"int {name}(void) {{ return 0; }}" for name in symbols if name != "ncclGetVersion")
-        code += f"\nint ncclGetVersion(int *v) {{ *v = {version}; return 0; }}\n"
+        code = "#include <stdio.h>\n"
+        code += "\n".join(f"int {name}(void) {{ return 0; }}" for name in symbols if name != "ncclGetVersion")
+        code += f"\nint ncclGetVersion(int *v) {{ *v = {version}; return {status}; }}\n"
+        if noisy:
+            code += r'''
+__attribute__((constructor)) static void diagnostics_before(void) {
+    fputs("native stdout before version: rocprofiler registration 22707", stdout);
+    fflush(stdout);
+    fputs("native stderr before version 22707", stderr);
+    fflush(stderr);
+    fputs("native stdout buffered until exit 22707\n", stdout);
+}
+__attribute__((destructor)) static void diagnostics_after(void) {
+    fputs("native stdout after version 22707\n", stdout);
+    fputs("native stderr after version 22707\n", stderr);
+}
+'''
+        code += extra_c
         source = self.root / "stub.c"
         source.write_text(code)
         library = self.root / "lib/librccl.so.1"
@@ -56,8 +73,9 @@ class DiscoveryTests(unittest.TestCase):
         return library
 
     def discover(self):
-        with contextlib.redirect_stdout(io.StringIO()) as out:
+        with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()) as err:
             result = PREFLIGHT.discover([self.root])
+        self.stderr = err.getvalue()
         return result, out.getvalue()
 
     def test_existing_torch_style_library_and_header(self):
@@ -93,6 +111,78 @@ class DiscoveryTests(unittest.TestCase):
         self.fake_library(version=0)
         with self.assertRaisesRegex(RuntimeError, "No loadable installed RCCL C API library"):
             self.discover()
+
+    def test_native_diagnostics_before_and_after_version_are_retained(self):
+        self.fake_library(version=22707, noisy=True)
+        with mock.patch.dict(os.environ, NCCL_DEBUG="INFO", NCCL_DEBUG_SUBSYS="ALL", NCCL_DEBUG_FILE="/dev/stdout"):
+            result, output = self.discover()
+        self.assertEqual(result["RCCL_RUNTIME_VERSION"], 22707)
+        marker = PREFLIGHT.CHECK_VERSION_MARKER + "=22707"
+        self.assertLess(output.index("native stdout before version"), output.index(marker))
+        self.assertLess(output.index(marker), output.index("native stdout buffered until exit"))
+        self.assertLess(output.index(marker), output.index("native stdout after version"))
+        for diagnostic in ("native stderr before version", "native stderr after version"):
+            self.assertIn(diagnostic, self.stderr)
+
+    def test_nonzero_symbol_status_rejects_valid_looking_native_record(self):
+        self.fake_library(version=22707, status=3, noisy=True, extra_c=f'''
+__attribute__((constructor)) static void misleading_record(void) {{
+    puts("\\n{PREFLIGHT.CHECK_VERSION_MARKER}=22707");
+    fflush(stdout);
+}}
+''')
+        with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()) as err:
+            with self.assertRaisesRegex(RuntimeError, "ncclGetVersion status=3 version=22707"):
+                PREFLIGHT.discover([self.root])
+        self.assertIn(PREFLIGHT.CHECK_VERSION_MARKER + "=22707", out.getvalue())
+        self.assertIn("native stdout before version", out.getvalue())
+        self.assertIn("native stdout after version", out.getvalue())
+        self.assertIn("native stderr before version", err.getvalue())
+        self.assertIn("native stderr after version", err.getvalue())
+        self.assertNotIn("RCCL_PREFLIGHT_VERSION value=", out.getvalue())
+
+    def test_version_record_requires_one_strict_positive_integer(self):
+        marker = PREFLIGHT.CHECK_VERSION_MARKER
+        valid = marker + "=22707"
+        rejected = (
+            "", "22707\n", "rocprofiler registration 22707\n22707\n",
+            valid + "\n" + valid, valid + valid,
+            valid + "\n" + marker + "=bad", marker, marker + "=",
+            marker + "=0", marker + "=-1", marker + "=+22707",
+            marker + "=022707", marker + "=22707.0", marker + "=22707 trailing",
+            "prefix " + valid, valid + " ", marker + "= 22707",
+        )
+        for output in rejected:
+            with self.subTest(output=output):
+                with self.assertRaises(ValueError):
+                    PREFLIGHT.parse_checked_version(output)
+        self.assertEqual(PREFLIGHT.parse_checked_version("22703\n" + valid + "\n99999\n"), 22707)
+
+    def test_stderr_version_record_cannot_replace_missing_stdout_record(self):
+        self.fake_library()
+        real_run = subprocess.run
+        def run(command, **kwargs):
+            if "--check-library" in command:
+                return subprocess.CompletedProcess(command, 0, "22707\n",
+                                                   PREFLIGHT.CHECK_VERSION_MARKER + "=22707\n")
+            return real_run(command, **kwargs)
+        with mock.patch.object(PREFLIGHT.subprocess, "run", side_effect=run):
+            with self.assertRaisesRegex(RuntimeError, "Expected exactly one RCCL check version record"):
+                self.discover()
+
+    def test_helper_timeout_retains_both_output_streams(self):
+        self.fake_library()
+        real_run = subprocess.run
+        def run(command, **kwargs):
+            if "--check-library" in command:
+                raise subprocess.TimeoutExpired(command, 20, b"native partial stdout", b"native partial stderr")
+            return real_run(command, **kwargs)
+        with mock.patch.object(PREFLIGHT.subprocess, "run", side_effect=run), \
+                contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()) as err:
+            with self.assertRaisesRegex(RuntimeError, "No loadable installed RCCL C API library"):
+                PREFLIGHT.discover([self.root])
+        self.assertIn("native partial stdout", out.getvalue())
+        self.assertIn("native partial stderr", err.getvalue())
 
 
 class RunnerTests(unittest.TestCase):
