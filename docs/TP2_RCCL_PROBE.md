@@ -14,8 +14,20 @@ From the existing stand checkout, with both MI50 cards already idle:
 bash tools/run_tp2_rccl_probe_mi50.sh
 ```
 
-The wrapper uses `sudo docker`, including on the stand's Snap Docker, and verifies
-this installed image's exact ID before running it:
+Before starting any timed Docker operation, the wrapper validates its options
+and checks authorization. When running as a non-root user with a controlling
+terminal, it runs `sudo -v` directly on that terminal, outside the log-capture
+pipeline and operation deadlines. Enter the password only at sudo's terminal
+prompt. The wrapper does not read, record, or echo it. Time spent authorizing is
+not part of the image-inspection, build, or probe limits.
+
+Without a controlling terminal, only cached or passwordless authorization is
+accepted through a bounded `sudo -n -v`; otherwise the wrapper stops before
+Docker and asks you to rerun it from a terminal. All subsequent Docker commands,
+including cleanup, use `sudo -n docker`, so expired authorization fails without
+another prompt. Root runs Docker directly and does not require sudo. This also
+supports the stand's Snap Docker. The wrapper verifies this installed image's
+exact ID before running it:
 
 ```text
 sha256:1947f7b9ea3514f137b3cabe5dc4f48ddabeb9c7bac78b4959a03b7dc7fcf4ca
@@ -45,13 +57,24 @@ TP2_TIMEOUT=180 TP2_BUILD_TIMEOUT=180 TP2_OUTER_TIMEOUT=600 \
   compilation, telemetry, and all test subprocesses
 - Each delayed-rank and missing-rank subprocess has a separate 45-second outer
   bound and a 10-second command watchdog
-- Image inspection and container cleanup have their own short bounds
+- Image inspection and container cleanup have their own short bounds; these
+  commands cannot prompt for a password
+- Interactive authorization is outside these bounds; noninteractive
+  authorization has a separate 20-second bound
 
 The smallest enclosing bound wins. The wrapper kills/removes only its own unique
 container after failure or completion, and checks that it is absent. A cleanup
 check failure is an error. A timeout, skip, missing completion marker, failed log
 write, or nonzero normal/delayed test exit cannot become a successful probe just
-because `tee` succeeded. Inspect GPU state before repeating an unexpected timeout.
+because `tee` succeeded. An image-inspection failure is labeled
+`RCCL_PROBE_SETUP_FAILURE stage=image-inspect ... container_attempted=0`; it is
+not GPU execution evidence. `RCCL_PROBE_CONTAINER_LAUNCH` records the Docker run
+attempt, and `RCCL_PROBE_CONTAINER_ENTER` records entry into its script. Neither
+means the GPU probe started. Only `RCCL_PROBE_PROCESS_BEGIN` records a probe
+launch attempt. If a timeout occurs after that marker, inspect GPU state before
+another run. Earlier timeouts are reported as host or container setup failures.
+If authorization expires during cleanup, absence cannot be verified; the wrapper
+reports that failure instead of prompting or claiming the container stopped.
 
 Normal-run options are restricted to tokens `1`, `8`, or `all`; launch order `01`,
 `10`, or `both`; iterations 2..1000; warmup 1..100; chain 2..1024; lifecycles 2..8;
@@ -187,7 +210,10 @@ c++ -std=c++17 -O2 -ffp-contract=off -DSTRATA_RCCL_CPU_SELFTEST \
 The runner tests use a temporary fake C shared library and mocked container/HIP
 commands. They check dependency failure, exact version/symbol discovery, shell
 syntax, restricted Docker arguments, process-status preservation, missing gates,
-fault-stage admission, hard outer timeout, and cleanup verification. They require
+fault-stage admission, hard outer timeout, and cleanup verification. They also
+exercise slow terminal-only authorization outside deadlines/log capture,
+noninteractive authorization, denied/expired credentials, root operation without
+sudo, and separate setup/probe timeout diagnostics. They require
 a host C compiler for fake-library coverage. The source self-test checks only host
 oracles and layout arithmetic. Neither is HIP compilation, RCCL capture testing,
 GPU correctness, or performance evidence. The real stand run remains necessary.

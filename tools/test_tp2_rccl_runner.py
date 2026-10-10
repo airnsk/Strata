@@ -2,14 +2,18 @@
 """CPU-only tests for installed-dependency discovery and RCCL runner boundaries."""
 from __future__ import annotations
 import contextlib
+import fcntl
 import importlib.util
 import io
 import json
 import os
 from pathlib import Path
+import pty
 import shutil
 import subprocess
 import tempfile
+import termios
+import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -108,7 +112,33 @@ class RunnerTests(unittest.TestCase):
         subprocess.run(["git", "-C", str(self.repo), "-c", "user.name=CPU Test", "-c", "user.email=cpu@example.invalid", "commit", "-qm", "fixture", "--allow-empty"], check=True)
         self.calls = self.root / "docker-calls.jsonl"
         self.env["MOCK_CALLS"] = str(self.calls)
-        executable(self.bin / "sudo", '#!/bin/bash\nexec "$@"\n')
+        self.sudo_calls = self.root / "sudo-calls.jsonl"
+        self.env["MOCK_SUDO_CALLS"] = str(self.sudo_calls)
+        executable(self.bin / "id", '#!/bin/bash\necho "${MOCK_UID:-1000}"\n')
+        executable(self.bin / "sudo", '''#!/usr/bin/env python3
+import json, os, sys, time
+args = sys.argv[1:]
+with open(os.environ["MOCK_SUDO_CALLS"], "a") as f: f.write(json.dumps(args) + "\\n")
+if args == ["-v"]:
+ if os.environ.get("MOCK_TIMED_OPERATION"): sys.exit(93)
+ if not all(os.isatty(fd) for fd in (0, 1, 2)): sys.exit(94)
+ print("MOCK_AUTH_TERMINAL_ONLY", flush=True)
+ time.sleep(float(os.environ.get("MOCK_AUTH_SLEEP", "0")))
+ sys.exit(int(os.environ.get("MOCK_AUTH_EXIT", "0")))
+if args == ["-n", "-v"]:
+ sys.exit(int(os.environ.get("MOCK_AUTH_EXIT", "0")))
+if args[:2] != ["-n", "docker"]: sys.exit(95)
+if args[2] in os.environ.get("MOCK_EXPIRE_ON", "").split(","): sys.exit(1)
+os.execvp(args[1], args[1:])
+''')
+        real_timeout = shutil.which("timeout")
+        executable(self.bin / "timeout", f'''#!/bin/bash
+export MOCK_TIMED_OPERATION=1
+if [[ " $* " == *" docker image inspect "* && -n ${{MOCK_IMAGE_TIMEOUT:-}} ]]; then
+  exit "$MOCK_IMAGE_TIMEOUT"
+fi
+exec {real_timeout!r} "$@"
+''')
         executable(self.bin / "docker", f'''#!/usr/bin/env python3
 import json, os, sys, time
 with open(os.environ["MOCK_CALLS"], "a") as f: f.write(json.dumps(sys.argv[1:]) + "\\n")
@@ -118,6 +148,8 @@ if args[:2] == ["image", "inspect"]:
 elif args[0] == "run":
  script = sys.stdin.read()
  open(os.environ["MOCK_CALLS"] + ".container", "w").write(script)
+ print("RCCL_PROBE_CONTAINER_ENTER", flush=True)
+ if os.environ.get("MOCK_PROCESS_BEGIN"): print("RCCL_PROBE_PROCESS_BEGIN scenario=normal bound_s=1", flush=True)
  if os.environ.get("MOCK_SLEEP"): time.sleep(5)
  if os.environ.get("MOCK_SUITE", "1") == "1": print({SUITE!r})
  sys.exit(int(os.environ.get("MOCK_RUN_EXIT", "0")))
@@ -125,9 +157,25 @@ elif args[0] == "ps" and os.environ.get("MOCK_CLEANUP_FAIL"):
  print("still-running")
 ''')
 
-    def host(self, args=(), **env):
-        process = subprocess.run(["bash", str(self.repo / "tools" / RUNNER.name), *args],
-                                 env=dict(self.env, **env), text=True, capture_output=True, timeout=12)
+    def host(self, args=(), interactive=False, **env):
+        command = ["bash", str(self.repo / "tools" / RUNNER.name), *args]
+        kwargs = dict(env=dict(self.env, **env), text=True, capture_output=True, timeout=12)
+        self.auth_output = ""
+        if interactive:
+            master, slave = pty.openpty()
+            def terminal_session():
+                os.setsid()
+                fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
+            try:
+                process = subprocess.run(command, stdin=slave, preexec_fn=terminal_session, **kwargs)
+                os.set_blocking(master, False)
+                self.auth_output = os.read(master, 65536).decode()
+            finally:
+                os.close(slave)
+                os.close(master)
+        else:
+            # Deterministically exercise the no-terminal path even from a shell.
+            process = subprocess.run(command, start_new_session=True, **kwargs)
         logs = list(self.repo.glob("tp2-rccl-probe-*.log"))
         self.assertEqual(len(logs), 1)
         saved = logs[0].read_text()
@@ -148,6 +196,67 @@ elif args[0] == "ps" and os.environ.get("MOCK_CLEANUP_FAIL"):
         self.assertNotIn("/models", " ".join(run))
         subprocess.run(["bash", "-n", str(self.calls) + ".container"], check=True)
 
+    def test_slow_interactive_auth_precedes_deadlines_and_log_capture(self):
+        started = time.monotonic()
+        process, saved = self.host(interactive=True, TP2_OUTER_TIMEOUT="1", MOCK_AUTH_SLEEP="1.2")
+        self.assertGreaterEqual(time.monotonic() - started, 1.2)
+        self.assertEqual(process.returncode, 0, process.stderr + saved)
+        self.assertIn("MOCK_AUTH_TERMINAL_ONLY", self.auth_output)
+        self.assertNotIn("MOCK_AUTH_TERMINAL_ONLY", saved + process.stdout + process.stderr)
+        calls = [json.loads(line) for line in self.sudo_calls.read_text().splitlines()]
+        self.assertEqual(calls[0], ["-v"])
+        self.assertTrue(all(call[:2] == ["-n", "docker"] for call in calls[1:]), calls)
+        self.assertEqual([call[2] for call in calls[1:]], ["image", "run", "rm", "ps"])
+
+    def test_no_terminal_uses_only_noninteractive_authorization(self):
+        process, saved = self.host()
+        self.assertEqual(process.returncode, 0, process.stderr + saved)
+        calls = [json.loads(line) for line in self.sudo_calls.read_text().splitlines()]
+        self.assertEqual(calls[0], ["-n", "-v"])
+        self.assertTrue(all(call[0] == "-n" for call in calls), calls)
+
+    def test_no_terminal_and_no_authorization_stops_before_docker(self):
+        process, saved = self.host(MOCK_AUTH_EXIT="1")
+        self.assertEqual(process.returncode, 1)
+        self.assertIn("stage=authorization code=1 container_attempted=0", saved)
+        self.assertIn("Run this wrapper from a terminal", process.stderr)
+        self.assertFalse(self.calls.exists())
+
+    def test_interactive_authorization_failure_stops_before_docker(self):
+        process, saved = self.host(interactive=True, MOCK_AUTH_EXIT="1")
+        self.assertEqual(process.returncode, 1)
+        self.assertIn("stage=authorization", saved)
+        self.assertNotIn("MOCK_AUTH_TERMINAL_ONLY", saved)
+        self.assertFalse(self.calls.exists())
+
+    def test_root_does_not_invoke_sudo(self):
+        (self.bin / "sudo").unlink()
+        process, saved = self.host(MOCK_UID="0")
+        self.assertEqual(process.returncode, 0, process.stderr + saved)
+        self.assertFalse(self.sudo_calls.exists())
+
+    def test_expired_authorization_never_reprompts_for_docker_or_cleanup(self):
+        process, saved = self.host(MOCK_EXPIRE_ON="run,rm,ps")
+        self.assertEqual(process.returncode, 1)
+        self.assertIn("RCCL_CONTAINER_CLEANUP_UNVERIFIED", saved)
+        calls = [json.loads(line) for line in self.sudo_calls.read_text().splitlines()]
+        self.assertEqual([call[2] for call in calls[1:]], ["image", "run", "rm", "ps"])
+        self.assertTrue(all(call[0] == "-n" for call in calls), calls)
+
+    def test_image_inspection_timeout_and_kill_are_not_gpu_failures(self):
+        for code in ("124", "137"):
+            with self.subTest(code=code):
+                # host() requires one saved log per invocation.
+                for log in self.repo.glob("tp2-rccl-probe-*.log"):
+                    log.unlink()
+                process, saved = self.host(MOCK_IMAGE_TIMEOUT=code)
+                self.assertEqual(process.returncode, int(code))
+                self.assertIn(f"stage=image-inspect code={code} container_attempted=0", saved)
+                self.assertIn("Host setup timeout or kill before container launch", saved)
+                self.assertNotIn("inspect GPU state", saved)
+                self.assertNotIn("RCCL_PROBE_CONTAINER_LAUNCH", saved)
+                self.assertFalse(self.calls.exists())
+
     def test_host_nonzero_propagates(self):
         process, _ = self.host(MOCK_RUN_EXIT="29")
         self.assertEqual(process.returncode, 29)
@@ -160,6 +269,13 @@ elif args[0] == "ps" and os.environ.get("MOCK_CLEANUP_FAIL"):
         process, saved = self.host(TP2_OUTER_TIMEOUT="1", MOCK_SLEEP="1")
         self.assertEqual(process.returncode, 124)
         self.assertIn("verified_absent=", saved)
+        self.assertIn("Container startup/setup timeout", saved)
+        self.assertNotIn("inspect GPU state", saved)
+
+    def test_host_probe_timeout_warns_about_gpu_state(self):
+        process, saved = self.host(TP2_OUTER_TIMEOUT="1", MOCK_SLEEP="1", MOCK_PROCESS_BEGIN="1")
+        self.assertEqual(process.returncode, 124)
+        self.assertIn("after probe launch: inspect GPU state", saved)
 
     def test_host_cleanup_must_be_verified(self):
         process, _ = self.host(MOCK_CLEANUP_FAIL="1")
@@ -174,6 +290,7 @@ elif args[0] == "ps" and os.environ.get("MOCK_CLEANUP_FAIL"):
         process, _ = self.host(["--scenario", "normal"])
         self.assertEqual(process.returncode, 2)
         self.assertFalse(self.calls.exists())
+        self.assertFalse(self.sudo_calls.exists())
 
     def test_duplicate_option_does_not_run(self):
         process, _ = self.host(["--tokens", "1", "--tokens", "8"])

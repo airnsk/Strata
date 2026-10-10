@@ -13,6 +13,7 @@ Defaults: all, both, 20, 3, 32, 2, 10000, 0,1.
 Also runs separate delayed-rank and missing-rank fault checks.
 Optional env: TP2_TIMEOUT=180 TP2_BUILD_TIMEOUT=180 TP2_OUTER_TIMEOUT=600 (seconds).
 The outer bound includes discovery, compilation and all subprocesses.
+Sudo authorization is checked first, outside all operation deadlines and logs.
 No downloads, model mounts, service stops, or clock/power changes.
 EOF
 }
@@ -23,6 +24,28 @@ LOG="$ROOT/tp2-rccl-probe-$RUN_ID.log"
 IMAGE=sha256:1947f7b9ea3514f137b3cabe5dc4f48ddabeb9c7bac78b4959a03b7dc7fcf4ca
 CONTAINER_NAME="strata-tp2-rccl-$RUN_ID"
 CONTAINER_STARTED=0
+DOCKER=(docker)
+authorize_docker() {
+  if (( $(id -u) == 0 )); then
+    return 0
+  fi
+  DOCKER=(sudo -n docker)
+  local auth_tty auth_rc=0
+  # Open the controlling terminal directly, even if the caller pipes stdout or
+  # stdin. Never put a password prompt/input in the timed or captured pipeline.
+  if { exec {auth_tty}<>/dev/tty; } 2>/dev/null; then
+    printf 'Checking sudo authorization before timed operations.\n' >&"$auth_tty"
+    sudo -v <&"$auth_tty" >&"$auth_tty" 2>&1 || auth_rc=$?
+    exec {auth_tty}>&-
+  else
+    # No terminal: accept cached/NOPASSWD authorization only, with a bound on PAM.
+    timeout --signal=TERM --kill-after=3s 20s sudo -n -v || auth_rc=$?
+    if (( auth_rc != 0 )); then
+      echo 'Sudo authorization unavailable without a terminal. Run this wrapper from a terminal to authorize Docker.' >&2
+    fi
+  fi
+  return "$auth_rc"
+}
 cleanup() {
   local rc=$?
   trap - EXIT
@@ -30,11 +53,11 @@ cleanup() {
   if (( CONTAINER_STARTED )); then
     # Killing a docker client does not prove its daemon-side container stopped.
     # Remove only this unique run's container; bound even a stuck daemon request.
-    timeout --signal=TERM --kill-after=3s 15s sudo docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1
+    timeout --signal=TERM --kill-after=3s 15s "${DOCKER[@]}" rm -f "$CONTAINER_NAME" >/dev/null 2>&1
     local cleanup_rc=$?
     # --rm normally removed it already. Verify absence independently.
     local inspect
-    inspect=$(timeout --signal=TERM --kill-after=3s 15s sudo docker ps -a --filter "name=^/${CONTAINER_NAME}$" --format '{{.Names}}' 2>&1)
+    inspect=$(timeout --signal=TERM --kill-after=3s 15s "${DOCKER[@]}" ps -a --filter "name=^/${CONTAINER_NAME}$" --format '{{.Names}}' 2>&1)
     local inspect_rc=$?
     if (( inspect_rc != 0 )) || [[ -n "$inspect" ]]; then
       printf 'RCCL_CONTAINER_CLEANUP_UNVERIFIED name=%s remove_exit=%s inspect_exit=%s\n' "$CONTAINER_NAME" "$cleanup_rc" "$inspect_rc" >&2
@@ -45,7 +68,7 @@ cleanup() {
   fi
   exit "$rc"
 }
-main() {
+validate_host() {
   local deadline=${TP2_TIMEOUT:-180} build_deadline=${TP2_BUILD_TIMEOUT:-180} outer_deadline=${TP2_OUTER_TIMEOUT:-600}
   local value flag
   for value in "$deadline" "$build_deadline" "$outer_deadline"; do
@@ -55,7 +78,6 @@ main() {
   done
   (( $# % 2 == 0 )) || { usage; return 2; }
   local -A seen=()
-  local args=("$@")
   while (( $# )); do
     flag=$1; value=$2; shift 2
     [[ -z ${seen[$flag]:-} ]] || { echo "Repeated option: $flag" >&2; return 2; }
@@ -74,12 +96,19 @@ main() {
       *) echo "Unsupported option/value: $flag=$value" >&2; return 2 ;;
     esac
   done
-  for value in timeout sudo git sha256sum tee; do
+  for value in timeout git sha256sum tee id; do
     command -v "$value" >/dev/null || { echo "Missing host command: $value" >&2; return 2; }
   done
+  if (( $(id -u) != 0 )); then
+    command -v sudo >/dev/null || { echo 'Missing host command: sudo' >&2; return 2; }
+  fi
   [[ -f "$ROOT/tests/hip/tp2_rccl_transport.cpp" && -f "$ROOT/tools/tp2_rccl_preflight.py" ]] || {
     echo 'Missing standalone RCCL probe source or dependency-discovery helper.' >&2; return 2;
   }
+}
+main() {
+  local deadline=${TP2_TIMEOUT:-180} build_deadline=${TP2_BUILD_TIMEOUT:-180} outer_deadline=${TP2_OUTER_TIMEOUT:-600}
+  local args=("$@")
   printf 'RCCL_PROBE_RUN id=%s head=%s image=%s\n' "$RUN_ID" "$(git -C "$ROOT" rev-parse HEAD)" "$IMAGE"
   printf 'RCCL_PROBE_STAND repo=%q log=%q\n' "$ROOT" "$LOG"
   printf 'RCCL_PROBE_ARGUMENTS'; printf ' %q' "${args[@]}"; printf '\n'
@@ -88,19 +117,30 @@ main() {
   printf 'RCCL_PROBE_TRACKED_DIFF_SHA256 '; git -C "$ROOT" diff --binary HEAD -- | sha256sum
   git -C "$ROOT" status --short
   sha256sum "$ROOT/tests/hip/tp2_rccl_transport.cpp" "$ROOT/tools/tp2_rccl_preflight.py" "$ROOT/tools/run_tp2_rccl_probe_mi50.sh"
-  local image_id
-  image_id=$(timeout --signal=TERM --kill-after=3s 20s sudo docker image inspect --format '{{.Id}}' "$IMAGE")
+  local image_id image_rc=0
+  echo 'RCCL_PROBE_IMAGE_INSPECT_BEGIN bound_s=20'
+  image_id=$(timeout --signal=TERM --kill-after=3s 20s "${DOCKER[@]}" image inspect --format '{{.Id}}' "$IMAGE") || image_rc=$?
+  printf 'RCCL_PROBE_IMAGE_INSPECT_EXIT code=%s\n' "$image_rc"
+  if (( image_rc != 0 )); then
+    printf 'RCCL_PROBE_SETUP_FAILURE stage=image-inspect code=%s container_attempted=0\n' "$image_rc" >&2
+    return "$image_rc"
+  fi
   printf 'RCCL_PROBE_RESOLVED_IMAGE %s\n' "$image_id"
-  [[ "$image_id" == "$IMAGE" ]] || { echo 'Installed image ID differs from the pinned stand image.' >&2; return 2; }
+  [[ "$image_id" == "$IMAGE" ]] || {
+    echo 'RCCL_PROBE_SETUP_FAILURE stage=image-verification code=2 container_attempted=0: installed image ID differs from the pinned stand image.' >&2
+    return 2
+  }
   trap cleanup EXIT
   CONTAINER_STARTED=1
-  timeout --signal=TERM --kill-after=15s "${outer_deadline}s" sudo docker run \
+  printf 'RCCL_PROBE_CONTAINER_LAUNCH name=%s\n' "$CONTAINER_NAME"
+  timeout --signal=TERM --kill-after=15s "${outer_deadline}s" "${DOCKER[@]}" run \
     --name "$CONTAINER_NAME" --rm --pull never --network none --read-only --cap-drop ALL \
     --tmpfs /tmp:rw,exec,nosuid,size=2g --shm-size=512m -e HOME=/tmp \
     --device=/dev/kfd --device=/dev/dri -e HIP_VISIBLE_DEVICES=0,1 -e NCCL_DEBUG=WARN \
     --mount "type=bind,src=$ROOT,dst=/work,readonly" \
     --workdir /work --entrypoint /bin/bash -i "$IMAGE" -s -- "$deadline" "$build_deadline" "${args[@]}" <<'RCCL_CONTAINER'
 set -euo pipefail
+echo 'RCCL_PROBE_CONTAINER_ENTER'
 export PATH=/opt/venv/bin:/opt/rocm/bin:$PATH
 runtime_deadline=$1; build_deadline=$2; shift 2
 for tool in python3 hipcc timeout ldd sha256sum; do
@@ -195,16 +235,42 @@ RCCL_CONTAINER
 # Keep failures from the real runner and from tee. The final outer status is
 # written into the durable host log, including preflight/build/timeout failures.
 set +e
-(set -e; main "$@") 2>&1 | tee "$LOG"
+(set -e; validate_host "$@") 2>&1 | tee "$LOG"
 STATUS=("${PIPESTATUS[@]}")
 RC=${STATUS[0]}
 if (( RC == 0 && STATUS[1] != 0 )); then RC=${STATUS[1]}; fi
+if (( RC == 0 )); then
+  # This call is deliberately outside every pipeline and operation deadline.
+  # Only its status is logged; sudo reads/writes the controlling terminal itself.
+  authorize_docker
+  RC=$?
+  printf 'RCCL_PROBE_AUTH_EXIT code=%s\n' "$RC" | tee -a "$LOG"
+  STATUS=("${PIPESTATUS[@]}")
+  if (( RC != 0 )); then
+    printf 'RCCL_PROBE_SETUP_FAILURE stage=authorization code=%s container_attempted=0\n' "$RC" | tee -a "$LOG"
+  elif (( STATUS[1] != 0 )); then
+    RC=${STATUS[1]}
+  else
+    (set -e; main "$@") 2>&1 | tee -a "$LOG"
+    STATUS=("${PIPESTATUS[@]}")
+    RC=${STATUS[0]}
+    if (( RC == 0 && STATUS[1] != 0 )); then RC=${STATUS[1]}; fi
+  fi
+fi
 if (( RC == 0 )) && ! grep -Fxq 'RCCL_PROBE_SUITE_PASS normal=pass delayed_rank=pass missing_rank=expected_watchdog_failure' "$LOG"; then
   echo 'RCCL_PROBE_ADMISSION_FAIL missing suite completion marker' | tee -a "$LOG"
   RC=4
 fi
 if (( RC == 77 )); then echo 'SKIPPED is not a pass.' | tee -a "$LOG"; fi
-if (( RC == 70 || RC == 124 || RC == 137 )); then echo 'Unexpected watchdog/timeout/kill: inspect GPU state before another run.' | tee -a "$LOG"; fi
+if (( RC == 70 || RC == 124 || RC == 137 )); then
+  if grep -q '^RCCL_PROBE_PROCESS_BEGIN ' "$LOG"; then
+    echo 'Unexpected watchdog/timeout/kill after probe launch: inspect GPU state before another run.' | tee -a "$LOG"
+  elif grep -q '^RCCL_PROBE_CONTAINER_LAUNCH ' "$LOG"; then
+    echo 'Container startup/setup timeout or kill before observed probe launch: inspect the setup log and container cleanup status.' | tee -a "$LOG"
+  else
+    echo 'Host setup timeout or kill before container launch. No GPU probe ran.' | tee -a "$LOG"
+  fi
+fi
 printf 'TP2_RCCL_PROBE_EXIT=%s LOG=%s\n' "$RC" "$LOG" | tee -a "$LOG"
 FOOTER_STATUS=("${PIPESTATUS[@]}")
 if (( RC == 0 && FOOTER_STATUS[1] != 0 )); then RC=${FOOTER_STATUS[1]}; fi
