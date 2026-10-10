@@ -512,7 +512,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # Production-owned TP components are isolated until the full-layer gate passes.
   # No generation target links this opt-in validation executable or its owners.
   if(STRATA_TP2_GDN_BUILD)
-    target_sources(strata_kernels PRIVATE src/kernels/cuda/tp_gdn_exchange.cu)
+    target_sources(strata_kernels PRIVATE src/kernels/cuda/tp_gdn_exchange.cu src/kernels/cuda/tp_hc.cu)
+    add_executable(tp_hc_layout_test tests/core/tp_hc_layout_test.cpp)
+    target_link_libraries(tp_hc_layout_test PRIVATE strata_artifact)
+    if(STRATA_BUILD_TESTS)
+      add_test(NAME tp_hc_layout_test COMMAND tp_hc_layout_test)
+    endif()
     add_executable(tp2_gdn_layer tests/hip/tp2_gdn_layer.cpp
       src/core/tp_gdn_layer.cpp src/core/tp_gdn_weights.cpp)
     target_include_directories(tp2_gdn_layer PRIVATE ${_strata_gpu_include_directories})

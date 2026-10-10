@@ -5,9 +5,13 @@ set -euo pipefail
 if [[ $# -lt 2 || "$1" == --help ]]; then
   echo 'Usage: bash tools/run_tp2_gdn_mi50.sh EXISTING_IMAGE MODEL_ROOT --pack /models/PACK --gguf /models/SHARD [--gguf /models/SHARD ...] [--layer 0]'
   echo 'This checks one non-PLE GDN layer, not generation speed. Layer 1 is PLE and is refused.'
-  echo 'Optional: --execution runtime|consolidated|captured|all (default runtime)'
-  echo 'Optional: --benchmark [--bench-warmup 3] [--bench-trials 12]'
-  echo 'Benchmark first checks all three modes, then alternates matched full/TP trials at T=1,2,4,8.'
+  echo 'Optional: --execution runtime|consolidated|captured|flat|flat-hc|all (default runtime)'
+  echo 'Optional: --benchmark [--bench-warmup 3] [--bench-trials 12] [--bench-block-calls 16] [--bench-block-trials 4]'
+  echo 'Benchmark defaults to captured, flat and flat-hc; --execution all explicitly includes all five.'
+  echo 'Flat modes require the integrated model-free and full-layer timeout/abort gates before benchmarking.'
+  echo 'Paired trials use identical input in AB and BA order; trials count complete crossovers.'
+  echo 'Sustained blocks add per-step shadow parity and measured final-block parity (no measured intermediate downloads).'
+  echo 'Optional --profile-flat uses separate diagnostic graphs; timing always uses unprofiled graphs.'
   echo 'Wall timing includes complete propose_device + commit(T); reset/uploads/capture/snapshots are outside.'
   echo 'Optional: BUILD_JOBS=48 TP2_TIMEOUT=1200'
   echo 'MODEL_ROOT is mounted read-only as /models. Both GPUs must be idle.'
@@ -67,11 +71,12 @@ cmake -S /work -B /work/build-tp2-gdn -G Ninja \
   -DCMAKE_C_COMPILER=/opt/rocm/lib/llvm/bin/clang \
   -DCMAKE_CXX_COMPILER=/opt/rocm/lib/llvm/bin/clang++ \
   -DCMAKE_HIP_COMPILER=/opt/rocm/lib/llvm/bin/clang++
-cmake --build /work/build-tp2-gdn --target tp2_shard_policy tp_layer_layout_test native_expert_call_policy tp_gdn_weights_test tp2_gdn_layer --parallel "$1"
+cmake --build /work/build-tp2-gdn --target tp2_shard_policy tp_layer_layout_test native_expert_call_policy tp_gdn_weights_test tp_hc_layout_test tp2_gdn_layer --parallel "$1"
 /work/build-tp2-gdn/tp2_shard_policy
 /work/build-tp2-gdn/tp_layer_layout_test
 /work/build-tp2-gdn/native_expert_call_policy
 /work/build-tp2-gdn/tp_gdn_weights_test
+/work/build-tp2-gdn/tp_hc_layout_test
 ' build "$JOBS" 2>&1 | tee -a "$LOG"
 RC=${PIPESTATUS[0]}
 set -e
@@ -79,7 +84,7 @@ if (( RC != 0 )); then echo "Build/CPU test failed: $RC. Log: $LOG"; exit "$RC";
 
 set +e
 sudo docker run "${COMMON[@]}" --device=/dev/kfd --device=/dev/dri \
-  -e HIP_VISIBLE_DEVICES=0,1 -e STRATA_HC_PERSIST=0 \
+  -e HIP_VISIBLE_DEVICES=0,1 -e STRATA_HC_PERSIST=0 -e STRATA_GR_V3=0 -e STRATA_GR_SPLIT=0 \
   --mount "type=bind,src=$ROOT,dst=/work,readonly" "${MODEL_MOUNT[@]}" \
   "$IMAGE" -c '
 set -euo pipefail

@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstdint>
+#include <cstddef>
+#include <type_traits>
 
 namespace strata::kernels {
 
@@ -41,5 +43,70 @@ void tp_gdn_push_output(const float* src, float* local_full, float* peer_full,
 void tp_gdn_push_hidden(const uint8_t* routed_src, uint8_t* routed_local, uint8_t* routed_peer,
                         const uint8_t* shared_src, uint8_t* shared_local, uint8_t* shared_peer,
                         int T, int rank, void* stream);
+
+// Flat graph protocol. These are plain integer objects with an explicit lifetime,
+// not std::atomic representations. The owner placement-news a zero-initialized
+// control in hipHostMallocMapped | hipHostMallocCoherent memory before device use.
+// Host access MUST use lock-free __atomic builtins (acquire/release); GPU access
+// uses HIP SYSTEM-scope acquire/release builtins. Every slot has one writer.
+// Epoch changes only after both ranks drain; zero/wrap/replay are invalid.
+// Abort slots are sticky: host publishes host_abort BEFORE draining a failed graph.
+constexpr int kTpGdnProtocolPhases = 8;
+struct alignas(64) TpGdnSignalSlot { uint64_t value = 0; };
+struct TpGdnProtocolControl {
+    TpGdnSignalSlot epoch;
+    TpGdnSignalSlot ready[2][kTpGdnProtocolPhases];
+    TpGdnSignalSlot abort[2];
+    TpGdnSignalSlot host_abort;
+};
+static_assert(sizeof(TpGdnSignalSlot) == 64 && alignof(TpGdnSignalSlot) == 64);
+static_assert(std::is_standard_layout<TpGdnProtocolControl>::value &&
+              std::is_trivially_copyable<TpGdnProtocolControl>::value);
+
+enum class TpGdnProtocolStatus : uint64_t { Pending = 0, Ready = 1, Aborted = 2, TimedOut = 3, InvalidEpoch = 4 };
+struct TpGdnProtocolStamp {
+    uint64_t epoch = 0;
+    uint64_t status = 0;
+    uint64_t polls = 0;
+    uint64_t elapsed_ticks = 0;
+};
+// Each span contributes rows*half_words raw uint32 words to one packed inbox.
+// run_words==half_words: ordinary row halves; run_words==1024 and half_words==3072:
+// mapped GDN Y. Hidden uses two spans (routed rows=T*10, shared rows=T, half_words=90).
+struct TpGdnPacketSpan {
+    const void* src = nullptr;
+    void* local_full = nullptr;
+    int rows = 0;
+    int half_words = 0;
+    int run_words = 0;
+};
+struct TpGdnExchangePacket {
+    TpGdnPacketSpan spans[2];
+    int count = 0;
+    void* peer_inbox = nullptr;
+    const void* own_inbox = nullptr;
+    size_t inbox_bytes = 0; // EXACT sum of packed source spans, not allocation capacity
+};
+// Compile-time capability only: gfx906 HIP 7.2.x with required compiler builtins.
+// Allocation flags, actual coherent atomics and peer visibility require the
+// model-free hardware preflight on the exact runtime before enabling FlatGraph.
+bool tp_gdn_protocol_supported() noexcept;
+// Inbox allocations MUST be hipDeviceMallocUncached, dedicated to this phase;
+// source, full destinations, inboxes, signals and stamps must remain alive through
+// replay. All payload, inbox, control and stamp ranges must be mutually disjoint;
+// raw address overlaps are rejected. Calls perform no allocation or pointer-attribute/runtime queries.
+void tp_gdn_packet_push(const TpGdnExchangePacket&, TpGdnProtocolControl*, int rank, void* stream);
+// Stream ordered after ALL producer writes. Publishes ready[rank][phase], waits
+// for the exact peer epoch or sticky abort. Deadline uses wall_clock64(), whose
+// constant frequency is hipDeviceAttributeWallClockRate (kHz), NEVER core clockRate.
+// timeout_ticks is positive and <= INT64_MAX; an independent finite poll cap also
+// bounds the loop. On failure publishes this rank's abort before returning.
+void tp_gdn_protocol_wait(TpGdnProtocolControl*, TpGdnProtocolStamp*, int rank, int phase,
+                          uint64_t timeout_ticks, void* stream);
+// Copies peer packed words into this rank's missing mapped half only after a
+// successful matching stamp. If either rank/host aborted, or stamp/epoch is bad,
+// zeros ALL local_full words (own and peer halves), without reading the inbox.
+void tp_gdn_packet_unpack(const TpGdnExchangePacket&, TpGdnProtocolControl*,
+                          const TpGdnProtocolStamp*, int rank, int phase, void* stream);
 
 }  // namespace strata::kernels

@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <memory>
 #include <vector>
+#include <string>
 
 namespace strata::core::tp2 {
 
@@ -25,7 +26,17 @@ struct TpGdnLayerSnapshot {
 enum class TpGdnExecution {
     RuntimeCopies, // validated baseline: individual runtime P2P copies
     Consolidated,  // one system-fenced peer push per exchange/rank
-    Captured       // rank-local compute/push graphs; event edges stay outside
+    Captured,      // rank-local compute/push graphs; event edges stay outside
+    FlatCaptured,  // one graph/rank, bounded device protocol, original HC
+    FlatHcCaptured // same graph/protocol, exact HC row-sharded compute
+};
+
+struct TpGdnLayerProfile {
+    uint64_t epoch = 0;
+    int tokens = 0, rank = 0;
+    std::vector<std::string> labels;
+    std::vector<uint64_t> nanoseconds; // absolute stamps: compare within ONE rank only
+    std::array<uint64_t,8> wait_nanoseconds{}, wait_polls{}, wait_status{};
 };
 
 // One non-PLE GDN layer, one in-flight proposal, T <= 8. Owns all session,
@@ -50,7 +61,18 @@ public:
     // Prepare each token count that Captured mode will use. Failure is fatal to
     // this instance, with no silent fallback to another execution mode.
     void prepare_captured(int tokens);
-    void set_execution(TpGdnExecution mode);
+    // Flat modes require the model-free protocol preflight on the target runtime.
+    // A separate profiled graph is explicit: timestamp overhead is not benchmark
+    // evidence. HC splitting changes compute ownership, not weight allocation.
+    void prepare_flat(int tokens, bool shard_hc = false, bool profile = false,
+                      uint64_t timeout_us = 100000);
+    void set_execution(TpGdnExecution mode, bool profile = false);
+    TpGdnLayerProfile profile(int rank = 0) const;
+    // Diagnostic fault injection, next flat proposal only. No successful output
+    // or commit is permitted after timeout/abort. Missing rank is not launched;
+    // delayed rank is launched after host delay. Never use in inference.
+    void set_flat_fault_for_test(int missing_rank = -1, int delayed_rank = -1,
+                                uint64_t delay_us = 0);
     TpGdnExecution execution() const;
 
     // Initialization/checkpoint adapter, outside token execution. Canonical

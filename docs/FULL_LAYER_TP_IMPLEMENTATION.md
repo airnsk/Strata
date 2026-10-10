@@ -129,13 +129,13 @@ validate the shared path.
 
 First replicate HC parameters and run existing `fused_gr_read_multi` and
 `gr_write_multi` on both ranks after identical complete `bo` gathers. Preserve
-pending-write ordering, injection coefficients, full HC*N RMS normalization,
+pending-write ordering, injection coefficients, full N-wide RMS normalization independently in each of the HC streams,
 and final output HC read. Assert replica equality at selected layer boundaries.
 This uses existing validated HC code and eliminates primary-to-peer input
 broadcasts from the steady layer loop, while leaving HC cost undivided.
 
 Actual HC sharding is a separate optimization with a concrete contract:
-shard residual channels within every HC stream, reduce RMS sum over all HC*N,
+shard residual channels within every HC stream, reduce the N-wide RMS sum separately within each HC stream,
 compute low-rank down partials and reduce them, then replicate small low-rank
 outputs/mixing coefficients and perform local up/inject/residual writes. This
 needs rank-aware GR kernels and changes floating-point association. Do not

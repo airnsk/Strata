@@ -23,8 +23,8 @@ identity is not inferred merely from a matching shape.
 6. Full output reconstruction and final HC residual write
 
 The hidden dimension stays full width for down. No CPU expert-pool planning
-or host route selection occurs. HC and router are replicated, not accelerated
-by partitioning. GDN state is sharded using modulo head ownership; convolution
+or host route selection occurs. In the baseline modes HC and router are
+replicated; the optional flat-HC mode below partitions HC compute. GDN state is sharded using modulo head ownership; convolution
 state uses canonical `[channel,3]` order. This component uses explicit per-call
 FFN phase/mode dispatch rather than the benchmark's global phase overrides.
 The legacy `native_expert_grouped` entry point keeps its existing dispatch.
@@ -35,26 +35,38 @@ both ranks before host pointer publication. A failed execution poisons the
 component, requiring reconstruction; it cannot report a successful partial
 commit. Only one window is in flight. Epochs increase between proposals.
 
-Three explicit execution modes retain the same arithmetic:
+Execution modes share the same native weights and layer contract:
 
 - `runtime` (default): the validated schedule with individual runtime copies.
-- `consolidated`: one bit-preserving peer-push kernel per exchange/rank. The
-  routed and shared hidden-Q8 transfers share a launch. Every writing thread
-  system-fences its own writes; both consumers wait for both producer events.
-- `captured`: cached rank-local compute/push graphs, with inter-device event
-  dependencies outside graph capture. The one-GPU reference captures its entire
-  proposal in one graph; TP uses five segments per rank. State-sensitive graphs are keyed by the
-  physical state bank, so commit pointer swaps cannot replay stale addresses.
+- `consolidated`: one bit-preserving peer-push kernel per exchange/rank.
+- `captured`: five cached compute/push graph segments per TP rank, with four
+  host-submitted inter-device event joins. One GPU uses one complete graph.
+- `flat`: **one complete proposal graph per rank**, with no host intervention
+  between layer phases. Dedicated uncached peer inboxes, coherent mapped
+  SYSTEM acquire/release epoch signals and local unpack replace event joins.
+- `flat-hc`: the same flat graph plus output-row partitioning of both large HC
+  matrices. Each rank computes 160 full down rows and 1280 up channels in every
+  HC stream. Full N-wide normalization and four inject dots remain replicated.
+  This reduces duplicate compute and weight reads, **not immutable allocations**:
+  the present loader still retains full canonical HC matrices on both ranks.
+  Four added small joins make this an independently measured candidate, not an
+  assumed improvement over `flat`.
 
-Graph preparation and first-use warmup are startup-only, before the first
-proposal. There is no silent fallback if graph preparation or execution fails.
+The flat protocol has private monotonic nonzero generations, per-phase storage,
+writer-system fences, bounded steady-clock waits and a separate finite poll cap.
+Abort is sticky; failed unpack clears outputs, and a failed proposal poisons the
+session before any output/commit is accepted. Downstream finite scratch work may
+still drain after an abort; this is not generic device-graph cancellation.
+A model-free two-GPU protocol preflight must pass before model graphs are used.
+Unsupported compiler/runtime primitives fail explicitly rather than falling back.
+
+Graph preparation is startup-only. State-sensitive graphs are keyed by their
+physical state bank; commit pointer swaps cannot replay stale addresses. Profiled
+and unprofiled flat graphs are distinct. New profiling stamps are absent from
+unprofiled compute, and all authoritative timing uses unprofiled graphs.
+The one-GPU reference aliases complete output/hidden buffers, avoiding self copies.
 Both rank streams complete before the synchronous proposal/commit API returns.
-The one-GPU reference aliases its complete output/hidden buffers instead of
-copying them back to itself, in all modes. This removes avoidable baseline
-transport overhead; the next gate also rechecks that reference change.
-These are single-layer components, not a full-model GPU-persistent scheduler.
-The new peer-push and graph modes still require their own hardware parity gate;
-previous runtime-copy success does not establish their visibility/capture safety.
+These are single-layer components, not a full-model generation adapter.
 
 ## Build and run
 
@@ -84,29 +96,39 @@ The script does not stop other services or change card power settings.
 
 ## Complete-layer timing
 
-Add `--benchmark` to the command above. It first runs the full correctness suite
-in runtime, consolidated and captured modes: 132 prefix cases and 132
-continuations. Then it alternates one-GPU full-layer and two-GPU TP calls at
-T=1,2,4,8, with three warmup pairs and twelve measured pairs per execution mode.
-`--bench-warmup` and `--bench-trials` override these counts. Every pair has
-matched signed input and committed initial state; parity checks run after both
-arms and outside their timers. `--execution all` runs the three correctness
-modes without timing; the default remains runtime-only.
+Add `--benchmark --profile-flat` to the command above. Benchmark mode compares
+captured, flat and flat-HC paths; slow runtime/consolidated timing is not repeated
+by default. `--execution all` explicitly includes every mode. Ordinary invocation
+without benchmark remains runtime-only. Each selected path first passes all
+44 prefix/continuation cases against the runtime arithmetic reference.
 
-Reported host wall time includes device-input staging, graph/kernel launches,
-peer exchange, layer compute, plan-status checking, explicit accepted-prefix
-commit replay and completion. Weight loading, graph preparation, host uploads,
-state reset and diagnostic snapshots are outside the timer. Proposal and
-commit times are also reported separately. Both arms use proposal+commit even
-at T=1, unlike an optimized autoregressive self-commit path in the production
-Verifier. This is not a production EP or whole-model generation comparison.
+Small-window timing uses matched-input AB/BA crossover at T=1,2,4,8. Each input
+is tested in both execution orders. Warmup, input upload synchronization, state
+reset and snapshots are outside timers; every measured pair is parity-checked.
+Snapshots between pairs create gaps, so these are not continuous-inference
+measurements. An additional sustained block test runs repeated complete calls
+without intermediate snapshots: an untimed shadow sequence checks every step,
+while timed blocks check final outputs/state. That distinction is reported
+explicitly; timed intermediate states are not individually downloaded.
 
-Full/TP pairs are alternated within each mode; execution-mode blocks are
-sequential. Thus full/TP ratios within a mode are paired measurements, while
-runtime-vs-captured differences remain diagnostic and can reflect drift.
-The runner records read-only ROCm telemetry outside the test, the source
-revision and any tracked-diff hash. It does not set clocks or power caps.
-No timing result is accepted if its parity gate fails.
+Host wall includes device-input staging, launches, peer exchange, layer compute,
+plan-status checking, explicit accepted-prefix commit replay and completion.
+Proposal and commit times are also reported separately. Both arms use
+proposal+commit even at T=1, unlike optimized autoregressive self-commit in the
+production Verifier. This is not a production EP or whole-model comparison.
+Execution-mode blocks remain sequential, so cross-mode differences can reflect
+drift. Same-mode full/TP comparisons have matched workloads and balanced order.
+
+`--profile-flat` runs separate diagnostic graphs with same-device phase stamps
+for HC, projections, GDN, router/shared/routed FFN, push, wait and unpack. Never
+subtract timestamps from different GPUs or treat instrumentation overhead as
+normal inference time. The runner prints actual native HC tensor types from
+GGUF headers; artifact filenames are not evidence of their quantization.
+
+The runner records read-only ROCm telemetry outside the test, source revision
+and any tracked-diff hash. Idle clock snapshots do not establish loaded clock
+rates. No power or clock settings are changed. No timing is accepted if the
+associated parity gate fails.
 
 ## Gates and reference independence
 
@@ -150,6 +172,17 @@ bit-exact.
 The authoring environment still has no HIP compiler/GPU. New changes after
 that revision require a new hardware gate; CPU tests and declaration-only
 host syntax checks cannot substitute for it.
+
+### Captured-layer hardware result at e48e2bd
+
+On the same two MI50s, `tp2-gdn-20261010T021055Z.txt` reports 132 prefix cases,
+132 continuations and all 144 measured/36 warmup pairs passing. The SHA-256 is
+`dc38727926e30381894e0498b0a187aaf965c94781ce224a55525f3306414787`.
+Captured median paired full/TP speed ratios were 0.732700, 0.859802, 0.925753
+and 1.083770 at T=1,2,4,8. Thus TP was slower at the first three sizes, with only
+a modest T8 win; this did not meet the acceleration objective. It did not prove
+host submission to be the remaining bottleneck. New flat/HC modes above are
+not covered by that result and await their own hardware gate.
 
 The remaining integration includes QSA/KV/indexer commit, PLE, full-model rank
 residency, output head, prompt ingestion, MTP binding, graph capture and the
