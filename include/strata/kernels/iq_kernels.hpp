@@ -9,6 +9,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
+#include <stdexcept>
 
 namespace strata::kernels {
 
@@ -63,6 +65,53 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
                            const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
                            int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream,
                            int64_t grid_groups = 0);
+/// Call-local phases. GateUp writes quantized SwiGLU rows into scratch; Down reads them there.
+enum class NativeExpertPhase { Full = 0, GateUp = 1, Down = 2 };
+struct NativeExpertCallOptions {
+    NativeExpertPhase phase = NativeExpertPhase::Full;
+    int mode = -1;  // environment/device default, ignoring native_expert_set_mode; otherwise an explicit layout
+};
+/// Syntactic validation, independent of the backend. Mode 1 additionally requires gfx906;
+/// HIP targets without experimental layouts accept only -1 and 0. Mode 3 has no implementation.
+inline bool native_expert_call_options_valid(const NativeExpertCallOptions& options) noexcept {
+    const bool phase = options.phase == NativeExpertPhase::Full || options.phase == NativeExpertPhase::GateUp ||
+                       options.phase == NativeExpertPhase::Down;
+    const int m = options.mode;
+    return phase && (m == -1 || m == 0 || m == 1 || m == 2 || (m >= 4 && m <= 8));
+}
+/// Byte offset of the entry-major q8_1 hidden rows in native_expert_scratch_bytes(cap_entries, n_ff).
+/// Each row holds n_ff/32 blocks of 36 bytes. Separate GU/down views need separate scratch allocations:
+/// gather GU hidden rows into the down view's hidden rows before launching Down on the consumer stream.
+/// Throws on negative capacity, nonpositive/non-32-aligned width or size_t overflow.
+inline size_t native_expert_hidden_q8_offset(int64_t cap_entries, int64_t n_ff) {
+    if (cap_entries < 0 || n_ff <= 0 || n_ff % 32 != 0)
+        throw std::invalid_argument("native expert hidden scratch dimensions");
+    const auto limit = std::numeric_limits<size_t>::max();
+    if (static_cast<uint64_t>(cap_entries) > limit || static_cast<uint64_t>(n_ff) > limit)
+        throw std::overflow_error("native expert hidden scratch size");
+    const size_t cap = static_cast<size_t>(cap_entries), width = static_cast<size_t>(n_ff);
+    if (width > limit / sizeof(float) || cap > (limit - 255) / (width * sizeof(float)))
+        throw std::overflow_error("native expert hidden scratch size");
+    const size_t aligned = (cap * width * sizeof(float) + 255) & ~size_t{255};
+    if (aligned > limit / 3) throw std::overflow_error("native expert hidden scratch size");
+    return 3 * aligned;
+}
+/// CUDA/HIP call-local dispatch: never reads or changes the benchmark's phase/mode overrides.
+/// Unchanged kernels, scratch format and group metadata contract from native_expert_grouped above.
+/// GateUp uses only gu_type, n_embd (input width), n_ff (local hidden width), gu_row and up_off;
+/// Down uses only d_type, n_embd (local output width), n_ff (gathered hidden width), d_row and down_off.
+/// Active matrix ranges must fit L.bytes; inactive type/row/offset fields are ignored. Thus separate layouts
+/// can describe GU N=2560,F=320 and down N=1280,F=640 over the same blob using its actual down_off.
+/// GateUp may pass null out/ent_dst; Down may pass null x_q8_1/ent_tok. Shared metadata and scratch are required.
+/// Invalid options, backend modes or active layout fields throw before any launch. Explicit split phases
+/// never use full-FFN V2/V2K. Full with mode=-1 retains these environment fast paths; explicit modes bypass them.
+/// Other kernel tuning switches keep their startup settings; do not mutate benchmark switches concurrently.
+/// This entry point has no SYCL implementation; SYCL callers must retain native_expert_grouped.
+void native_expert_grouped_explicit(const NativeExpertLayout& L, const unsigned long long* grp_ptr,
+                                    const int32_t* grp_start, const int32_t* n_groups, const int32_t* ent_dst,
+                                    const int32_t* ent_tok, int64_t cap_groups, int64_t cap_entries,
+                                    const void* x_q8_1, void* scratch, float* out, void* stream,
+                                    const NativeExpertCallOptions& options, int64_t grid_groups = 0);
 /// true: `native_expert_grouped`'s launches before the group stride (STRATA_GROUPED_V1=1 at startup) - a block row
 /// per possible group, SwiGLU and the q8_1 quantization as two kernels over all cap_entries.  Bitwise the same results
 /// (native_grouped_parity checks it); kept for A/B timing.  Set before graph capture; captured graphs keep theirs.

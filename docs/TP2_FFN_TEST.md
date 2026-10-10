@@ -321,13 +321,52 @@ explicit graph-generation/lifetime design; an event wait inserted into an alread
 graph is not automatically equivalent to the prototype. No 30–50% model gain follows
 from this candidate.
 
+## Output-row TP hardware result, 2026-10-10
+
+At `05695a9`, the owner built the HIP harness and both CPU targets and ran 12
+alternating single/candidate pairs, both layouts, reduced transport, graphs on.
+All 32 synthetic cases passed. Output-row expert rows and ordered FP32 combines
+were bit-exact against the original single-GPU oracle; local hidden halves and
+both full-F gathered buffers were byte-exact. The direct peer/event probes passed.
+This is a subgraph correctness result, not full-model quality approval.
+
+| T | Median row/single speedup (single time / row time) | Median column/single speedup | Median EP/single speedup |
+|---|---:|---:|---:|
+| 1 | 0.862 | 1.033 | 1.066 |
+| 2 | 0.937 | 1.120 | 1.139 |
+| 4 | 1.067 | 1.190 | 1.261 |
+| 8 | 1.289 | 1.260 | 1.406 |
+
+Each entry is the median of eight ratios using that candidate's paired single
+baseline. This is not a median-time ratio. Row TP beats its own single baseline
+in 18/32 cases, balanced EP in 0/32, and column TP in 6/32 (all at T8).
+The strongest row result is 1.342x. No case establishes 2x.
+
+Applying actual layer-format counts to these small synthetic fixtures gives
+single/row ratios 0.886, 0.962, 1.081 and 1.297 at T1/2/4/8. These are ratios
+of count-weighted wall-time sums, excluding absent pair (23,42), not model
+latency predictions. The common (22,20) pair still favors column at T8
+(278.429 us column versus 288.693 us row). One (23,20) T8 row result is weak
+at 306.425 us; no cause is established and it should not decide architecture.
+
+The run has 12 samples/pairs but reports only means, not dispersion. EP/column
+comparisons are same-run separate candidate blocks, not directly interleaved
+row-versus-EP trials. The build is incremental and contains 46 compiler warnings.
+No further unchanged FFN repeats are required to advance the implementation:
+the next useful gate is the complete GDN-layer executor, shared FFN and
+GPU-owned routing/state, as specified in `FULL_LAYER_TP_IMPLEMENTATION.md`.
+
+Source log: `tp2-20261010T011347Z.txt`, SHA-256
+`152aa7d4d2d27476bd1a968e99c418b5bb7c6123db7ff2f8924dc07284205deb`.
+
 ## Validation status
 
 CPU strict-warning, optimized, Release/NDEBUG and ASan/UBSan checks passed.
 LeakSanitizer is unavailable under this executor's ptrace, so its check was disabled.
 The authoring executor has no HIP toolchain; GPU compile and runtime evidence above
 comes from the owner's hardware logs for the earlier column-only revisions. The corrected
-column reduced protocol passed its historical hardware gate. The new output-row path and
-paired timing changes have NOT been HIP-compiled or run on GPUs in the authoring environment.
+column reduced protocol passed its historical hardware gate. The output-row path and paired timing changes subsequently passed the owner’s
+HIP/GPU gate at `05695a9`, documented above. The authoring environment itself still
+has no HIP compiler or GPU.
 Real-weight/model-quality and production integration remain untested. These test
 sources do not enable any production TP path.

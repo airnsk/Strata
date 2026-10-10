@@ -3403,15 +3403,23 @@ __global__ void __launch_bounds__(256) native_gu_fused_kernel(const unsigned lon
 }
 
 int g_exp_mode = -1;   // native_expert_set_mode (the bench); -1 = STRATA_EXP_MODE, else the card's default
-int exp_mode() {
+int exp_mode(bool use_bench = true) {
     static const int m = [] { const char* v = std::getenv("STRATA_EXP_MODE"); return v ? std::atoi(v) : -1; }();
-    if (g_exp_mode >= 0) return g_exp_mode;
+    if (use_bench && g_exp_mode >= 0) return g_exp_mode;
     if (m >= 0) return m;
 #if defined(STRATA_HIP_GFX906)
     return kExpModeDefault;
 #else
     // Volta (sm_70): mode 8, the grid and the group's activations in shared memory with SwiGLU + q8_1 fused
     // (V100-SXM2, a verify window's VRAM call: 227 -> 159 us); every other CUDA card keeps the CUDA layout
+    if (!use_bench) {
+        int dev = 0, major = 0, minor = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess) return kExpModeDefault;
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
+        const char* sm70 = std::getenv("STRATA_SM70_TABLE");
+        return major == 7 && minor == 0 && sm70 && std::atoi(sm70) != 0 ? 8 : kExpModeDefault;
+    }
     static int per_dev[64];   // 0 unknown, else mode + 1
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return kExpModeDefault;
@@ -3443,10 +3451,10 @@ bool g_grouped_v1 = env_on("STRATA_GROUPED_V1");
 
 void native_grouped_set_v1(bool v1) { g_grouped_v1 = v1; }
 
-void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start,
+static void native_expert_grouped_impl(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start,
                            const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
                            int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream,
-                           int64_t grid_groups) {
+                           int64_t grid_groups, int phase, int mode, bool legacy) {
     if (cap_groups <= 0 || cap_entries <= 0) return;
     if (L.n_ff % 32 != 0) { std::fprintf(stderr, "native_expert_grouped: n_ff %lld\n", (long long) L.n_ff); std::exit(1); }
     cudaStream_t s = (cudaStream_t) stream;
@@ -3457,7 +3465,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     block_q8_1* hq = (block_q8_1*) ((uint8_t*) scratch + 3 * fa);
     const auto* X = (const block_q8_1*) x_q8_1;
     static const bool v2 = [] { const char* v = std::getenv("STRATA_EXPERT_V2"); return v && v[0] == '1'; }();
-    if (v2 && L.gu_type == 21 && L.d_type == 20 && L.n_embd == 2560 && L.n_ff == 640) {   // S26: see s26_gu_l_kernel
+    if ((legacy || (phase == 0 && mode == -1)) && v2 && L.gu_type == 21 && L.d_type == 20 && L.n_embd == 2560 && L.n_ff == 640) {   // S26: see s26_gu_l_kernel
         // S26 STRATA_TSUM=1: the sums as one transposed butterfly per warp (s26_tsum.cuh; bitwise the same values)
         static const bool ts = [] { const char* v = std::getenv("STRATA_TSUM"); return v && v[0] == '1'; }();
         // (+ down rows' items spread evenly over the lanes, one load group: bitwise, harness 1.09-1.12x vs 1.03-1.06x;
@@ -3471,7 +3479,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     }
     // stream B: UD-Q4_K_XL's Q4_K / Q5_K gate/up and Q5_1 / Q8_0 down (see S27 above)
     static const bool v2k = [] { const char* v = std::getenv("STRATA_EXPERT_V2K"); return v && v[0] == '1'; }();
-    if (v2k && (L.gu_type == 12 || L.gu_type == 13) && (L.d_type == 7 || L.d_type == 8) && L.n_embd == 2560 &&
+    if ((legacy || (phase == 0 && mode == -1)) && v2k && (L.gu_type == 12 || L.gu_type == 13) && (L.d_type == 7 || L.d_type == 8) && L.n_embd == 2560 &&
         L.n_ff == 640) {
         static const bool ts = [] { const char* v = std::getenv("STRATA_TSUM"); return v && v[0] == '1'; }();
         const long long nh = (long long) cap_entries * L.n_ff;
@@ -3490,17 +3498,18 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     const dim3 ggu((unsigned) ((2 * L.n_ff + gu_rows - 1) / gu_rows), (unsigned) gy);
 #if STRATA_EXP_LAYOUTS
 #if defined(STRATA_HIP_GFX906)
-    const int em0 = exp_mode();
+    const int em0 = legacy ? exp_mode() : (mode < 0 ? exp_mode(false) : mode);
 #else
     // CUDA: the AMD layouts launch a block row per possible group, so a call that strides (a verify window's PCIe
     // call, grid_groups 1..cap) keeps the CUDA layout: V100, 0 groups 11.3 vs 6.5 us, 1 group of 2 29.6 vs 21.3
-    const int em0 = (grid_groups > 0 && grid_groups < cap_groups) ? 0 : exp_mode();
+    const int em0 = legacy ? ((grid_groups > 0 && grid_groups < cap_groups) ? 0 : exp_mode())
+                           : (mode < 0 ? ((grid_groups > 0 && grid_groups < cap_groups) ? 0 : exp_mode(false)) : mode);
 #endif
 #endif
 #if STRATA_EXP_LAYOUTS
     const bool fused_gu = em0 == 8 && ((kExpLds16 && L.gu_type == 16) || L.gu_type == 18 || L.gu_type == 21 || L.gu_type == 22 || L.gu_type == 23) &&
                           L.n_ff % 32 == 0;
-    if (fused_gu && g_exp_phase != 2) {
+    if (fused_gu && phase != 2) {
         const dim3 gl((unsigned) (L.n_ff / 32), (unsigned) cap_groups);
         const size_t sh = (size_t) LDS_NT * (size_t) (L.n_embd / 32) * sizeof(block_q8_1);
         switch (L.gu_type) {
@@ -3512,9 +3521,9 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
         }
         check("native_expert_grouped/gu fused");
     }
-    if (g_exp_phase != 2 && !fused_gu) {
+    if (phase != 2 && !fused_gu) {
 #else
-    if (g_exp_phase != 2) {
+    if (phase != 2) {
 #endif
 #if STRATA_EXP_LAYOUTS
     const bool lds_gu = (em0 == 5 || em0 == 6 || em0 == 7 || em0 == 8) && ((kExpLds16 && L.gu_type == 16) || L.gu_type == 18 || L.gu_type == 21 || L.gu_type == 22 || L.gu_type == 23);
@@ -3574,7 +3583,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     }
     check("native_expert_grouped/swiglu");
     }
-    if (g_exp_phase == 1) return;
+    if (phase == 1) return;
     const int d_rows = (!g_old_kernels && !g_no_sub16_gu && L.n_ff == 640) ? (L.d_type == 20 ? 32 : (L.d_type == 42 ? 16 : 8)) : 8;
     const dim3 gd((unsigned) ((L.n_embd + d_rows - 1) / d_rows), (unsigned) gy);
 #if STRATA_EXP_LAYOUTS
@@ -3608,6 +3617,65 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
         default: std::fprintf(stderr, "native_expert_grouped: down type %d\n", L.d_type); std::exit(1);
     }
     check("native_expert_grouped/down");
+}
+
+void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start,
+                           const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
+                           int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream,
+                           int64_t grid_groups) {
+    native_expert_grouped_impl(L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, cap_groups, cap_entries,
+                               x_q8_1, scratch, out, stream, grid_groups, g_exp_phase, -1, true);
+}
+
+void native_expert_grouped_explicit(const NativeExpertLayout& L, const unsigned long long* grp_ptr,
+                                    const int32_t* grp_start, const int32_t* n_groups, const int32_t* ent_dst,
+                                    const int32_t* ent_tok, int64_t cap_groups, int64_t cap_entries,
+                                    const void* x_q8_1, void* scratch, float* out, void* stream,
+                                    const NativeExpertCallOptions& options, int64_t grid_groups) {
+    if (!native_expert_call_options_valid(options))
+        throw std::invalid_argument("native expert phase or mode");
+    int mode = options.mode;
+#if STRATA_EXP_LAYOUTS
+    const int resolved_mode = mode < 0 ? exp_mode(false) : mode;
+    if (!native_expert_call_options_valid({options.phase, resolved_mode}) || resolved_mode < 0)
+        throw std::invalid_argument("native expert environment mode");
+#if !defined(STRATA_HIP_GFX906)
+    if (resolved_mode == 1) throw std::invalid_argument("native expert mode 1 requires gfx906");
+#endif
+#else
+    if (mode != -1 && mode != 0) throw std::invalid_argument("native expert mode unavailable on this backend");
+#endif
+    if (cap_groups < 0 || cap_entries < 0 || grid_groups < 0 || grid_groups > cap_groups)
+        throw std::invalid_argument("native expert group capacity");
+    // Zero capacity is a no-op, but malformed options are never silently accepted.
+    if (cap_groups == 0 || cap_entries == 0) return;
+    const bool gu = options.phase != NativeExpertPhase::Down;
+    const bool down = options.phase != NativeExpertPhase::GateUp;
+    if (L.n_embd <= 0 || L.n_embd % 32 != 0 || L.n_ff <= 0 || L.n_ff % 32 != 0 ||
+        L.n_embd > std::numeric_limits<int>::max() || L.n_ff > std::numeric_limits<int>::max() ||
+        cap_groups > std::numeric_limits<int>::max() || cap_entries > std::numeric_limits<int>::max())
+        throw std::invalid_argument("native expert layout dimensions");
+    // Subtraction/division checks avoid overflow and permit inactive fields to describe a different view.
+    const auto fits = [&](size_t offset, size_t row, int64_t rows) {
+        return row && offset <= L.bytes && static_cast<uint64_t>(rows) <= (L.bytes - offset) / row;
+    };
+    if (gu) {
+        const int qk = gu_qk(L.gu_type);
+        if (qk <= 0 || L.n_embd % qk != 0 || L.gu_row != iq_row_bytes(L.gu_type, L.n_embd) ||
+            !fits(0, L.gu_row, L.n_ff) || !fits(L.up_off, L.gu_row, L.n_ff))
+            throw std::invalid_argument("native expert gate/up layout");
+    }
+    if (down) {
+        const int qk = d_qk(L.d_type);
+        if (qk <= 0 || L.n_ff % qk != 0 || L.d_row != iq_row_bytes(L.d_type, L.n_ff) ||
+            !fits(L.down_off, L.d_row, L.n_embd))
+            throw std::invalid_argument("native expert down layout");
+    }
+    (void) native_expert_hidden_q8_offset(cap_entries, L.n_ff);
+    if (!grp_ptr || !grp_start || !n_groups || !scratch || (gu && (!ent_tok || !x_q8_1)) ||
+        (down && (!ent_dst || !out))) throw std::invalid_argument("native expert null phase buffer");
+    native_expert_grouped_impl(L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, cap_groups, cap_entries,
+                               x_q8_1, scratch, out, stream, grid_groups, static_cast<int>(options.phase), mode, false);
 }
 
 }  // namespace strata::kernels
