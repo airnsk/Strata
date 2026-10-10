@@ -5,10 +5,29 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <stdexcept>
 #include <vector>
 
 namespace strata::core::tp2 {
-enum class TpGdnPartition { OutputRows, InputColumns };
+enum class TpGdnPartition { OutputRows, InputColumns, HybridRowsColumns };
+// Pure geometry shared by loading, allocation and descriptor validation.
+// The full reference has the same dimensions regardless of a valid partition tag.
+struct TpGdnPartitionGeometry {
+    bool full, projection_columns, ffn_columns;
+    int projection_input, projection_output, ffn_input, ffn_output;
+};
+constexpr TpGdnPartitionGeometry tp_gdn_partition_geometry(TpGdnPartition partition,int rank) {
+    if(rank < -1 || rank > 1 ||
+       (partition != TpGdnPartition::OutputRows && partition != TpGdnPartition::InputColumns &&
+        partition != TpGdnPartition::HybridRowsColumns))
+        throw std::invalid_argument("TP GDN invalid rank or partition");
+    const bool full=rank==-1;
+    const bool projection_columns=!full&&partition==TpGdnPartition::InputColumns;
+    const bool ffn_columns=!full&&(projection_columns||partition==TpGdnPartition::HybridRowsColumns);
+    return {full,projection_columns,ffn_columns,projection_columns?3072:6144,
+            full||projection_columns?2560:1280,ffn_columns?320:640,full||ffn_columns?2560:1280};
+}
+
 // Native Q8_1 projection contract: non-MMVQ source types are refused, matching
 // the existing Verifier/shared_expert_multi path. BF16 small weights are separate.
 struct TpNativeMatrix {
@@ -32,7 +51,7 @@ struct TpGdnRankWeights {
     const uint8_t* expert_arena = nullptr;
     size_t expert_bytes = 0; // stride of ONE expert; arena contains 512
     // Independent phase descriptors: GU n_embd=N,n_ff=local_F;
-    // OutputRows down: n_embd=local_N,n_ff=full_F; InputColumns down:
+    // OutputRows down: n_embd=local_N,n_ff=full_F; InputColumns/HybridRowsColumns down:
     // n_embd=full_N,n_ff=local_F. Both offsets address the same raw blob.
     kernels::NativeExpertLayout gu_layout{}, down_layout{};
 };
@@ -47,10 +66,11 @@ public:
     // WeightTable's exact engine conversions. Native matrices/experts come from
     // validated GGUF spans. Only this non-PLE GDN layer is allocated.
     // rank=-1 is a full single-device reference regardless of partition tag.
-    // Ranks 0/1 own identical GU/head shards in either partition. InputColumns
+    // Ranks 0/1 own identical GU/head shards in all partitions. InputColumns
     // packs out along local value_rows and shared/expert down along local F/2;
     // their full-N outputs are partial sums requiring the executor reduction.
-    // OutputRows remains the default. HC stays replicated in both partitions.
+    // HybridRowsColumns keeps output-row attention projection and column FFN down.
+    // OutputRows remains the default. HC stays replicated in all partitions.
     // Synchronous initialization; scratch/state belong to the separate executor.
     bool load(const std::vector<std::string>& shards, const std::string& pack_dir,
               const ModelGeometry& geometry, int layer, int rank, int device, std::string& err,

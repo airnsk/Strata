@@ -61,8 +61,8 @@ Options parse(int argc,char**argv) {
     }
     if(o.shards.empty() || o.pack.empty() || o.layer<0 || o.layer>=48 || o.layer==1 || o.layer%4==3 ||
        (o.mode!=7 && o.mode!=8) || o.warmup<1 || o.warmup>100 || o.trials<2 || o.trials>1000 || o.block_calls<2 || o.block_calls>64 || o.block_trials<2 || o.block_trials>20 ||
-       (o.execution!="runtime"&&o.execution!="consolidated"&&o.execution!="captured"&&o.execution!="flat"&&o.execution!="flat-hc"&&o.execution!="column"&&o.execution!="all"))
-        throw std::invalid_argument("usage: tp2_gdn_layer --pack PACK --gguf SHARD [--gguf SHARD ...] [--layer non-PLE-GDN-index] [--mode 7|8] [--execution runtime|consolidated|captured|column|flat|flat-hc|all] [--benchmark | --calibrate] [--bench-warmup 3] [--bench-trials 12] [--profile-stages] [--bench-block-calls 16] [--bench-block-trials 4]");
+       (o.execution!="runtime"&&o.execution!="consolidated"&&o.execution!="captured"&&o.execution!="flat"&&o.execution!="flat-hc"&&o.execution!="column"&&o.execution!="hybrid"&&o.execution!="all"))
+        throw std::invalid_argument("usage: tp2_gdn_layer --pack PACK --gguf SHARD [--gguf SHARD ...] [--layer non-PLE-GDN-index] [--mode 7|8] [--execution runtime|consolidated|captured|column|hybrid|flat|flat-hc|all] [--benchmark | --calibrate] [--bench-warmup 3] [--bench-trials 12] [--profile-stages] [--bench-block-calls 16] [--bench-block-trials 4]");
     if(o.calibrate){
         if(o.benchmark||o.profile_flat||(o.execution_explicit&&o.execution!="captured"))
             throw std::invalid_argument("--calibrate only supports unprofiled output-row captured; do not combine with --benchmark/--profile-stages/other execution");
@@ -269,7 +269,9 @@ void column_local_fusion_gate(Checks& c,const tp::TpGdnLayerSnapshot& s) {
         expected[pos]=float(value);}
     c.floats("column fused vs local unfused",expected,s.local_output_partial,ffn_gate);
 }
-void seams(Checks& c,const tp::TpGdnLayerSnapshot& a,const tp::TpGdnLayerSnapshot& b,bool replica=false,bool same_epoch=true,bool association_change=false,const tp::TpGdnRankWeights* oracle=nullptr) {
+void seams(Checks& c,const tp::TpGdnLayerSnapshot& a,const tp::TpGdnLayerSnapshot& b,bool replica=false,bool same_epoch=true,bool association_change=false,const tp::TpGdnRankWeights* oracle=nullptr,bool hybrid=false) {
+    if(hybrid)c.require(!b.local_output_partial.empty(),"hybrid local fused diagnostic present");
+    if(replica&&!a.local_output_partial.empty())c.require(!b.local_output_partial.empty(),"replica local fused diagnostic present");
     column_local_fusion_gate(c,a);column_local_fusion_gate(c,b);
     c.require(a.tokens==b.tokens&&(!same_epoch||a.epoch==b.epoch),same_epoch?"snapshot token/epoch identity":"snapshot token identity (independent epochs)");
     if(replica)c.exact("replica final residual",a.residual,b.residual);
@@ -288,8 +290,9 @@ void seams(Checks& c,const tp::TpGdnLayerSnapshot& a,const tp::TpGdnLayerSnapsho
         c.floats("combined FFN",a.output,b.output,ffn_gate);
     }
     const bool same_input=same_float_bits(a.ffn_input,b.ffn_input);
+    if(hybrid)c.exact("hybrid original FFN input",a.ffn_input,b.ffn_input);
     c.exact("ordered router IDs",a.ids,b.ids);
-    if(association_change&&!same_input){
+    if(association_change&&!hybrid&&!same_input){
         // PREDECLARED: reuse hc_gate {2e-6,2e-5,5e-6}; no fitted thresholds.
         c.floats("router logits changed input",a.route_logits,b.route_logits,hc_gate);
         c.floats("router weights changed input",a.route_weights,b.route_weights,hc_gate);
@@ -303,8 +306,8 @@ void seams(Checks& c,const tp::TpGdnLayerSnapshot& a,const tp::TpGdnLayerSnapsho
         c.exact("router logits",a.route_logits,b.route_logits);c.exact("router weights",a.route_weights,b.route_weights);
         c.exact("routed hidden Q8 bytes",a.routed_hidden_q8,b.routed_hidden_q8);c.exact("shared hidden Q8 bytes",a.shared_hidden_q8,b.shared_hidden_q8);
     }
-    if(association_change){
-        if(!oracle)throw std::logic_error("column parity requires candidate-same-input full-FFN oracle");
+    if(association_change||hybrid){
+        if(!oracle)throw std::logic_error("column/hybrid parity requires candidate-same-input full-FFN oracle");
         same_input_ffn_oracle(c,*oracle,b);
     }
     c.floats("committed recurrence",a.state,b.state,replica?Gate{0,0,0}:gdn_gate);
@@ -339,7 +342,7 @@ void matrix_columns(Checks& c,const char* label,const tp::TpNativeMatrix& full,c
     c.exact(label,expected,actual);
 }
 void expert_byte_coherence(Checks& c,const tp::TpGdnRankWeights& full,const tp::TpGdnRankWeights& shard) {
-    const bool columns=shard.partition==tp::TpGdnPartition::InputColumns;
+    const bool columns=shard.partition==tp::TpGdnPartition::InputColumns||shard.partition==tp::TpGdnPartition::HybridRowsColumns;
     const auto& fl=full.gu_layout;const auto& sl=shard.gu_layout;const auto& dl=shard.down_layout;
     const size_t gu_bytes=size_t(F/2)*fl.gu_row,down_bytes=size_t(columns?N:N/2)*dl.d_row;
     c.require(fl.gu_type==sl.gu_type&&fl.d_type==dl.d_type&&sl.gu_row==fl.gu_row&&sl.up_off==gu_bytes&&dl.down_off==2*gu_bytes&&
@@ -364,7 +367,7 @@ void expert_byte_coherence(Checks& c,const tp::TpGdnRankWeights& full,const tp::
         size_t mismatches=0;for(size_t i=0;i<actual.size();++i)mismatches+=expected[i]!=actual[i];
         bad_experts+=mismatches!=0;different_bytes+=mismatches;
     }
-    std::printf("EXPERT_BYTE_COHERENCE partition=%s rank=%d experts=512 bad-experts=%zu differing-bytes=%zu\n",columns?"input-columns":"output-rows",shard.rank,bad_experts,different_bytes);
+    std::printf("EXPERT_BYTE_COHERENCE partition=%s rank=%d experts=512 bad-experts=%zu differing-bytes=%zu\n",shard.partition==tp::TpGdnPartition::HybridRowsColumns?"hybrid-rows-columns":(columns?"input-columns":"output-rows"),shard.rank,bad_experts,different_bytes);
     c.require(!bad_experts,"all512 actual expert shard bytes");
 }
 void coherence(Checks& c,const strata::core::ModelGeometry& g,const tp::TpGdnRankWeights& full,const tp::TpGdnRankWeights& r) {
@@ -384,7 +387,7 @@ void coherence(Checks& c,const strata::core::ModelGeometry& g,const tp::TpGdnRan
     else matrix("actual output rows",full.out,r.out,sequence(r.rank*N/2,N/2));
     matrix("actual shared gate rows",full.shared_gate,r.shared_gate,sequence(r.rank*F/2,F/2));
     matrix("actual shared up rows",full.shared_up,r.shared_up,sequence(r.rank*F/2,F/2));
-    if(r.partition==tp::TpGdnPartition::InputColumns)matrix_columns(c,"actual shared down columns",full.shared_down,r.shared_down,sequence(r.rank*F/2,F/2),full.device,r.device);
+    if(r.partition==tp::TpGdnPartition::InputColumns||r.partition==tp::TpGdnPartition::HybridRowsColumns)matrix_columns(c,"actual shared down columns",full.shared_down,r.shared_down,sequence(r.rank*F/2,F/2),full.device,r.device);
     else matrix("actual shared down rows",full.shared_down,r.shared_down,sequence(r.rank*N/2,N/2));
     mapped_bytes(c,"actual alpha head rows",full.alpha,r.alpha,N*2,heads,full.device,r.device);
     mapped_bytes(c,"actual beta head rows",full.beta,r.beta,N*2,heads,full.device,r.device);
@@ -532,12 +535,13 @@ void committed(Checks& c,const tp::TpGdnLayerSnapshot& a,const tp::TpGdnLayerSna
 }
 
 const char* execution_name(tp::TpGdnExecution mode) {
-    switch(mode){case tp::TpGdnExecution::RuntimeCopies:return "runtime";case tp::TpGdnExecution::Consolidated:return "consolidated";case tp::TpGdnExecution::Captured:return "captured";case tp::TpGdnExecution::FlatCaptured:return "flat";case tp::TpGdnExecution::FlatHcCaptured:return "flat-hc";case tp::TpGdnExecution::ColumnCaptured:return "column";}
+    switch(mode){case tp::TpGdnExecution::RuntimeCopies:return "runtime";case tp::TpGdnExecution::Consolidated:return "consolidated";case tp::TpGdnExecution::Captured:return "captured";case tp::TpGdnExecution::FlatCaptured:return "flat";case tp::TpGdnExecution::FlatHcCaptured:return "flat-hc";case tp::TpGdnExecution::ColumnCaptured:return "column";case tp::TpGdnExecution::HybridCaptured:return "hybrid";}
     throw std::invalid_argument("unknown execution mode");
 }
 std::vector<tp::TpGdnExecution> execution_modes(const Options& o) {
     if(o.benchmark&&!o.execution_explicit)return {tp::TpGdnExecution::Captured,tp::TpGdnExecution::ColumnCaptured};
     if(o.execution=="all")return {tp::TpGdnExecution::RuntimeCopies,tp::TpGdnExecution::Consolidated,tp::TpGdnExecution::Captured,tp::TpGdnExecution::FlatCaptured,tp::TpGdnExecution::FlatHcCaptured,tp::TpGdnExecution::ColumnCaptured};
+    if(o.execution=="hybrid")return o.benchmark?std::vector<tp::TpGdnExecution>{tp::TpGdnExecution::Captured,tp::TpGdnExecution::HybridCaptured}:std::vector<tp::TpGdnExecution>{tp::TpGdnExecution::HybridCaptured};
     if(o.execution=="column")return {tp::TpGdnExecution::ColumnCaptured};
     if(o.execution=="flat-hc")return {tp::TpGdnExecution::FlatHcCaptured};
     if(o.execution=="flat")return {tp::TpGdnExecution::FlatCaptured};
@@ -550,8 +554,10 @@ std::vector<tp::TpGdnExecution> execution_modes(const Options& o) {
 void execution_metadata(tp::TpGdnExecution mode) {
     const bool flat=mode==tp::TpGdnExecution::FlatCaptured||mode==tp::TpGdnExecution::FlatHcCaptured;
     const bool column=mode==tp::TpGdnExecution::ColumnCaptured;
-    const bool graph=flat||column||mode==tp::TpGdnExecution::Captured;
-    std::printf("EXECUTION_LAYOUT mode=%s full-proposal-graph-launches=%d full-commit-graph-launches=%d tp-proposal-graph-launches-per-rank=%d tp-commit-graph-launches-per-rank=%d positive-keep-only; graph-counts-exclude-copy/host-commands\n",execution_name(mode),graph?1:0,graph?1:0,flat?1:(column?3:(graph?5:0)),graph?1:0);
+    const bool hybrid=mode==tp::TpGdnExecution::HybridCaptured;
+    const bool graph=flat||column||hybrid||mode==tp::TpGdnExecution::Captured;
+    std::printf("EXECUTION_LAYOUT mode=%s full-proposal-graph-launches=%d full-commit-graph-launches=%d tp-proposal-graph-launches-per-rank=%d tp-commit-graph-launches-per-rank=%d positive-keep-only; graph-counts-exclude-copy/host-commands\n",execution_name(mode),graph?1:0,graph?1:0,flat?1:(column?3:(hybrid?4:(graph?5:0))),graph?1:0);
+    if(hybrid)std::printf("HYBRID_TRANSPORT row-attention Y/projection gathers; local-hidden320 column-FFN fused down; three joins/four segments vs row four/five; one fewer join, wall-time saving unmeasured; no new GPU kernel; expert-parts snapshot diagnostic recomputation\n");
     if(column)std::printf("COLUMN_TRANSPORT local-Y3072/local-hidden320; fullN partial outputs; two reductions; no Y/hidden gather in timed execution; expert parts snapshot is diagnostic recomputation\n");
     std::printf("HC_OWNERSHIP mode=%s TP=%s full-reference=original-full-HC norm/injection=replicated weight-allocation=full-canonical-BF16-on-each-rank\n",execution_name(mode),mode==tp::TpGdnExecution::FlatHcCaptured?"down160-rows-per-rank/up1280-channels-in-each-of-four-streams-per-rank":"replicated-full-compute");
 }
@@ -627,6 +633,7 @@ void sustained_benchmark(Checks& c,const Options& o,const BenchStudy& study,cons
                          uint64_t& epoch,const std::vector<float>& state,const std::vector<float>& conv) {
     auto& reference=study.baseline;auto& parallel=study.candidate;const auto mode=study.candidate_mode;
     const bool association=mode==tp::TpGdnExecution::ColumnCaptured;
+    const bool hybrid=mode==tp::TpGdnExecution::HybridCaptured;
     std::printf("BLOCK_STUDY baseline=%s candidate=%s\n",study.baseline_label,study.candidate_label);
     std::printf("BLOCK_SCOPE complete-call evolving-state blocks; shadow pass checks every step, measured blocks download no intermediate outputs/state and check final results only; not full-model throughput\n");
     std::printf("BLOCK_METHOD calls=%d crossovers=%d same preuploaded input sequence in both orders; equal untimed %d-call evolving warm block immediately before each measured arm; initial state reset outside clock; block wall includes all host looping/proposals/commits/sync; no snapshots within block\n",o.block_calls,o.block_trials,o.block_calls);
@@ -642,7 +649,7 @@ void sustained_benchmark(Checks& c,const Options& o,const BenchStudy& study,cons
         for(int j=0;j<o.block_calls;++j){const auto e=++epoch;reference.propose_device(input(j),tokens,e);reference.commit(tokens);parallel.propose_device(input(j),tokens,e);parallel.commit(tokens);
             shadow_full=reference.snapshot();shadow_tp=parallel.snapshot();
             std::printf("BLOCK_SHADOW mode=%s T=%d step=%d\n",execution_name(mode),tokens,j);
-            seams(c,shadow_full,shadow_tp,false,true,association,&oracle);seams(c,shadow_tp,parallel.snapshot(1),true);
+            seams(c,shadow_full,shadow_tp,false,true,association,&oracle,hybrid);seams(c,shadow_tp,parallel.snapshot(1),true);
             if(c.failures)throw std::runtime_error("sustained shadow parity failed; timing prohibited");}
         auto run=[&](tp::TpGdnLayer& layer){
             layer.reset_state(state,conv);const auto start=std::chrono::steady_clock::now();
@@ -657,7 +664,7 @@ void sustained_benchmark(Checks& c,const Options& o,const BenchStudy& study,cons
                 std::printf("BLOCK_SAMPLE baseline=%s candidate=%s mode=%s T=%d trial=%d crossover-leg=%d first=%s calls=%d baseline-wall-ms=%.6f candidate-wall-ms=%.6f baseline-ms-per-call=%.6f candidate-ms-per-call=%.6f\n",study.baseline_label,study.candidate_label,execution_name(mode),tokens,trial,leg,tp_first?study.candidate_label:study.baseline_label,o.block_calls,a,b,a/o.block_calls,b/o.block_calls);
                 // Epoch counters differ across sequential complete blocks; inputs,
                 // initial state, token count and number of transitions match.
-                const auto aa=reference.snapshot(),bb=parallel.snapshot();seams(c,aa,bb,false,false,association,&oracle);seams(c,bb,parallel.snapshot(1),true);
+                const auto aa=reference.snapshot(),bb=parallel.snapshot();seams(c,aa,bb,false,false,association,&oracle,hybrid);seams(c,bb,parallel.snapshot(1),true);
                 seams(c,shadow_full,aa,false,false);seams(c,shadow_tp,bb,false,false);
                 if(c.failures)throw std::runtime_error("measured block final parity failed; timing rejected");
                 fs+=a;ps+=b;full_times.push_back(a/o.block_calls);tp_times.push_back(b/o.block_calls);
@@ -671,6 +678,7 @@ void benchmark(Checks& c,const Options& o,const BenchStudy& study,const tp::TpGd
                uint64_t& epoch,const std::vector<float>& state,const std::vector<float>& conv) {
     auto& reference=study.baseline;auto& parallel=study.candidate;const auto mode=study.candidate_mode;
     const bool association=mode==tp::TpGdnExecution::ColumnCaptured;
+    const bool hybrid=mode==tp::TpGdnExecution::HybridCaptured;
     std::printf("BENCH_STUDY baseline=%s candidate=%s\n",study.baseline_label,study.candidate_label);
     std::printf("\nBENCH_SCOPE real-weight-one-GDN-layer; explicit-arm-labels-above; matched-input-and-state; not-EP-or-full-model-generation\n");
     std::printf("BENCH_METHOD wall=propose_device+commit(T), includes D2D input/host launch/P2P/compute/commit/sync; excludes reset/H2D/weight-load/graph-preparation/snapshots; fixed initialized state, varying matched signed input; keep=T is a workload choice, not measured speculative acceptance\n");
@@ -713,7 +721,7 @@ void benchmark(Checks& c,const Options& o,const BenchStudy& study,const tp::TpGd
             // Every measured proposal/commit pair is retained and checked,
             // including the first order leg. Snapshot gaps are outside clocks;
             // explicit untimed warming precedes the next measured pair.
-            for(int order=0;order<2;++order){seams(c,full_snap[order],split_snap[order],false,true,association,&oracle);seams(c,split_snap[order],replica_snap[order],true);}
+            for(int order=0;order<2;++order){seams(c,full_snap[order],split_snap[order],false,true,association,&oracle,hybrid);seams(c,split_snap[order],replica_snap[order],true);}
             if(c.failures)throw std::runtime_error("benchmark parity failed; timing is not an accepted result");
             if(trial>=0)std::printf("BENCH_CROSSOVER baseline=%s candidate=%s mode=%s T=%d trial=%d baseline-mean-ms=%.6f candidate-mean-ms=%.6f crossed-ratio=%.6f\n",study.baseline_label,study.candidate_label,execution_name(mode),tokens,trial,full_sum/2,tp_sum/2,full_sum/tp_sum);
             if(trial>=0)ratio.push_back(full_sum/tp_sum);
@@ -786,8 +794,9 @@ int main(int argc,char** argv) {
                             std::find(executions.begin(),executions.end(),tp::TpGdnExecution::FlatHcCaptured)!=executions.end();
         Checks preflight;if(use_flat)flat_protocol_preflight(preflight);
         const bool use_column=std::find(executions.begin(),executions.end(),tp::TpGdnExecution::ColumnCaptured)!=executions.end();
+        const bool use_hybrid=std::find(executions.begin(),executions.end(),tp::TpGdnExecution::HybridCaptured)!=executions.end();
         const bool profiles=o.profile_flat||o.benchmark;
-        strata::core::ModelGeometry g;tp::TpGdnWeights full,rank0,rank1,column0,column1;std::string err;
+        strata::core::ModelGeometry g;tp::TpGdnWeights full,rank0,rank1,column0,column1,hybrid0,hybrid1;std::string err;
         if(!full.load(o.shards,o.pack,g,o.layer,-1,0,err))throw std::runtime_error("full reference load: "+err);
         if(!rank0.load(o.shards,o.pack,g,o.layer,0,0,err))throw std::runtime_error("rank0 load: "+err);
         if(!rank1.load(o.shards,o.pack,g,o.layer,1,1,err))throw std::runtime_error("rank1 load: "+err);
@@ -796,20 +805,33 @@ int main(int argc,char** argv) {
             if(!column1.load(o.shards,o.pack,g,o.layer,1,1,err,tp::TpGdnPartition::InputColumns))throw std::runtime_error("column rank1 load: "+err);
             std::printf("column-weight-bytes rank0=%llu rank1=%llu\n",(unsigned long long)column0.weight_bytes(),(unsigned long long)column1.weight_bytes());
         }
+        if(use_hybrid){
+            if(!hybrid0.load(o.shards,o.pack,g,o.layer,0,0,err,tp::TpGdnPartition::HybridRowsColumns))throw std::runtime_error("hybrid rank0 load: "+err);
+            if(!hybrid1.load(o.shards,o.pack,g,o.layer,1,1,err,tp::TpGdnPartition::HybridRowsColumns))throw std::runtime_error("hybrid rank1 load: "+err);
+            std::printf("hybrid-weight-bytes rank0=%llu rank1=%llu\n",(unsigned long long)hybrid0.weight_bytes(),(unsigned long long)hybrid1.weight_bytes());
+        }
         std::printf("real-weight GDN layer=%d mode=%d weight-bytes full=%llu rank0=%llu rank1=%llu\n",o.layer,o.mode,(unsigned long long)full.weight_bytes(),(unsigned long long)rank0.weight_bytes(),(unsigned long long)rank1.weight_bytes());
         std::printf("scope=one-layer; full-reference shares orchestrator; independent legacy GDN/HC/shared and CPU-combine checks; no model-quality or performance claim\n");
         Checks c;coherence(c,g,full.weights(),rank0.weights());coherence(c,g,full.weights(),rank1.weights());
         if(use_column){coherence(c,g,full.weights(),column0.weights());coherence(c,g,full.weights(),column1.weights());}
+        if(use_hybrid){coherence(c,g,full.weights(),hybrid0.weights());coherence(c,g,full.weights(),hybrid1.weights());}
         if(c.failures)return 1;
+        if(use_hybrid)std::printf("HYBRID_REFERENCE_CONTRACT original-full bounds unchanged; original FFN input/router logits/router weights/ordered IDs/hidden Q8 exact; candidate-same-input full-FFN oracle retained; local fused-vs-unfused FFN gate; GDN output row ownership and hidden column ownership checked independently; correctness failures prohibit timing\n");
         if(use_column)std::printf("COLUMN_REFERENCE_CONTRACT original-full seam/residual/state bounds unchanged; original router IDs exact; router logits/weights use predeclared hc_gate(abs2e-6,scaled2e-5,rms5e-6) only when FFN inputs differ; candidate-same-input original full GU/Q8 exact and complete FFN numerical gate; original-input Q8 differences diagnostic, not exact PASS; diagnostic recomputed expert parts do not establish fused output correctness; engineering parity only\n");
         const auto state=signed_input(STATE,17,0.015f),conv=signed_input(CONV,31,0.12f);
         if(use_flat)flat_failure_gate(c,o,g,rank0.weights(),rank1.weights(),state,conv);
         tp::TpGdnLayer reference(g,full.weights(),nullptr,8,o.mode),row_parallel(g,rank0.weights(),&rank1.weights(),8,o.mode);
-        std::unique_ptr<tp::TpGdnLayer> column_parallel;
+        std::unique_ptr<tp::TpGdnLayer> column_parallel,hybrid_parallel;
         if(use_column)column_parallel=std::make_unique<tp::TpGdnLayer>(g,column0.weights(),&column1.weights(),8,o.mode);
+        if(use_hybrid)hybrid_parallel=std::make_unique<tp::TpGdnLayer>(g,hybrid0.weights(),&hybrid1.weights(),8,o.mode);
+        auto candidate_for=[&](tp::TpGdnExecution mode)->tp::TpGdnLayer&{
+            if(mode==tp::TpGdnExecution::ColumnCaptured)return *column_parallel;
+            if(mode==tp::TpGdnExecution::HybridCaptured)return *hybrid_parallel;
+            return row_parallel;
+        };
         for(auto execution:executions){
-            auto& candidate=execution==tp::TpGdnExecution::ColumnCaptured?*column_parallel:row_parallel;
-            if(execution==tp::TpGdnExecution::Captured||execution==tp::TpGdnExecution::ColumnCaptured){
+            auto& candidate=candidate_for(execution);
+            if(execution==tp::TpGdnExecution::Captured||execution==tp::TpGdnExecution::ColumnCaptured||execution==tp::TpGdnExecution::HybridCaptured){
                 for(int t=1;t<=8;++t){candidate.prepare_captured(t);if(profiles)candidate.prepare_captured(t,true);}
                 if(o.benchmark||o.calibrate)for(int t:{1,2,4,5,8})reference.prepare_captured(t);
             }
@@ -823,8 +845,9 @@ int main(int argc,char** argv) {
         std::vector<int32_t> prior_routes;bool routes_changed=false,repeated_ids=false;
         for(auto execution:executions){
         const bool association=execution==tp::TpGdnExecution::ColumnCaptured;
-        auto& parallel=association?*column_parallel:row_parallel;
-        const bool profiled=profiles&&(execution==tp::TpGdnExecution::Captured||association||execution==tp::TpGdnExecution::FlatCaptured||execution==tp::TpGdnExecution::FlatHcCaptured);
+        const bool hybrid=execution==tp::TpGdnExecution::HybridCaptured;
+        auto& parallel=candidate_for(execution);
+        const bool profiled=profiles&&(execution==tp::TpGdnExecution::Captured||association||hybrid||execution==tp::TpGdnExecution::FlatCaptured||execution==tp::TpGdnExecution::FlatHcCaptured);
         parallel.set_execution(execution,false);execution_metadata(execution);
         std::printf("\nCORRECTNESS_EXECUTION %s (reference=runtime)\n",execution_name(execution));
         for(int tokens=1;tokens<=8;++tokens)for(int keep=0;keep<=tokens;++keep){
@@ -832,7 +855,7 @@ int main(int argc,char** argv) {
             const auto input=signed_input(size_t(tokens)*H*N,43+tokens*19+keep*7,0.65f);
             reference.reset_state(state,conv);parallel.reset_state(state,conv);
             reference.propose(input,tokens,++epoch);parallel.propose(input,tokens,epoch);
-            auto a=reference.snapshot(),b=parallel.snapshot();seams(c,a,b,false,true,association,&full.weights());seams(c,b,parallel.snapshot(1),true);
+            auto a=reference.snapshot(),b=parallel.snapshot();seams(c,a,b,false,true,association,&full.weights(),hybrid);seams(c,b,parallel.snapshot(1),true);
             c.exact("proposal leaves state",state,b.state);c.exact("proposal leaves conv",conv,b.conv);
             if(!prior_routes.empty()&&std::vector<int32_t>(b.ids.begin(),b.ids.begin()+K)!=prior_routes)routes_changed=true;
             prior_routes.assign(b.ids.begin(),b.ids.begin()+K);
@@ -842,13 +865,13 @@ int main(int argc,char** argv) {
             const auto legacy=legacy_gdn(full.weights(),a.attention_input,state,conv,tokens,keep);
             c.floats("serial legacy GDN output",legacy.output,b.gdn_output,gdn_gate);
             c.floats("serial legacy mixer output",legacy.mixer,b.mixer_output,gdn_gate);
-            legacy_hc(c,full.weights(),input,b);if(!association)same_input_ffn_oracle(c,full.weights(),b);
+            legacy_hc(c,full.weights(),input,b);if(!association&&!hybrid)same_input_ffn_oracle(c,full.weights(),b);
             reference.commit(keep);parallel.commit(keep);a=reference.snapshot();b=parallel.snapshot();committed(c,a,b,legacy);
             // A new input after EVERY keep catches accidental full-window commit,
             // rejected-tail leakage, stale exchange slots and zero-keep rollback.
             const auto next=signed_input(size_t(2)*H*N,101+tokens*13+keep*23,0.55f);
             reference.propose(next,2,++epoch);parallel.propose(next,2,epoch);
-            const auto na=reference.snapshot(),nb=parallel.snapshot();seams(c,na,nb,false,true,association,&full.weights());seams(c,nb,parallel.snapshot(1),true);
+            const auto na=reference.snapshot(),nb=parallel.snapshot();seams(c,na,nb,false,true,association,&full.weights(),hybrid);seams(c,nb,parallel.snapshot(1),true);
             const auto continuation=legacy_gdn(full.weights(),na.attention_input,legacy.state,legacy.conv,2,2);
             c.floats("continuation legacy GDN",continuation.output,nb.gdn_output,gdn_gate);
             c.floats("continuation legacy mixer",continuation.mixer,nb.mixer_output,gdn_gate);
@@ -863,7 +886,7 @@ int main(int argc,char** argv) {
                 const auto input=signed_input(size_t(tokens)*H*N,43+tokens*19,0.65f);
                 reference.reset_state(state,conv);parallel.reset_state(state,conv);
                 reference.propose(input,tokens,++epoch);parallel.propose(input,tokens,epoch);
-                profile_report(c,parallel);const auto a=reference.snapshot(),b=parallel.snapshot();seams(c,a,b,false,true,association,&full.weights());seams(c,b,parallel.snapshot(1),true);
+                profile_report(c,parallel);const auto a=reference.snapshot(),b=parallel.snapshot();seams(c,a,b,false,true,association,&full.weights(),hybrid);seams(c,b,parallel.snapshot(1),true);
                 reference.commit(0);parallel.commit(0);
             }
             parallel.set_execution(execution,false);
@@ -876,7 +899,10 @@ int main(int argc,char** argv) {
         if(o.calibrate)calibration(c,o,g,reference,row_parallel,full.weights(),epoch,state,conv);
         if(o.benchmark){
             std::vector<BenchStudy> studies;
-            if(!o.execution_explicit){
+            if(o.execution=="hybrid"){
+                studies.push_back({reference,*hybrid_parallel,tp::TpGdnExecution::Captured,tp::TpGdnExecution::HybridCaptured,"single-gpu-captured","tp-hybrid-captured"});
+                studies.push_back({row_parallel,*hybrid_parallel,tp::TpGdnExecution::Captured,tp::TpGdnExecution::HybridCaptured,"tp-row-captured","tp-hybrid-captured"});
+            }else if(!o.execution_explicit){
                 studies.push_back({reference,*column_parallel,tp::TpGdnExecution::ColumnCaptured,tp::TpGdnExecution::ColumnCaptured,"single-gpu-captured","tp-column-captured"});
                 studies.push_back({row_parallel,*column_parallel,tp::TpGdnExecution::Captured,tp::TpGdnExecution::ColumnCaptured,"tp-row-captured","tp-column-captured"});
             }else for(auto mode:executions)studies.push_back({reference,mode==tp::TpGdnExecution::ColumnCaptured?*column_parallel:row_parallel,mode,mode,"single-gpu",mode==tp::TpGdnExecution::ColumnCaptured?"tp-column-captured":"tp-output-rows"});

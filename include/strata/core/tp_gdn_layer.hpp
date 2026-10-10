@@ -32,7 +32,8 @@ enum class TpGdnExecution {
     Captured,      // rank-local compute/push graphs; event edges stay outside
     ColumnCaptured,// input-column owners, two event-ordered output reductions
     FlatCaptured,  // one graph/rank, bounded device protocol, original HC
-    FlatHcCaptured // same graph/protocol, exact HC row-sharded compute
+    FlatHcCaptured,// same graph/protocol, exact HC row-sharded compute
+    HybridCaptured // row attention / column FFN, three joins, no FFN hidden gather
 };
 
 struct TpGdnLayerProfile {
@@ -72,14 +73,15 @@ public:
     // Explicit startup-only preparation, before the first proposal. Warms the
     // kernels without committing state, then captures both physical state banks.
     // Allocations and graph instantiation happen here, never in propose/commit.
-    // Prepare each token count that Captured/ColumnCaptured will use. Optional
+    // Prepare each token count that Captured/ColumnCaptured/HybridCaptured uses. Optional
     // profile=true creates separate stamped graphs; timing graphs stay untouched.
+    // Hybrid TP uses four segments/three joins, with original row attention.
     // Column TP uses three compute segments and two full-output reductions;
     // row TP retains five segments/four gathers. Failure is fatal to
     // this instance, with no silent fallback to another execution mode.
     void prepare_captured(int tokens, bool profile = false);
     // Flat modes require the model-free protocol preflight on the target runtime.
-    // They are incompatible with InputColumns owners.
+    // They are incompatible with InputColumns/HybridRowsColumns owners.
     // A separate profiled graph is explicit: timestamp overhead is not benchmark
     // evidence. HC splitting changes compute ownership, not weight allocation.
     void prepare_flat(int tokens, bool shard_hc = false, bool profile = false,

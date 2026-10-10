@@ -5,12 +5,15 @@ set -euo pipefail
 if [[ $# -lt 2 || "$1" == --help ]]; then
   echo 'Usage: bash tools/run_tp2_gdn_mi50.sh EXISTING_IMAGE MODEL_ROOT --pack /models/PACK --gguf /models/SHARD [--gguf /models/SHARD ...] [--layer 0]'
   echo 'This checks one non-PLE GDN layer, not generation speed. Layer 1 is PLE and is refused.'
-  echo 'Optional: --execution runtime|consolidated|captured|column|flat|flat-hc|all (default runtime)'
+  echo 'Optional: --execution runtime|consolidated|captured|column|hybrid|flat|flat-hc|all (default runtime)'
   echo 'Optional: --calibrate (captured output-row only, T=1,4,8); suggested --bench-warmup 3 --bench-trials 4'
   echo 'Calibration keeps the correctness gate, adds full baselines on both GPUs, frozen isolated/concurrent phase replays and push/event controls.'
   echo 'Do not combine --calibrate with --benchmark, profiling or another execution mode.'
   echo 'Optional: --benchmark [--bench-warmup 3] [--bench-trials 12] [--bench-block-calls 16] [--bench-block-trials 4]'
   echo 'Benchmark defaults: single-GPU captured vs column TP, and row-captured TP vs column TP.'
+  echo 'Opt-in --execution hybrid --benchmark compares full captured vs hybrid and row captured vs hybrid, without pure column.'
+  echo 'Hybrid keeps row attention and local-column FFN: three joins/four segments; one fewer join is not a measured speedup.'
+  echo 'Hybrid requires original-reference exact FFN input/router/hidden Q8 plus unchanged numerical bounds and local-fusion diagnostics.'
   echo 'Both direct comparisons cover T=1,2,4,5,8 with named arms; flat modes are opt-in only.'
   echo '--execution captured --benchmark explicitly measures single-GPU vs row TP; all selects all six modes.'
   echo 'Flat modes require the integrated model-free and full-layer timeout/abort gates before benchmarking.'
@@ -116,7 +119,7 @@ exit "$rc"
 ' run "$DEADLINE" "$@" 2>&1 | tee -a "$LOG"
 RC=${PIPESTATUS[0]}
 set -e
-printf 'TP2_GDN_EXIT=%s LOG=%s\n' "$RC" "$LOG"
+printf 'TP2_GDN_EXIT=%s LOG=%s\n' "$RC" "$LOG" | tee -a "$LOG"
 if (( RC == 77 )); then echo 'SKIPPED is not a pass.'; fi
 if (( RC == 124 || RC == 137 )); then echo 'Timeout/kill: inspect GPU state before another run.'; fi
 exit "$RC"

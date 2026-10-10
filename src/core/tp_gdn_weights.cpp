@@ -67,8 +67,7 @@ bool TpGdnWeights::load(const std::vector<std::string>& shards, const std::strin
     if (!allocations_.empty()) { err = "TP GDN weights already loaded"; return false; }
     int previous = -1;
     try {
-        if (partition != TpGdnPartition::OutputRows && partition != TpGdnPartition::InputColumns)
-            throw std::runtime_error("unknown GDN partition");
+        const auto ownership = tp_gdn_partition_geometry(partition,rank);
         const auto layout = gdn_rank_layout(g, rank < 0 ? 0 : rank);
         if (rank < -1 || layer < 0 || layer >= g.n_layers || layer == 1 || is_qsa_layer(g, layer))
             throw std::runtime_error("requires a valid non-PLE GDN layer and rank -1, 0 or 1");
@@ -192,8 +191,9 @@ bool TpGdnWeights::load(const std::vector<std::string>& shards, const std::strin
             return TpNativeMatrix{static_cast<int>(t.info->type), dst, local_input, local_output};
         };
         TpGdnRankWeights w; w.rank = rank; w.device = device; w.layer = layer; w.partition = partition;
-        const bool full = rank == -1;
-        const bool columns = !full && partition == TpGdnPartition::InputColumns;
+        const bool full = ownership.full;
+        const bool projection_columns = ownership.projection_columns;
+        const bool ffn_columns = ownership.ffn_columns;
         const auto qkv = full ? rows(0, 10240) : layout.qkv_rows;
         const auto hv = full ? rows(0, 48) : layout.value_heads;
         const auto vr = full ? rows(0, 6144) : layout.value_rows;
@@ -201,10 +201,13 @@ bool TpGdnWeights::load(const std::vector<std::string>& shards, const std::strin
         const auto hidden = rows(full ? 0 : rank * 320, full ? 640 : 320);
         w.qkv = native("attn_qkv.weight", 2560, 10240, qkv);
         w.z = native("attn_gate.weight", 2560, 6144, vr);
-        w.out = native("ssm_out.weight", 6144, 2560, columns ? vr : output, columns);
+        w.out = native("ssm_out.weight", 6144, 2560, projection_columns ? vr : output, projection_columns);
         w.shared_gate = native("ffn_gate_shexp.weight", 2560, 640, hidden);
         w.shared_up = native("ffn_up_shexp.weight", 2560, 640, hidden);
-        w.shared_down = native("ffn_down_shexp.weight", 640, 2560, columns ? hidden : output, columns);
+        w.shared_down = native("ffn_down_shexp.weight", 640, 2560, ffn_columns ? hidden : output, ffn_columns);
+        if(w.out.input!=ownership.projection_input||w.out.output!=ownership.projection_output||
+           w.shared_down.input!=ownership.ffn_input||w.shared_down.output!=ownership.ffn_output)
+            throw std::runtime_error("native projection/FFN partition geometry mismatch");
         for (int i = 0; i < 2; ++i) {
             const std::string h = i == 0 ? "hc_attn_" : "hc_ffn_";
             w.hc[i].norm = static_cast<const float*>(canonical_view((h + "norm.weight").c_str(), 10240, 1, WeightKind::F32).data);
@@ -231,7 +234,7 @@ bool TpGdnWeights::load(const std::vector<std::string>& shards, const std::strin
         const auto up = tensor(model, prefix + "ffn_up_exps.weight", {2560, 640, 512});
         const auto down = tensor(model, prefix + "ffn_down_exps.weight", {640, 2560, 512});
         if (gate.info->type != up.info->type) throw std::runtime_error("expert gate/up formats differ");
-        const auto p = plan(gate.info->type, down.info->type, 2560, 640, columns ? DownSplit::Columns : DownSplit::OutputRows);
+        const auto p = plan(gate.info->type, down.info->type, 2560, 640, ffn_columns ? DownSplit::Columns : DownSplit::OutputRows);
         const auto& blob = full ? p.original : p.shard;
         w.expert_bytes = blob.bytes;
         auto* arena = static_cast<uint8_t*>(alloc(detail::multiply(blob.bytes, 512)));
@@ -267,8 +270,8 @@ bool TpGdnWeights::load(const std::vector<std::string>& shards, const std::strin
         }
         w.gu_layout = {p.gu_type, p.down_type, 2560, full ? 640 : 320,
                        blob.gate.row_bytes, blob.down.row_bytes, blob.up.offset, blob.down.offset, blob.bytes};
-        w.down_layout = w.gu_layout; w.down_layout.n_embd = full || columns ? 2560 : 1280;
-        w.down_layout.n_ff = columns ? 320 : 640;
+        w.down_layout = w.gu_layout; w.down_layout.n_embd = ownership.ffn_output;
+        w.down_layout.n_ff = ownership.ffn_input;
         ck(cudaDeviceSynchronize());
         weights_ = w;
         ck(cudaSetDevice(previous));

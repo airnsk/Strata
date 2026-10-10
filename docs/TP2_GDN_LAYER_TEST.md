@@ -47,6 +47,13 @@ Execution modes share the same native weights and layer contract:
   local. Routed down, ordered weighting, shared contribution and peer publication
   are fused. Dedicated attention/FFN peer inboxes avoid overwrite races. No
   runtime peer-copy calls or mapped-host flag polling occur between segments.
+- `hybrid` (explicit opt-in only): output-row attention retains the original
+  full-width GDN projection association; local-hidden column FFNs reuse the
+  existing fused down/combine implementation. Four captured segments and three
+  event joins replace row mode's five segments and four joins. This saves one
+  structural join; wall-time benefit is unknown until measured. No new GPU
+  kernel is introduced. GDN output snapshots use row ownership, while FFN
+  hidden and down diagnostics use column ownership.
 - `flat`: **one complete proposal graph per rank**, with no host intervention
   between layer phases. Dedicated uncached peer inboxes, coherent mapped
   SYSTEM acquire/release epoch signals and local unpack replace event joins.
@@ -104,10 +111,39 @@ The script does not stop other services or change card power settings.
 
 Add `--benchmark --profile-stages` to the command above. Benchmark mode selects
 the captured output-row reference and column candidate; rejected flat/flat-HC
-modes are not repeated by default. `--execution all` explicitly includes every
-mode. Ordinary invocation without benchmark remains runtime-only. Each selected
-path must first pass all 44 prefix/continuation cases against the original full
+modes are not repeated by default. `--execution all` retains its six legacy
+modes; the new hybrid candidate requires `--execution hybrid`. Ordinary
+invocation without benchmark remains runtime-only. Each selected path must first pass all 44 prefix/continuation cases against the original full
 reference under its explicitly declared numerical contract below.
+
+### Opt-in hybrid acceptance and matched timing
+
+Add `--execution hybrid --benchmark` to the runner arguments to compare
+`single-gpu-captured` versus `tp-hybrid-captured`, then `tp-row-captured` versus
+`tp-hybrid-captured`. This explicitly selected run loads no pure-column
+candidate and does not rerun that rejected path. Row and hybrid each pass all
+44 T=1..8 prefix cases and their two-token continuations before any timing.
+Standalone `--execution hybrid` runs hybrid correctness only. Existing default
+selection and `--calibrate` remain unchanged; calibration accepts captured-row
+only and rejects hybrid.
+
+Hybrid retains the original-full numerical bounds, exact ordered router IDs,
+exact router logits/weights and exact original-reference routed/shared hidden
+Q8 bytes. It also explicitly requires bitwise-equal FFN input, rather than
+using the column candidate's changed-input diagnostic exception. The
+candidate-same-input full-FFN oracle remains a separate check, including full
+GU/Q8 ownership and the combined FFN numerical gate. Both ranks' actual local
+fused FFN partials are compared with independently recomputed unfused local
+expert/shared parts. This diagnostic is required, not inferred from a
+reconstructed full output. Any failed correctness check prevents benchmark
+admission; bounds are not fitted to the candidate.
+
+Both hybrid studies use the same ABBA/BAAB crossover and sustained-block
+method below at T=1,2,4,5,8, including shadow every-step checks and final timed
+block checks. Their stage profiles are separate from authoritative unprofiled
+timing. One fewer join does not imply an additive saving: host scheduling,
+compute association and communication overlap can change together. No hybrid
+GPU correctness or speedup result is claimed by this implementation alone.
 
 Small-window timing uses matched-input AB/BA crossover at T=1,2,4,5,8. Each input
 is tested in both execution orders. Warmup, input upload synchronization, state
@@ -137,8 +173,9 @@ subtract timestamps from different GPUs or treat instrumentation overhead as
 normal inference time. The runner prints actual native HC tensor types from
 GGUF headers; artifact filenames are not evidence of their quantization.
 
-The runner records read-only ROCm telemetry outside the test, source revision
-and any tracked-diff hash. Idle clock snapshots do not establish loaded clock
+The runner writes its real `TP2_GDN_EXIT` footer to both the console and the
+saved log, preserving the test exit status. It records read-only ROCm telemetry
+outside the test, source revision and any tracked-diff hash. Idle clock snapshots do not establish loaded clock
 rates. No power or clock settings are changed. No timing is accepted if the
 associated parity gate fails.
 
