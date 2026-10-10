@@ -3,7 +3,9 @@
 Decision document, updated 2026-10-10. Initial source review: Strata `6c32b09` and
 Castagna Veloce `3483d462715d61f21ed5877836be35a724446359`. The running configuration,
 manifest and GGUF header metadata have now been supplied. A build-off, routed-expert-only
-TP2 test prototype is implemented; GPU compilation/results remain pending. No production
+TP2 test prototype is implemented. Its initial rows-return version passed 32 synthetic GPU
+cases but was slower than balanced EP in 30/32; the updated reduced/event exchange is
+implemented and awaits hardware validation. No production
 TP integration or whole-decode speedup is claimed. See [TP2_FFN_TEST.md](TP2_FFN_TEST.md).
 
 Target hardware reported by the owner: two MI50 32 GB, gfx906, 60 CUs/card, 150 W/card;
@@ -210,10 +212,12 @@ both cards is not the proposed design.
    report per-card balance and accepted tokens/window. Expand to whole-layer integration
    only if the measured critical-path saving justifies the remaining engineering cost.
 
-Configuration, manifest, header and startup memory evidence have arrived; the bounded
-routed-expert test is now implemented. Stop before production integration until GPU build,
-phase parity and transfer-inclusive results justify it, and the complete memory budget is
-checked. No GPU compiler/device was available in the authoring executor.
+Configuration, manifest, header and startup memory evidence have arrived. Initial GPU
+phase parity passed, but transfer-inclusive timing was negative. The next bounded test
+reduces on both EP/TP ranks and uses explicit fenced peer writes/event dependencies;
+its results remain pending. Stop before production integration until measured performance
+justifies it and the complete memory budget is checked. No GPU compiler/device was
+available in the authoring executor.
 
 ## Read-only metadata recipe for reproducing the decision
 
