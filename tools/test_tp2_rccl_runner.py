@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import pty
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -194,6 +195,13 @@ elif args[0] == "ps" and os.environ.get("MOCK_CLEANUP_FAIL"):
         self.assertIn(IMAGE, run)
         self.assertNotIn("no-new-privileges", " ".join(run))
         self.assertNotIn("/models", " ".join(run))
+        self.assertEqual([run[i + 1] for i, value in enumerate(run) if value == "-e"], [
+            "HOME=/tmp", "HIP_VISIBLE_DEVICES=0,1", "NCCL_DEBUG=INFO",
+            "NCCL_DEBUG_SUBSYS=ALL", "NCCL_DEBUG_FILE=/dev/stdout",
+        ])
+        for forbidden in ("--privileged", "--ipc", "--security-opt"):
+            self.assertNotIn(forbidden, run)
+        self.assertEqual(sum(call[0] == "run" for call in calls), 1)
         subprocess.run(["bash", "-n", str(self.calls) + ".container"], check=True)
 
     def test_slow_interactive_auth_precedes_deadlines_and_log_capture(self):
@@ -302,11 +310,40 @@ elif args[0] == "ps" and os.environ.get("MOCK_CLEANUP_FAIL"):
         self.assertEqual(process.returncode, 2)
         self.assertFalse(self.calls.exists())
 
+    def test_watchdog_option_ranges(self):
+        for flag in ("--timeout-ms", "--init-timeout-ms"):
+            for value in ("100", "60000", "120000"):
+                with self.subTest(flag=flag, value=value):
+                    for log in self.repo.glob("tp2-rccl-probe-*.log"):
+                        log.unlink()
+                    process, saved = self.host([flag, value])
+                    self.assertEqual(process.returncode, 0, process.stderr + saved)
+                    calls = [json.loads(line) for line in self.calls.read_text().splitlines()]
+                    run = [call for call in calls if call[0] == "run"][-1]
+                    self.assertEqual(run[-2:], [flag, value])
+
+    def test_invalid_watchdog_options_stop_before_authorization(self):
+        for flag in ("--timeout-ms", "--init-timeout-ms"):
+            for value in ("0", "99", "120001", "00100", "-1", "1.5", "abc", "1000000"):
+                with self.subTest(flag=flag, value=value):
+                    for log in self.repo.glob("tp2-rccl-probe-*.log"):
+                        log.unlink()
+                    process, _ = self.host([flag, value])
+                    self.assertEqual(process.returncode, 2)
+                    self.assertFalse(self.calls.exists())
+                    self.assertFalse(self.sudo_calls.exists())
+
+    def test_duplicate_init_timeout_stops_before_authorization(self):
+        process, _ = self.host(["--init-timeout-ms", "60000", "--init-timeout-ms", "60000"])
+        self.assertEqual(process.returncode, 2)
+        self.assertFalse(self.calls.exists())
+        self.assertFalse(self.sudo_calls.exists())
+
     def inner(self, args=(), **env):
         work = self.root / "inner-work"
         tmp = self.root / "inner-tmp"
-        tmp.mkdir()
-        work.mkdir()
+        tmp.mkdir(exist_ok=True)
+        work.mkdir(exist_ok=True)
         source = RUNNER.read_text().split("<<'RCCL_CONTAINER'\n", 1)[1].split("\nRCCL_CONTAINER\n", 1)[0]
         source = source.replace("/tmp", str(tmp)).replace("/work", str(work))
         # Keep the test's mocks first; do not execute an available HIP compiler.
@@ -323,6 +360,7 @@ ENV
         (tmp / "librccl.so").write_text("CPU-only fixture")
         fixture = self.root / "mock-probe"
         executable(fixture, '''#!/bin/bash
+printf 'MOCK_PROBE_COMMAND'; printf ' %q' "$@"; printf '\\n'
 full_suite=1
 while (( $# )); do
  if [[ "$1" == --scenario ]]; then scenario=$2; fi
@@ -366,6 +404,48 @@ exit 0
         process = self.inner()
         self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
         self.assertIn(SUITE, process.stdout)
+
+    def test_inner_init_budget_and_diagnostic_environment(self):
+        process = self.inner(NCCL_DEBUG="INFO", NCCL_DEBUG_SUBSYS="ALL", NCCL_DEBUG_FILE="/dev/stdout")
+        self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
+        for value in ("NCCL_DEBUG=INFO", "NCCL_DEBUG_SUBSYS=ALL", "NCCL_DEBUG_FILE=/dev/stdout"):
+            self.assertIn("RCCL_PROBE_DIAGNOSTIC_ENV " + value, process.stdout)
+        self.assertIn("RCCL_PROBE_WATCHDOGS init_ms=60000 normal_command_ms=10000 fault_command_ms=10000 fault_outer_s=105", process.stdout)
+        calls = [shlex.split(line)[1:] for line in process.stdout.splitlines() if line.startswith("MOCK_PROBE_COMMAND ")]
+        self.assertEqual(len(calls), 3)
+        self.assertEqual([call[call.index("--scenario") + 1] for call in calls], ["normal", "delayed-rank", "missing-rank"])
+        for call in calls:
+            self.assertEqual(call.count("--init-timeout-ms"), 1)
+            self.assertEqual(call[call.index("--init-timeout-ms") + 1], "60000")
+        for call in calls[1:]:
+            self.assertEqual(call[call.index("--timeout-ms") + 1], "10000")
+        for scenario in ("delayed-rank", "missing-rank"):
+            self.assertIn(f"RCCL_PROBE_PROCESS_BEGIN scenario={scenario} bound_s=105", process.stdout)
+
+    def test_inner_init_override_does_not_extend_fault_launch_watchdog(self):
+        for value, bound in (("100", "46"), ("60001", "106"), ("120000", "165")):
+            with self.subTest(value=value):
+                process = self.inner(args=["--init-timeout-ms", value, "--timeout-ms", "120000"])
+                self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
+                self.assertIn(f"init_ms={value} normal_command_ms=120000 fault_command_ms=10000 fault_outer_s={bound}", process.stdout)
+                calls = [shlex.split(line)[1:] for line in process.stdout.splitlines() if line.startswith("MOCK_PROBE_COMMAND ")]
+                self.assertEqual(len(calls), 3)
+                for call in calls:
+                    self.assertEqual(call.count("--init-timeout-ms"), 1)
+                    self.assertEqual(call[call.index("--init-timeout-ms") + 1], value)
+                self.assertEqual(calls[0][calls[0].index("--timeout-ms") + 1], "120000")
+                for call in calls[1:]:
+                    self.assertEqual(call[call.index("--timeout-ms") + 1], "10000")
+                for scenario in ("delayed-rank", "missing-rank"):
+                    self.assertIn(f"RCCL_PROBE_PROCESS_BEGIN scenario={scenario} bound_s={bound}", process.stdout)
+
+    def test_inner_initialization_timeout_stops_after_one_attempt(self):
+        process = self.inner(MOCK_NORMAL_EXIT="70")
+        self.assertEqual(process.returncode, 70)
+        self.assertEqual(process.stdout.count("MOCK_PROBE_COMMAND "), 1)
+        self.assertNotIn("scenario=delayed-rank", process.stdout)
+        self.assertNotIn("scenario=missing-rank", process.stdout)
+        self.assertNotIn(SUITE, process.stdout)
 
     def test_inner_partial_scope_is_explicit(self):
         process = self.inner(args=["--tokens", "1"])
@@ -418,8 +498,12 @@ exit 0
         self.assertEqual(process.returncode, 70)
 
     def test_inner_setup_timeout_does_not_count_as_fault_success(self):
-        process = self.inner(MOCK_STAGE="initialize")
-        self.assertEqual(process.returncode, 70)
+        for stage in ("initialize", "warmup-exchange", "capture-and-instantiate", "fault-prepare"):
+            with self.subTest(stage=stage):
+                process = self.inner(MOCK_STAGE=stage)
+                self.assertEqual(process.returncode, 70)
+                self.assertNotIn("RCCL_PROBE_FAULT_GATE EXPECTED_FAILURE", process.stdout)
+                self.assertNotIn(SUITE, process.stdout)
 
     def test_inner_fault_must_be_armed(self):
         process = self.inner(MOCK_ARMED="0")

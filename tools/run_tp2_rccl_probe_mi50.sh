@@ -9,8 +9,10 @@ Normal run options (all optional):
   --tokens 1|8|all       --launch-order 01|10|both
   --iterations 2..1000  --warmup 1..100  --chain 2..1024
   --lifecycles 2..8     --timeout-ms 100..120000  --devices 0,1|1,0
-Defaults: all, both, 20, 3, 32, 2, 10000, 0,1.
+  --init-timeout-ms 100..120000 (initialization only; also used by fault checks)
+Defaults: all, both, 20, 3, 32, 2, 10000, 0,1; init-timeout-ms=60000.
 Also runs separate delayed-rank and missing-rank fault checks.
+One attempt only; INFO logging covers all RCCL subsystems for diagnosis.
 Optional env: TP2_TIMEOUT=180 TP2_BUILD_TIMEOUT=180 TP2_OUTER_TIMEOUT=600 (seconds).
 The outer bound includes discovery, compilation and all subprocesses.
 Sudo authorization is checked first, outside all operation deadlines and logs.
@@ -84,12 +86,13 @@ validate_host() {
     seen[$flag]=1
     case "$flag:$value" in
       --tokens:1|--tokens:8|--tokens:all|--launch-order:01|--launch-order:10|--launch-order:both|--devices:0,1|--devices:1,0) ;;
-      --iterations:*|--warmup:*|--chain:*|--lifecycles:*|--timeout-ms:*)
+      --iterations:*|--warmup:*|--chain:*|--lifecycles:*|--timeout-ms:*|--init-timeout-ms:*)
         [[ "$value" =~ ^[1-9][0-9]{0,5}$ ]] || { echo "Invalid positive integer: $flag=$value" >&2; return 2; }
         local lower=1 upper=1
         case "$flag" in
           --iterations) lower=2; upper=1000 ;; --warmup) upper=100 ;;
-          --chain) lower=2; upper=1024 ;; --lifecycles) lower=2; upper=8 ;; --timeout-ms) lower=100; upper=120000 ;;
+          --chain) lower=2; upper=1024 ;; --lifecycles) lower=2; upper=8 ;;
+          --timeout-ms|--init-timeout-ms) lower=100; upper=120000 ;;
         esac
         (( value >= lower && value <= upper )) || { echo "Out of range: $flag=$value" >&2; return 2; }
         ;;
@@ -136,13 +139,31 @@ main() {
   timeout --signal=TERM --kill-after=15s "${outer_deadline}s" "${DOCKER[@]}" run \
     --name "$CONTAINER_NAME" --rm --pull never --network none --read-only --cap-drop ALL \
     --tmpfs /tmp:rw,exec,nosuid,size=2g --shm-size=512m -e HOME=/tmp \
-    --device=/dev/kfd --device=/dev/dri -e HIP_VISIBLE_DEVICES=0,1 -e NCCL_DEBUG=WARN \
+    --device=/dev/kfd --device=/dev/dri -e HIP_VISIBLE_DEVICES=0,1 \
+    -e NCCL_DEBUG=INFO -e NCCL_DEBUG_SUBSYS=ALL -e NCCL_DEBUG_FILE=/dev/stdout \
     --mount "type=bind,src=$ROOT,dst=/work,readonly" \
     --workdir /work --entrypoint /bin/bash -i "$IMAGE" -s -- "$deadline" "$build_deadline" "${args[@]}" <<'RCCL_CONTAINER'
 set -euo pipefail
 echo 'RCCL_PROBE_CONTAINER_ENTER'
 export PATH=/opt/venv/bin:/opt/rocm/bin:$PATH
 runtime_deadline=$1; build_deadline=$2; shift 2
+for key in NCCL_DEBUG NCCL_DEBUG_SUBSYS NCCL_DEBUG_FILE; do
+  printf 'RCCL_PROBE_DIAGNOSTIC_ENV %s=%s\n' "$key" "${!key:-<unset>}"
+done
+init_timeout_ms=60000; command_timeout_ms=10000; init_override=0
+normal_args=("$@")
+for (( index=0; index<${#normal_args[@]}; index+=2 )); do
+  case "${normal_args[index]}" in
+    --init-timeout-ms) init_timeout_ms=${normal_args[index+1]}; init_override=1 ;;
+    --timeout-ms) command_timeout_ms=${normal_args[index+1]} ;;
+  esac
+done
+if (( ! init_override )); then normal_args+=(--init-timeout-ms "$init_timeout_ms"); fi
+# Fault setup needs the same initialization allowance as the normal run. Its
+# existing execution envelope and 10-second fault-launch watchdog stay separate.
+fault_deadline=$(( (init_timeout_ms + 999) / 1000 + 45 ))
+printf 'RCCL_PROBE_WATCHDOGS init_ms=%s normal_command_ms=%s fault_command_ms=10000 fault_outer_s=%s\n' \
+  "$init_timeout_ms" "$command_timeout_ms" "$fault_deadline"
 for tool in python3 hipcc timeout ldd sha256sum; do
   command -v "$tool" >/dev/null || { echo "RCCL_PREFLIGHT_BLOCKED missing installed tool: $tool" >&2; exit 2; }
 done
@@ -220,14 +241,14 @@ run_case() {
 }
 telemetry
 normal_rc=0
-run_case normal "$runtime_deadline" 0 "$@" || normal_rc=$?
+run_case normal "$runtime_deadline" 0 "${normal_args[@]}" || normal_rc=$?
 telemetry
 (( normal_rc == 0 )) || exit "$normal_rc"
 # Fault checks are independent processes. Their output cannot admit normal timings.
-run_case delayed-rank 45 0 --tokens 1 --launch-order 01 --iterations 2 --warmup 1 --chain 2 \
-  --lifecycles 1 --timeout-ms 10000 --delay-ms 200 --devices 0,1
-run_case missing-rank 45 70 --tokens 1 --launch-order 01 --iterations 2 --warmup 1 --chain 2 \
-  --lifecycles 1 --timeout-ms 10000 --delay-ms 200 --devices 0,1
+run_case delayed-rank "$fault_deadline" 0 --tokens 1 --launch-order 01 --iterations 2 --warmup 1 --chain 2 \
+  --lifecycles 1 --init-timeout-ms "$init_timeout_ms" --timeout-ms 10000 --delay-ms 200 --devices 0,1
+run_case missing-rank "$fault_deadline" 70 --tokens 1 --launch-order 01 --iterations 2 --warmup 1 --chain 2 \
+  --lifecycles 1 --init-timeout-ms "$init_timeout_ms" --timeout-ms 10000 --delay-ms 200 --devices 0,1
 telemetry
 echo 'RCCL_PROBE_SUITE_PASS normal=pass delayed_rank=pass missing_rank=expected_watchdog_failure'
 RCCL_CONTAINER

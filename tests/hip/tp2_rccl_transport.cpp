@@ -113,7 +113,7 @@ void require(bool ok, const std::string& message) { if (!ok) throw ExactError(me
 struct Options {
     std::vector<int> tokens{1, 8}, firsts{0, 1};
     std::array<int, 2> devices{0, 1};
-    int iterations = 20, warmup = 3, chain = 32, lifecycles = 2, timeout_ms = 10000, delay_ms = 200;
+    int iterations = 20, warmup = 3, chain = 32, lifecycles = 2, timeout_ms = 10000, init_timeout_ms = 60000, delay_ms = 200;
     std::string scenario = "normal", library;
     bool selftest = false;
 };
@@ -125,7 +125,7 @@ int integer(const std::string& value) {
 void usage() {
     std::puts("tp2_rccl_transport [--tokens 1|8|all] [--launch-order 01|10|both]"
               " [--devices 0,1] [--iterations 20] [--warmup 3] [--chain 32]"
-              " [--lifecycles 2] [--timeout-ms 10000] [--rccl-library ABS_REAL_PATH]"
+              " [--lifecycles 2] [--timeout-ms 10000] [--init-timeout-ms 60000] [--rccl-library ABS_REAL_PATH]"
               " [--scenario normal|delayed-rank|missing-rank] [--delay-ms 200] [--selftest]");
 }
 Options parse(int argc, char** argv) {
@@ -151,6 +151,7 @@ Options parse(int argc, char** argv) {
         else if (a == "--chain") o.chain = integer(v);
         else if (a == "--lifecycles") o.lifecycles = integer(v);
         else if (a == "--timeout-ms") o.timeout_ms = integer(v);
+        else if (a == "--init-timeout-ms") o.init_timeout_ms = integer(v);
         else if (a == "--delay-ms") o.delay_ms = integer(v);
         else if (a == "--scenario") o.scenario = v;
         else if (a == "--rccl-library") o.library = v;
@@ -159,7 +160,7 @@ Options parse(int argc, char** argv) {
     if (o.iterations < 2 || o.iterations > 1000 || o.warmup < 1 || o.warmup > 100 ||
         o.chain < 2 || o.chain > 1024 || o.lifecycles < 1 || o.lifecycles > 8 ||
         (o.scenario == "normal" && o.lifecycles < 2) ||
-        o.timeout_ms < 100 || o.timeout_ms > 120000 || o.delay_ms < 1 ||
+        o.timeout_ms < 100 || o.timeout_ms > 120000 || o.init_timeout_ms < 100 || o.init_timeout_ms > 120000 || o.delay_ms < 1 ||
         (o.scenario == "delayed-rank" && o.delay_ms >= o.timeout_ms) || o.devices[0] < 0 || o.devices[1] < 0 || o.devices[0] == o.devices[1])
         throw std::invalid_argument("option out of range (iterations >=2; normal lifecycles >=2; delay < timeout)");
     if (o.scenario != "normal" && o.scenario != "delayed-rank" && o.scenario != "missing-rank")
@@ -217,6 +218,22 @@ void rccl_check(ncclResult_t result, const char* what) {
     if (result != ncclSuccess) throw std::runtime_error(std::string(what) + ": " + ncclGetErrorString(result));
 }
 
+// Initialization diagnostics stay outside captured/timed work. A BEGIN without
+// its END identifies the blocked API; errors remain visible if its peer hangs.
+template <typename Action>
+void init_call(int life, int rank, const std::string& call, const Action& action) {
+    const auto begin = Clock::now();
+    std::printf("INIT_CALL_BEGIN life=%d rank=%d call=%s\n", life, rank, call.c_str());
+    try { action(); }
+    catch (...) {
+        const double elapsed = std::chrono::duration<double, std::milli>(Clock::now() - begin).count();
+        std::fprintf(stderr, "INIT_CALL_ERROR life=%d rank=%d call=%s elapsed_ms=%.3f\n", life, rank, call.c_str(), elapsed);
+        throw;
+    }
+    const double elapsed = std::chrono::duration<double, std::milli>(Clock::now() - begin).count();
+    std::printf("INIT_CALL_END life=%d rank=%d call=%s elapsed_ms=%.3f\n", life, rank, call.c_str(), elapsed);
+}
+
 // Each rank owns its context, communicator, stream and API calls for the entire
 // process. A command timeout exits without freeing possibly live GPU buffers.
 // An OUTER subprocess timeout is still mandatory (e.g. runtime/library startup).
@@ -230,14 +247,16 @@ public:
         { std::lock_guard<std::mutex> lock(mutex_); stop_ = true; }
         changed_.notify_all(); for (auto& t : threads_) t.join();
     }
-    void run(const std::string& stage, const std::function<void(int)>& action) {
+    void run(const std::string& stage, const std::function<void(int)>& action, int timeout_ms = 0) {
         std::unique_lock<std::mutex> lock(mutex_);
-        failed_.store(false); error_ = nullptr; completed_ = 0; action_ = action; ++generation_;
-        const auto deadline = Clock::now() + std::chrono::milliseconds(options_.timeout_ms);
+        failed_.store(false); error_ = nullptr; completed_ = 0; action_ = action; stage_ = stage; ++generation_;
+        const int budget_ms = timeout_ms ? timeout_ms : options_.timeout_ms;
+        const auto deadline = Clock::now() + std::chrono::milliseconds(budget_ms);
         changed_.notify_all();
         if (!done_.wait_until(lock, deadline, [&] { return completed_ == 2; })) {
             std::fprintf(stderr, "WATCHDOG_TIMEOUT scenario=%s stage=%s exit=70 "
-                         "teardown=process_exit_without_buffer_release\n", options_.scenario.c_str(), stage.c_str());
+                         "teardown=process_exit_without_buffer_release budget_ms=%d completed_ranks=%d\n",
+                         options_.scenario.c_str(), stage.c_str(), budget_ms, completed_);
             std::fflush(nullptr); std::_Exit(70);
         }
         if (error_) std::rethrow_exception(error_);
@@ -249,15 +268,27 @@ private:
         unsigned seen = 0;
         for (;;) {
             std::function<void(int)> action;
+            std::string stage;
             {
                 std::unique_lock<std::mutex> lock(mutex_);
                 changed_.wait(lock, [&] { return stop_ || generation_ != seen; });
                 if (stop_) return;
-                seen = generation_; action = action_;
+                seen = generation_; action = action_; stage = stage_;
             }
             try { action(rank); }
             catch (...) {
                 failed_.store(true, std::memory_order_release);
+                // Do not wait for a possibly blocked peer before exposing the
+                // original failure. Cleanup still waits for both rank owners.
+                try { throw; }
+                catch (const std::exception& e) {
+                    std::fprintf(stderr, "WORKER_ERROR scenario=%s stage=%s rank=%d reason=%s\n",
+                                 options_.scenario.c_str(), stage.c_str(), rank, e.what());
+                }
+                catch (...) {
+                    std::fprintf(stderr, "WORKER_ERROR scenario=%s stage=%s rank=%d reason=unknown_exception\n",
+                                 options_.scenario.c_str(), stage.c_str(), rank);
+                }
                 std::lock_guard<std::mutex> lock(mutex_); if (!error_) error_ = std::current_exception();
             }
             { std::lock_guard<std::mutex> lock(mutex_); ++completed_; }
@@ -269,6 +300,7 @@ private:
     mutable std::mutex mutex_;
     std::condition_variable changed_, done_;
     std::function<void(int)> action_;
+    std::string stage_;
     std::exception_ptr error_;
     std::atomic<bool> failed_{false};
     unsigned generation_ = 0;
@@ -314,9 +346,14 @@ struct Buffer {
 struct Bank {
     std::array<Buffer, 3> source, result;
     Buffer attention_receive, ffn_receive;
-    void allocate() {
-        for (int k = 0; k < 3; ++k) { source[k].allocate(8 * width(k)); result[k].allocate(8 * full_width(k)); }
-        attention_receive.allocate(8 * kY); ffn_receive.allocate(8 * kFfn);
+    void allocate(int life, int rank, int bank) {
+        const std::string prefix = "hipMalloc.bank" + std::to_string(bank) + ".";
+        for (int k = 0; k < 3; ++k) {
+            init_call(life, rank, prefix + "source." + name(k), [&] { source[k].allocate(8 * width(k)); });
+            init_call(life, rank, prefix + "result." + name(k), [&] { result[k].allocate(8 * full_width(k)); });
+        }
+        init_call(life, rank, prefix + "attention_receive", [&] { attention_receive.allocate(8 * kY); });
+        init_call(life, rank, prefix + "ffn_receive", [&] { ffn_receive.allocate(8 * kFfn); });
     }
     void release() {
         for (int k = 0; k < 3; ++k) { source[k].release(); result[k].release(); }
@@ -525,7 +562,8 @@ void metadata(const Options& o, int argc, char** argv) {
         std::printf("DEVICE rank=%d logical_id=%d pci=%s name=%s arch=%s vram_bytes=%zu peer_access=%d\n",
                     rank, o.devices[rank], pci, p.name, p.gcnArchName, p.totalGlobalMem, peer);
     }
-    for (const char* key : {"HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES", "NCCL_DEBUG", "NCCL_P2P_DISABLE", "NCCL_SHM_DISABLE",
+    for (const char* key : {"HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES", "NCCL_DEBUG", "NCCL_DEBUG_SUBSYS", "NCCL_DEBUG_FILE",
+                          "NCCL_SOCKET_IFNAME", "NCCL_SOCKET_FAMILY", "NCCL_P2P_DISABLE", "NCCL_SHM_DISABLE",
                           "NCCL_ALGO", "NCCL_PROTO", "NCCL_GRAPH_REGISTER", "NCCL_GRAPH_MIXING_SUPPORT"})
         std::printf("ENV %s=%s\n", key, std::getenv(key) ? std::getenv(key) : "<unset>");
     std::puts("CONTRACT payload_per_rank_T1_y=12288 output=5120 ffn=10240 T8_multiplier=8 bytes_type=FP32_raw "
@@ -535,14 +573,18 @@ void metadata(const Options& o, int argc, char** argv) {
               "launch_order=host_admission_before_HIP_call empty_control=zero_node_graph paired_order=alternating_AB_BA subtraction=forbidden "
               "layer_speedup_claim=0 prefix_continuation_tested=0 full_layer_gate_required=1");
 }
-void init_rank(Rank& r, int rank, const Options& o, const ncclUniqueId& id) {
-    hip_check(hipSetDevice(o.devices[rank]), "hipSetDevice");
+void init_rank(Rank& r, int rank, int life, const Options& o, const ncclUniqueId& id) {
+    init_call(life, rank, "hipSetDevice", [&] { hip_check(hipSetDevice(o.devices[rank]), "hipSetDevice"); });
     require(std::fesetround(FE_TONEAREST) == 0, "cannot set worker rounding");
-    hip_check(hipStreamCreateWithFlags(&r.stream, hipStreamNonBlocking), "hipStreamCreateWithFlags");
-    hip_check(hipEventCreate(&r.start), "hipEventCreate start");
-    hip_check(hipEventCreate(&r.end), "hipEventCreate end");
-    for (auto& b : r.banks) b.allocate();
-    rccl_check(ncclCommInitRank(&r.comm, 2, id, rank), "ncclCommInitRank");
+    init_call(life, rank, "hipStreamCreateWithFlags", [&] {
+        hip_check(hipStreamCreateWithFlags(&r.stream, hipStreamNonBlocking), "hipStreamCreateWithFlags");
+    });
+    init_call(life, rank, "hipEventCreate.start", [&] { hip_check(hipEventCreate(&r.start), "hipEventCreate start"); });
+    init_call(life, rank, "hipEventCreate.end", [&] { hip_check(hipEventCreate(&r.end), "hipEventCreate end"); });
+    for (int bank = 0; bank < kBanks; ++bank) r.banks[bank].allocate(life, rank, bank);
+    init_call(life, rank, "ncclCommInitRank", [&] {
+        rccl_check(ncclCommInitRank(&r.comm, 2, id, rank), "ncclCommInitRank");
+    });
 }
 void capture(Rank& r, int rank, const Options& o) {
     hip_check(hipGraphCreate(&r.empty.graph, 0), "hipGraphCreate empty"); r.empty.instantiate();
@@ -573,8 +615,11 @@ int gpu_main(const Options& o, int argc, char** argv) {
     size_t checked_replays = 0;
     try {
         for (int life = 0; life < o.lifecycles; ++life) {
-            ncclUniqueId id{}; rccl_check(ncclGetUniqueId(&id), "ncclGetUniqueId");
-            workers.run("initialize", [&](int rank) { init_rank(ranks[rank], rank, o, id); });
+            std::printf("INITIALIZE_BEGIN life=%d init_budget_ms=%d command_budget_ms=%d\n", life, o.init_timeout_ms, o.timeout_ms);
+            ncclUniqueId id{};
+            init_call(life, -1, "ncclGetUniqueId", [&] { rccl_check(ncclGetUniqueId(&id), "ncclGetUniqueId"); });
+            workers.run("initialize", [&](int rank) { init_rank(ranks[rank], rank, life, o, id); }, o.init_timeout_ms);
+            std::printf("INITIALIZE_END life=%d\n", life);
             // Establish both directions and all consumers outside capture/timing.
             for (int w = 0; w < o.warmup; ++w) {
                 ++epoch;

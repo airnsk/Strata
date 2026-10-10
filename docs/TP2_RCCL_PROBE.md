@@ -14,6 +14,10 @@ From the existing stand checkout, with both MI50 cards already idle:
 bash tools/run_tp2_rccl_probe_mi50.sh
 ```
 
+This is one complete suite attempt, with initialization diagnostics enabled. It
+does not retry a failure or sweep settings. The normal process runs first; either
+fault subprocess runs only after the preceding process passes its gate.
+
 Before starting any timed Docker operation, the wrapper validates its options
 and checks authorization. When running as a non-root user with a controlling
 terminal, it runs `sudo -v` directly on that terminal, outside the log-capture
@@ -48,15 +52,24 @@ Defaults and optional bounded overrides:
 TP2_TIMEOUT=180 TP2_BUILD_TIMEOUT=180 TP2_OUTER_TIMEOUT=600 \
   bash tools/run_tp2_rccl_probe_mi50.sh \
   --tokens all --launch-order both --iterations 20 --warmup 3 \
-  --chain 32 --lifecycles 2 --timeout-ms 10000 --devices 0,1
+  --chain 32 --lifecycles 2 --init-timeout-ms 60000 --timeout-ms 10000 --devices 0,1
 ```
 
 - `TP2_TIMEOUT`: normal test-process limit in seconds
 - `TP2_BUILD_TIMEOUT`: compilation limit in seconds
 - `TP2_OUTER_TIMEOUT`: limit for the entire container, including discovery,
   compilation, telemetry, and all test subprocesses
-- Each delayed-rank and missing-rank subprocess has a separate 45-second outer
-  bound and a 10-second command watchdog
+- `--init-timeout-ms`: watchdog for the paired rank-initialization command only,
+  including device selection, stream/event creation, allocation, and
+  `ncclCommInitRank`; default 60000 ms. Each lifecycle gets this budget. The
+  preceding main-thread `ncclGetUniqueId` call remains under the process bound.
+- `--timeout-ms`: normal-process watchdog for other worker commands, including
+  warmup, capture, replay, and teardown; default 10000 ms
+- Delayed-rank and missing-rank processes use the same initialization budget but
+  retain fixed 10000 ms command watchdogs. Each has an outer bound of
+  `ceil(init_timeout_ms / 1000) + 45` seconds, 105 seconds by default. Increasing
+  the initialization allowance does not lengthen the deliberate missing-rank
+  fault-launch watchdog.
 - Image inspection and container cleanup have their own short bounds; these
   commands cannot prompt for a password
 - Interactive authorization is outside these bounds; noninteractive
@@ -78,7 +91,8 @@ reports that failure instead of prompting or claiming the container stopped.
 
 Normal-run options are restricted to tokens `1`, `8`, or `all`; launch order `01`,
 `10`, or `both`; iterations 2..1000; warmup 1..100; chain 2..1024; lifecycles 2..8;
-command timeout 100..120000 milliseconds; and devices `0,1` or `1,0` within
+initialization and other-command timeouts 100..120000 milliseconds each; and
+devices `0,1` or `1,0` within
 `HIP_VISIBLE_DEVICES=0,1`. The runner selects scenarios and library paths itself.
 A narrowed token/order run is explicitly `full_suite=0` and cannot satisfy the
 full transport admission gate. The fixed fault subprocesses use logical devices
@@ -110,6 +124,40 @@ resolved library. Runtime resolves `ncclGetVersion` back to its loaded library
 and rejects a path mismatch. Header/runtime major compatibility is checked; a
 matching version still does not establish working gfx906 capture support.
 No automatic fallback download, package installation, or RCCL rebuild is allowed.
+
+## Initialization diagnosis
+
+The real stand run `tp2-rccl-probe-20261010T194525Z-30796.log` at commit
+`9bada87` passed HIP compilation and loaded RCCL 2.27.7 on both gfx906 cards, each
+reporting peer access. It then exited through the old 10-second
+`stage=initialize` watchdog before capture. No transport timing or correctness
+result was admitted. That stage marker alone does not identify which HIP or RCCL
+call stalled. The logged missing-`iommu=pt` warning is a clue, not proof of the
+cause; this diagnostic makes no kernel, IOMMU, driver, or network changes.
+
+The wrapper now explicitly sets `NCCL_DEBUG=INFO`, `NCCL_DEBUG_SUBSYS=ALL`, and
+`NCCL_DEBUG_FILE=/dev/stdout`, and records those values before discovery. All
+subsystems are included so early kernel setup, allocation, bootstrap, and
+transport messages are not filtered out. The output shares the bounded process
+log and durable host log; it is not left only in temporary container storage.
+These are logging settings described in the
+[RCCL 2.27.7 environment-variable reference](https://rocm.docs.amd.com/projects/rccl/en/docs-7.2.0/api-reference/env-variables.html).
+No algorithm, protocol, transport, or socket-interface choice is forced. The
+container still uses `--network none` and the same installed library.
+
+Per-call initialization begin/end/error markers identify lifecycle, rank, call,
+and elapsed time, including the individual buffer allocations. The unique-ID
+call is marked separately on the main thread. Worker exceptions are printed
+immediately, so an error on one rank is visible even if the other rank remains
+blocked. After a timeout, use these markers and RCCL messages to locate the last
+unfinished call; do not attribute it to graph capture without evidence that
+initialization and capture were reached. The 60-second initialization budget is
+a bounded diagnostic allowance, not a claim that slow setup is correct.
+
+The same default command attempts the full normal, delayed-rank, and missing-rank
+suite once. A normal initialization failure stops the suite. Inspect GPU state
+and the verified container-cleanup result before deciding whether another run is
+needed. No setting sweep or automatic rerun is performed.
 
 ## Exact dataflow and lifetime gates
 
@@ -168,6 +216,9 @@ with separate host-wall and rank-local event distributions. Each transport timin
 includes its local unpack or ordered reduction. Initialization, capture,
 instantiation, preparation, poisoning, and host verification are outside the timed
 span. The three-exchange sequence is distinct from individual exchange timings.
+INFO logging can affect measurements if messages occur inside measured intervals;
+inspect the diagnostic log when deciding whether any emitted timing is usable.
+The logging setting alone is not evidence that a repeat is needed.
 
 `single_call` measures one replay. `sustained_chain` reports amortized time for a
 chain on the same stream/storage with one completion boundary; payloads are fixed
@@ -214,6 +265,10 @@ fault-stage admission, hard outer timeout, and cleanup verification. They also
 exercise slow terminal-only authorization outside deadlines/log capture,
 noninteractive authorization, denied/expired credentials, root operation without
 sudo, and separate setup/probe timeout diagnostics. They require
-a host C compiler for fake-library coverage. The source self-test checks only host
+a host C compiler for fake-library coverage. Additional checks cover both timeout
+option ranges, initialization-budget propagation, the fixed fault-launch
+watchdog, diagnostic logging flags, one-attempt failure handling, and rejection
+of initialization/warmup/capture timeouts by the missing-rank fault gate. They require
+no GPU. The source self-test checks only host
 oracles and layout arithmetic. Neither is HIP compilation, RCCL capture testing,
 GPU correctness, or performance evidence. The real stand run remains necessary.
