@@ -126,6 +126,12 @@ TP2_RCCL_ARTIFACT=build-rccl-gfx906-YYYYMMDDTHHMMSSZ-PID \
 ```
 
 The override accepts only a direct, non-symlink child directory of the checkout.
+Run the wrapper as the same user who built the artifact, without an outer `sudo`;
+the wrapper obtains Docker authorization itself. Only this artifact path runs the
+container as the invoking UID:GID, preserving access to its owner-only manifest.
+It carries numeric host supplementary groups and the groups of the attached GPU
+devices, so `video`/`render` names need not match the image. Files stay read-only,
+capabilities stay dropped, and no artifact permissions or host groups are changed.
 It reruns static inspection and matches the exact manifest before library loading
 or probe compilation, then discovers the C API only under this artifact's install
 root and checks the recorded library hash. There is no fallback to the image's

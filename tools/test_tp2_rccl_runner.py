@@ -228,7 +228,26 @@ class RunnerTests(unittest.TestCase):
         self.env["MOCK_CALLS"] = str(self.calls)
         self.sudo_calls = self.root / "sudo-calls.jsonl"
         self.env["MOCK_SUDO_CALLS"] = str(self.sudo_calls)
-        executable(self.bin / "id", '#!/bin/bash\necho "${MOCK_UID:-1000}"\n')
+        executable(self.bin / "id", '''#!/bin/bash
+case "$1" in
+  -u) echo "${MOCK_UID:-1000}" ;;
+  -g) echo "${MOCK_GID:-1000}" ;;
+  -G) echo "${MOCK_GROUPS:-1000 27 44}" ;;
+  *) exit 2 ;;
+esac
+''')
+        self.stat_calls = self.root / "stat-calls.jsonl"
+        self.env["MOCK_STAT_CALLS"] = str(self.stat_calls)
+        executable(self.bin / "stat", '''#!/usr/bin/env python3
+import json, os, sys
+with open(os.environ["MOCK_STAT_CALLS"], "a") as f: f.write(json.dumps(sys.argv[1:]) + "\\n")
+if os.environ.get("MOCK_STAT_EXIT"): sys.exit(int(os.environ["MOCK_STAT_EXIT"]))
+if "MOCK_DEVICE_GROUPS" in os.environ:
+ print(os.environ["MOCK_DEVICE_GROUPS"])
+else:
+ for path in sys.argv[4:]:
+  print(44 if "/card" in path else 0 if path == "/dev/dri" else 109)
+''')
         executable(self.bin / "sudo", '''#!/usr/bin/env python3
 import json, os, sys, time
 args = sys.argv[1:]
@@ -263,6 +282,14 @@ elif args[0] == "run":
  script = sys.stdin.read()
  open(os.environ["MOCK_CALLS"] + ".container", "w").write(script)
  print("RCCL_PROBE_CONTAINER_ENTER", flush=True)
+ if os.environ.get("MOCK_PRIVATE_MANIFEST"):
+  from pathlib import Path
+  private = Path(os.environ["MOCK_PRIVATE_MANIFEST"])
+  owner = private.stat().st_uid
+  uid = int(args[args.index("--user") + 1].split(":")[0]) if "--user" in args else 0
+  # Model DAC with cap-drop ALL; container root has no owner-file bypass.
+  if uid != owner and private.stat().st_mode & 0o044 == 0: sys.exit(13)
+  private.read_text()
  if os.environ.get("MOCK_PROCESS_BEGIN"): print("RCCL_PROBE_PROCESS_BEGIN scenario=normal bound_s=1", flush=True)
  if os.environ.get("MOCK_SLEEP"): time.sleep(5)
  if os.environ.get("MOCK_SUITE", "1") == "1": print({SUITE!r})
@@ -308,6 +335,9 @@ elif args[0] == "ps" and os.environ.get("MOCK_CLEANUP_FAIL"):
         self.assertIn(IMAGE, run)
         self.assertNotIn("no-new-privileges", " ".join(run))
         self.assertNotIn("/models", " ".join(run))
+        self.assertNotIn("--user", run)
+        self.assertNotIn("--group-add", run)
+        self.assertFalse(self.stat_calls.exists())
         self.assertEqual([run[i + 1] for i, value in enumerate(run) if value == "-e"], [
             "HOME=/tmp", "HIP_VISIBLE_DEVICES=0,1", "NCCL_DEBUG=INFO",
             "NCCL_DEBUG_SUBSYS=ALL", "NCCL_DEBUG_FILE=/dev/stdout",
@@ -320,15 +350,72 @@ elif args[0] == "ps" and os.environ.get("MOCK_CLEANUP_FAIL"):
     def test_opt_in_artifact_is_passed_only_when_explicit(self):
         artifact = self.repo / "build-rccl-test"
         artifact.mkdir()
-        (artifact / "artifact.json").write_text("{}")
+        manifest = artifact / "artifact.json"
+        manifest.write_text("{}")
+        manifest.chmod(0o600)
         (self.repo / "tools/verify_rccl_gfx906.py").write_text("# fixture\n")
-        process, saved = self.host(TP2_RCCL_ARTIFACT=artifact.name)
+        process, saved = self.host(TP2_RCCL_ARTIFACT=artifact.name,
+                                  MOCK_UID=str(os.getuid()), MOCK_GID=str(os.getgid()),
+                                  MOCK_PRIVATE_MANIFEST=str(manifest))
         self.assertEqual(process.returncode, 0, process.stderr + saved)
         run = next(call for call in [json.loads(line) for line in self.calls.read_text().splitlines()] if call[0] == "run")
         self.assertIn("TP2_RCCL_ARTIFACT=/work/build-rccl-test", run)
+        self.assertEqual(run[run.index("--user") + 1], f"{os.getuid()}:{os.getgid()}")
+        self.assertEqual(run[run.index("--cap-drop") + 1], "ALL")
+        self.assertNotIn("--cap-add", run)
+        groups = [run[i + 1] for i, arg in enumerate(run) if arg == "--group-add"]
+        self.assertEqual(len(groups), len(set(groups)))
+        self.assertIn("109", groups)
+        self.assertIn("44", groups)
+        self.assertIn("27", groups)
+        self.assertEqual(manifest.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(manifest.stat().st_uid, os.getuid())
         inner = Path(str(self.calls) + ".container").read_text()
         self.assertLess(inner.index("verify_rccl_gfx906.py"), inner.index("tp2_rccl_preflight.py"))
         self.assertIn('--expected-sha256 "$artifact_hash"', inner)
+
+    def test_artifact_group_metadata_errors_stop_before_container(self):
+        artifact = self.repo / "build-rccl-test"
+        artifact.mkdir()
+        (artifact / "artifact.json").write_text("{}")
+        (self.repo / "tools/verify_rccl_gfx906.py").write_text("# fixture\n")
+        for override in ({"MOCK_STAT_EXIT": "1"}, {"MOCK_DEVICE_GROUPS": "render"},
+                         {"MOCK_DEVICE_GROUPS": ""}, {"MOCK_GROUPS": "1000 bad"}):
+            with self.subTest(override=override):
+                for log in self.repo.glob("tp2-rccl-probe-*.log"):
+                    log.unlink()
+                self.calls.unlink(missing_ok=True)
+                process, saved = self.host(TP2_RCCL_ARTIFACT=artifact.name, **override)
+                self.assertEqual(process.returncode, 2, process.stderr + saved)
+                self.assertIn("stage=artifact-identity container_attempted=0", saved)
+                calls = [json.loads(line) for line in self.calls.read_text().splitlines()]
+                self.assertFalse(any(call[0] == "run" for call in calls))
+                self.assertNotIn("RCCL_PROBE_CONTAINER_LAUNCH", saved)
+
+    def test_artifact_discovers_numeric_groups_for_render_and_card_nodes(self):
+        devices = self.root / "fake-dri"
+        devices.mkdir()
+        for name in ("card0", "renderD128", "renderD129"):
+            (devices / name).touch()
+        script = self.repo / "tools" / RUNNER.name
+        script.write_text(script.read_text().replace(
+            "for node in /dev/dri/card[0-9]* /dev/dri/renderD[0-9]*;",
+            f"for node in {devices}/card[0-9]* {devices}/renderD[0-9]*;"))
+        artifact = self.repo / "build-rccl-test"
+        artifact.mkdir()
+        (artifact / "artifact.json").write_text("{}")
+        (self.repo / "tools/verify_rccl_gfx906.py").write_text("# fixture\n")
+        process, saved = self.host(TP2_RCCL_ARTIFACT=artifact.name, MOCK_GROUPS="1000")
+        self.assertEqual(process.returncode, 0, process.stderr + saved)
+        calls = [json.loads(line) for line in self.stat_calls.read_text().splitlines()]
+        for name in ("card0", "renderD128", "renderD129"):
+            self.assertIn(str(devices / name), calls[0])
+        run = next(call for call in self.recorded_docker_calls() if call[0] == "run")
+        groups = [run[i + 1] for i, arg in enumerate(run) if arg == "--group-add"]
+        self.assertEqual(groups, ["109", "0", "44"])
+
+    def recorded_docker_calls(self):
+        return [json.loads(line) for line in self.calls.read_text().splitlines()]
 
     def test_invalid_artifact_does_not_authorize_or_run(self):
         for name in ("../outside", "/absolute", ".", "..", "missing", "a,b"):

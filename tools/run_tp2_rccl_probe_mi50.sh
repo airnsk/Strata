@@ -111,6 +111,7 @@ validate_host() {
     echo 'Missing standalone RCCL probe source or dependency-discovery helper.' >&2; return 2;
   }
   if [[ -n ${TP2_RCCL_ARTIFACT:-} ]]; then
+    command -v stat >/dev/null || { echo 'Missing host command: stat' >&2; return 2; }
     [[ $TP2_RCCL_ARTIFACT =~ ^[a-zA-Z0-9_.-]+$ && $TP2_RCCL_ARTIFACT != . && $TP2_RCCL_ARTIFACT != .. ]] || {
       echo 'TP2_RCCL_ARTIFACT must be one direct child directory name in this checkout.' >&2; return 2;
     }
@@ -144,13 +145,42 @@ main() {
     echo 'RCCL_PROBE_SETUP_FAILURE stage=image-verification code=2 container_attempted=0: installed image ID differs from the pinned stand image.' >&2
     return 2
   }
+  local artifact_args=()
+  if [[ -n ${TP2_RCCL_ARTIFACT:-} ]]; then
+    # The builder writes an owner-only manifest. Root with all capabilities
+    # dropped cannot bypass its mode bits; use the same invoking user instead.
+    local uid gid host_groups device_groups group node
+    uid=$(id -u); gid=$(id -g); host_groups=$(id -G)
+    [[ $uid =~ ^[0-9]+$ && $gid =~ ^[0-9]+$ && -n $host_groups ]] || {
+      echo 'RCCL_PROBE_SETUP_FAILURE stage=artifact-identity container_attempted=0: invalid host identity' >&2; return 2;
+    }
+    local device_nodes=(/dev/kfd /dev/dri)
+    for node in /dev/dri/card[0-9]* /dev/dri/renderD[0-9]*; do
+      [[ ! -e $node ]] || device_nodes+=("$node")
+    done
+    device_groups=$(stat -Lc '%g' -- "${device_nodes[@]}") || {
+      echo 'RCCL_PROBE_SETUP_FAILURE stage=artifact-identity container_attempted=0: cannot read GPU device groups' >&2; return 2;
+    }
+    [[ -n $device_groups ]] || {
+      echo 'RCCL_PROBE_SETUP_FAILURE stage=artifact-identity container_attempted=0: missing GPU device groups' >&2; return 2;
+    }
+    artifact_args=(--user "$uid:$gid" -e "TP2_RCCL_ARTIFACT=/work/$TP2_RCCL_ARTIFACT")
+    local -A seen_groups=(["$gid"]=1)
+    local added_groups=()
+    # Numeric IDs preserve host group permissions without assuming image names.
+    for group in $host_groups $device_groups; do
+      [[ $group =~ ^[0-9]+$ ]] || {
+        echo 'RCCL_PROBE_SETUP_FAILURE stage=artifact-identity container_attempted=0: invalid group ID' >&2; return 2;
+      }
+      if [[ -z ${seen_groups[$group]:-} ]]; then
+        artifact_args+=(--group-add "$group"); added_groups+=("$group"); seen_groups[$group]=1
+      fi
+    done
+    printf 'RCCL_PROBE_ARTIFACT_IDENTITY uid=%s gid=%s supplementary_groups=%s\n' "$uid" "$gid" "${added_groups[*]}"
+  fi
   trap cleanup EXIT
   CONTAINER_STARTED=1
   printf 'RCCL_PROBE_CONTAINER_LAUNCH name=%s\n' "$CONTAINER_NAME"
-  local artifact_args=()
-  if [[ -n ${TP2_RCCL_ARTIFACT:-} ]]; then
-    artifact_args=(-e "TP2_RCCL_ARTIFACT=/work/$TP2_RCCL_ARTIFACT")
-  fi
   timeout --signal=TERM --kill-after=15s "${outer_deadline}s" "${DOCKER[@]}" run \
     --name "$CONTAINER_NAME" --rm --pull never --network none --read-only --cap-drop ALL \
     --tmpfs /tmp:rw,exec,nosuid,size=2g --shm-size=512m -e HOME=/tmp \
