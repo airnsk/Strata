@@ -346,6 +346,25 @@ bool hidden_exact(const std::vector<uint8_t>& full,const std::vector<uint8_t>& a
     if(verbose || diff)std::printf("  hidden_q8_blocks %s differing_bytes=%zu\n",diff?"FAIL":"PASS",diff);
     return diff==0;
 }
+void probe_pattern(std::vector<uint8_t>& bytes,unsigned source,unsigned sequence) {
+    // Distinct finite FP32 words, including across sequences: no NaN payload ambiguity.
+    for(size_t i=0;i<bytes.size()/4;++i){
+        const uint32_t word=0x3f000000u | ((sequence*4099u+(uint32_t)i*97u+source*65537u)&0x007fffffu);
+        std::memcpy(bytes.data()+i*4,&word,4);
+    }
+}
+std::string probe_mismatch(const char* stage,int src,unsigned sequence,const std::vector<uint8_t>& expected,
+                           const std::vector<uint8_t>& got) {
+    if(expected.size()!=got.size())throw std::runtime_error("probe result size mismatch");
+    const auto mismatch=std::mismatch(expected.begin(),expected.end(),got.begin());
+    if(mismatch.first==expected.end())return {};
+    const size_t at=(size_t)(mismatch.first-expected.begin()),word_at=at&~size_t(3);
+    uint32_t want=0,have=0;std::memcpy(&want,expected.data()+word_at,4);std::memcpy(&have,got.data()+word_at,4);
+    char detail[384];
+    std::snprintf(detail,sizeof(detail),"%s src=%d dst=%d sequence=%u first_byte=%zu expected_byte=0x%02x got_byte=0x%02x word_offset=%zu expected_word=0x%08x got_word=0x%08x",
+                  stage,src,1-src,sequence,at,(unsigned)expected[at],(unsigned)got[at],word_at,(unsigned)want,(unsigned)have);
+    return detail;
+}
 bool peer_ready(Exchange exchange) {
     int count=0;auto e=cudaGetDeviceCount(&count);
     if(e!=cudaSuccess||count<2){std::printf("SKIP: two GPUs required\n");return false;}
@@ -362,40 +381,60 @@ bool peer_ready(Exchange exchange) {
         on(d);e=cudaDeviceEnablePeerAccess(1-d,0);
         if(e==cudaErrorPeerAccessAlreadyEnabled)cudaGetLastError();else ck(e,"enable peer access");
     }
-    std::array<uint8_t*,2> p{};
+    std::array<uint8_t*,2> p{},witness{};
     std::vector<uint8_t> pattern(4096);
-    for(size_t i=0;i<pattern.size();++i)pattern[i]=(uint8_t)(i*73+19);
-    for(int d=0;d<2;++d){on(d);p[d]=alloc<uint8_t>(pattern.size());}
+    for(int d=0;d<2;++d){on(d);p[d]=alloc<uint8_t>(pattern.size());witness[d]=alloc<uint8_t>(pattern.size());}
     for(int src=0;src<2;++src){
-        on(src);ck(cudaMemcpy(p[src],pattern.data(),pattern.size(),cudaMemcpyHostToDevice),"peer probe source");
-        on(1-src);ck(cudaMemset(p[1-src],0,pattern.size()),"peer probe clear");
-        cudaStream_t s{};ck(cudaStreamCreateWithFlags(&s,cudaStreamNonBlocking),"probe stream");
-        ck(cudaMemcpyPeerAsync(p[1-src],1-src,p[src],src,pattern.size(),s),"peer probe copy");
-        ck(cudaStreamSynchronize(s),"peer probe sync");
-        if(download(p[1-src],pattern.size())!=pattern)throw std::runtime_error("peer copy content mismatch");
-        ck(cudaStreamDestroy(s),"probe destroy");
-    }
-    if(exchange!=Exchange::Rows)for(int src=0;src<2;++src){
         cudaStream_t producer{},consumer{};cudaEvent_t ready{};
-        on(src);ck(cudaStreamCreateWithFlags(&producer,cudaStreamNonBlocking),"push probe producer");
-        ck(cudaEventCreateWithFlags(&ready,cudaEventDisableTiming),"push probe event");
-        on(1-src);ck(cudaStreamCreateWithFlags(&consumer,cudaStreamNonBlocking),"push probe consumer");
-        for(unsigned sequence=1;sequence<=16;++sequence){
-            // Monotonic sequences exceed the fixture replay period, exposing stale event reuse.
-            for(size_t i=0;i<pattern.size();++i)pattern[i]=(uint8_t)(i*73+sequence*29+(i>>8)*sequence);
-            on(src);ck(cudaMemcpy(p[src],pattern.data(),pattern.size(),cudaMemcpyHostToDevice),"push probe source");
-            on(1-src);ck(cudaMemset(p[1-src],0,pattern.size()),"push probe poison");
+        on(src);ck(cudaStreamCreateWithFlags(&producer,cudaStreamNonBlocking),"probe producer");
+        ck(cudaEventCreateWithFlags(&ready,cudaEventDisableTiming),"probe event");
+        on(1-src);ck(cudaStreamCreateWithFlags(&consumer,cudaStreamNonBlocking),"probe consumer");
+        auto initialize=[&](unsigned sequence){
+            probe_pattern(pattern,(unsigned)src,sequence);
+            // Explicitly finish BOTH initializations. hipMemset's default-stream
+            // async work has no ordering edge to another device's nonblocking
+            // producer: late poison must never race a tested peer write.
+            on(src);ck(cudaMemcpyAsync(p[src],pattern.data(),pattern.size(),cudaMemcpyHostToDevice,producer),"probe source upload");
+            ck(cudaStreamSynchronize(producer),"probe source initialization complete");
+            on(1-src);ck(cudaMemsetAsync(p[1-src],0,pattern.size(),consumer),"probe destination poison");
+            ck(cudaMemsetAsync(witness[1-src],0,pattern.size(),consumer),"probe witness poison");
+            ck(cudaStreamSynchronize(consumer),"probe destination initialization complete");
+        };
+        initialize(0);
+        on(1-src);ck(cudaMemcpyPeerAsync(p[1-src],1-src,p[src],src,pattern.size(),consumer),"runtime peer probe copy");
+        ck(cudaStreamSynchronize(consumer),"runtime peer probe complete");
+        if(const auto bad=probe_mismatch("runtime peer copy",src,0,pattern,download(p[1-src],pattern.size()));!bad.empty())
+            throw std::runtime_error(bad);
+        if(exchange!=Exchange::Rows)for(unsigned sequence=1;sequence<=16;++sequence){
+            initialize(sequence);
             on(src);tp2_input_push(reinterpret_cast<float*>(p[src]),reinterpret_cast<float*>(p[1-src]),(int)pattern.size()/4,producer);
             ck(cudaEventRecord(ready,producer),"push probe record");
             on(1-src);ck(cudaStreamWaitEvent(consumer,ready,0),"push probe cross-device wait");
-            ck(cudaStreamSynchronize(consumer),"push probe consumer done");
-            if(download(p[1-src],pattern.size())!=pattern)throw std::runtime_error("peer-write/event visibility mismatch at sequence "+std::to_string(sequence));
+            // A GPU-side local witness must see the peer data after the event,
+            // not only a later host/DMA readback that could mask consumer visibility.
+            tp2_input_push(reinterpret_cast<float*>(p[1-src]),reinterpret_cast<float*>(witness[1-src]),(int)pattern.size()/4,consumer);
+            ck(cudaStreamSynchronize(consumer),"push probe consumer complete");
+            const auto bad=probe_mismatch("peer-write/event consumer witness",src,sequence,pattern,download(witness[1-src],pattern.size()));
+            if(!bad.empty()){
+                std::fprintf(stderr,"probe failure: %s\n",bad.c_str());
+                const auto raw=probe_mismatch("destination readback after consumer wait",src,sequence,pattern,download(p[1-src],pattern.size()));
+                std::fprintf(stderr,"probe diagnostic: %s\n",raw.empty()?"destination readback matches":raw.c_str());
+                // One untimed fully synchronized diagnostic. Recovery does NOT
+                // turn a failed event protocol into a pass or select a fallback.
+                on(src);ck(cudaStreamSynchronize(producer),"diagnostic producer completion");
+                on(1-src);ck(cudaStreamSynchronize(consumer),"diagnostic consumer completion");
+                tp2_input_push(reinterpret_cast<float*>(p[1-src]),reinterpret_cast<float*>(witness[1-src]),(int)pattern.size()/4,consumer);
+                ck(cudaStreamSynchronize(consumer),"diagnostic witness complete");
+                const auto after=probe_mismatch("witness after explicit producer completion",src,sequence,pattern,download(witness[1-src],pattern.size()));
+                std::fprintf(stderr,"probe diagnostic: %s; original event gate remains FAIL\n",after.empty()?"values match after producer completion":after.c_str());
+                throw std::runtime_error(bad+"; original failure preserved after diagnostic");
+            }
         }
         on(1-src);cudaStreamDestroy(consumer);on(src);cudaStreamDestroy(producer);cudaEventDestroy(ready);
     }
-    for(int d=0;d<2;++d){on(d);cudaFree(p[d]);}
-    if(exchange==Exchange::Rows)std::printf("transport probe: runtime peer copies passed content checks both directions; no physical DMA bandwidth claim\n");
-    else std::printf("transport probe: runtime peer copies and direct peer writes+system fences+cross-device events passed content checks both directions; 16 monotonic sequences/direction; no physical DMA bandwidth claim\n");
+    for(int d=0;d<2;++d){on(d);cudaFree(p[d]);cudaFree(witness[d]);}
+    if(exchange==Exchange::Rows)std::printf("transport probe: explicit initialization and runtime peer copies passed content checks both directions; no physical DMA bandwidth claim\n");
+    else std::printf("transport probe: initialized runtime copies and direct peer writes+system fences+cross-device events+GPU consumer witness passed; 16 monotonic sequences/direction; no physical DMA bandwidth claim\n");
     return true;
 }
 struct ExchangeEvents {

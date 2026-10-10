@@ -33,7 +33,8 @@ namespace {
 __global__ void input_push_kernel(const float* src, float* dst, int n) {
     const int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
     if (i < n / 4) {
-        reinterpret_cast<float4*>(dst)[i] = reinterpret_cast<const float4*>(src)[i];
+        // Integer vector transport preserves all input bit patterns without FP interpretation.
+        reinterpret_cast<uint4*>(dst)[i] = reinterpret_cast<const uint4*>(src)[i];
         // Each writer fences its own remote writes before kernel completion.
         // The consumer additionally waits for the producer stream's event.
         __threadfence_system();

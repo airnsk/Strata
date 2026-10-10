@@ -200,12 +200,37 @@ these figures do not prove SDMA behavior or host staging, nor overturn an indepe
 28 GB/s PCIe benchmark. They motivate reduced payload, packed dynamic metadata and an
 event-joined protocol rather than another unchanged baseline run.
 
+## Probe initialization correction, 2026-10-10
+
+The first reduced-protocol hardware attempt compiled and passed the CPU gate, then
+stopped at the first direct peer-write/event visibility probe. No reduced FFN case or
+performance result was produced.
+
+Review found that probe initialization used default-stream H2D/memset operations without
+an explicit completion dependency before another device's nonblocking producer. The
+[pinned ROCm 7.2.4 `hipMemset` implementation](https://github.com/ROCm/rocm-systems/blob/rocm-7.2.4/projects/clr/hipamd/src/hip_memory.cpp#L2759-L2784)
+can enqueue this device-memory operation asynchronously. This is a real ordering defect in the probe; it is not proof that it
+caused the observed mismatch. The measured FFN loop already completed its poison/input
+initialization explicitly and is not being retimed or changed by this correction.
+
+Both runtime-copy and direct-write probes now initialize on named streams and explicitly
+complete source upload and destination/witness poisoning before transport. Input transport
+uses raw `uint4` loads/stores, and the probe uses finite FP32 word patterns. After the
+cross-device event, a GPU consumer kernel copies destination data to a local witness so
+host/DMA readback cannot alone certify kernel-visible data.
+
+Failures print source/destination, sequence, first bad byte and expected/actual words.
+One fully synchronized producer/consumer re-read is diagnostic only: even if that restores
+the expected data, the original event-protocol failure remains a failure. There is no
+automatic fallback, threshold change, or speculative event-flag change. Actual fenced
+peer-write/event behavior remains a hardware gate after the initialization correction.
+
 ## Validation status of the updated reduced protocol
 
 CPU standalone strict-warning, optimized, Release/NDEBUG and ASan/UBSan checks passed.
 LeakSanitizer is unavailable under this executor's ptrace, so its check was disabled.
 Host harness C++ syntax was checked with local API declarations; that is not a HIP compile.
 CMake was unavailable in the authoring executor. The initial rows-return version did
-compile/run on the owner's hardware as recorded above. The new reduction/peer-write/event
-protocol's GPU compilation, visibility, arithmetic and timing remain pending hardware
-validation. These test sources do not enable any production TP path.
+compile/run on the owner's hardware as recorded above. The reduction/peer-write/event version compiled on hardware, but its initial probe failed
+before arithmetic/timing. The corrected probe's GPU build/visibility and subsequent
+reduced arithmetic/timing remain pending hardware validation. These test sources do not enable any production TP path.
