@@ -10,6 +10,9 @@
 #include "strata/kernels/tp_gdn_exchange.hpp"
 #include "strata/kernels/tp_hc.hpp"
 #include "strata/kernels/verify_kernels.hpp"
+#if defined(STRATA_TP2_GDN_RCCL)
+#include "tp_gdn_rccl.hpp"
+#endif
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <cstring>
@@ -21,6 +24,8 @@
 #include <thread>
 #include <chrono>
 #include <cmath>
+#include <atomic>
+#include <cstdio>
 
 namespace strata::core::tp2 {
 namespace {
@@ -35,6 +40,7 @@ struct CapturedNode { cudaGraph_t graph{}; cudaGraphExec_t executable{}; };
 struct CapturedWindow {
     CapturedNode mixer[2], middle[4], commit[2];
     CapturedNode flat[2][2][2]; // HC split, instrumentation, physical state bank
+    CapturedNode rccl[2]; // whole unprofiled hybrid proposal, physical state bank
 };
 struct Rank {
     TpGdnRankWeights w;
@@ -49,6 +55,7 @@ struct Rank {
     bool ffn_columns() const {return tp_gdn_partition_geometry(w.partition,w.rank).ffn_columns;}
     CapturedWindow& window(int t,bool profile){return profile?captured_profile[t]:captured[t];}
     int state_bank=0;
+    bool resources_released=false;
     bool trace=false;
     unsigned long long* stamps{};
     float *hc_local_lo{},*hc_local_mixed{};
@@ -58,6 +65,7 @@ struct Rank {
     uint64_t wall_khz=0;
     float *R{},*mixed{},*attn_input{},*ffn_input{},*mixer_output{},*lo{},*rs{},*xn{},*inj[2]{},*bo{},*local_out{};
     float* peer_partial[2]{}; // distinct attention/FFN receive payloads
+    float* rccl_attention_receive{}; // packed Y, then packed output; allocated only on opt-in
     float *state{},*conv{},*candidate_state{},*candidate_conv{},*qkv{},*h{},*gate{},*beta{},*z{},*y{},*full_y{};
     float *logits{},*weights{},*sg{},*su{},*scalar{},*shared{},*parts{};
     uint8_t *xq{},*shared_local_q{},*shared_full_q{},*gu_scratch{},*down_scratch{};
@@ -108,15 +116,10 @@ struct Rank {
         void* p=nullptr;check(cudaMalloc(&p,n*sizeof(T)),"allocation");owned.push_back(p);owned_bytes.push_back(n*sizeof(T));
         check(cudaMemset(p,0,n*sizeof(T)),"initial zero");return static_cast<T*>(p);
     }
-    void release() noexcept {
-        cudaSetDevice(w.device);
-        if(compute)cudaStreamSynchronize(compute);
-        if(copy)cudaStreamSynchronize(copy);
-        // Graph nodes borrow weight/state/scratch pointers: destroy after drain,
-        // on their owning device, BEFORE freeing any referenced allocations.
-        auto destroy=[](CapturedNode& node){
-            if(node.executable)cudaGraphExecDestroy(node.executable);
-            if(node.graph)cudaGraphDestroy(node.graph);
+    void destroy_graphs(bool checked = false) {
+        auto destroy=[checked](CapturedNode& node){
+            if(node.executable){auto e=cudaGraphExecDestroy(node.executable);if(checked)check(e,"destroy graph executable");}
+            if(node.graph){auto e=cudaGraphDestroy(node.graph);if(checked)check(e,"destroy graph");}
             node={};
         };
         for(auto* windows:{&captured,&captured_profile})for(auto& window:*windows){
@@ -124,14 +127,26 @@ struct Rank {
             for(auto& node:window.middle)destroy(node);
             for(auto& node:window.commit)destroy(node);
             for(auto& hc:window.flat)for(auto& profile:hc)for(auto& node:profile)destroy(node);
+            for(auto& node:window.rccl)destroy(node);
         }
-        for(void* p:owned)cudaFree(p);
+    }
+    void release(bool checked = false) {
+        if(resources_released)return;
+        auto status=[checked](cudaError_t e,const char* label){if(checked)check(e,label);};
+        status(cudaSetDevice(w.device),"release select device");
+        if(compute)status(cudaStreamSynchronize(compute),"release compute drain");
+        if(copy)status(cudaStreamSynchronize(copy),"release copy drain");
+        // RCCL owners destroy all graphs BEFORE their communicator is released;
+        // the second call here is then a no-op. Ordinary owners retain the old order.
+        destroy_graphs(checked);
+        for(void* p:owned)status(cudaFree(p),"release allocation");
         owned.clear();
-        if(ready)cudaEventDestroy(ready);
-        if(arrival)cudaEventDestroy(arrival);
-        if(compute)cudaStreamDestroy(compute);
-        if(copy)cudaStreamDestroy(copy);
+        if(ready)status(cudaEventDestroy(ready),"release ready event");
+        if(arrival)status(cudaEventDestroy(arrival),"release arrival event");
+        if(compute)status(cudaStreamDestroy(compute),"release compute stream");
+        if(copy)status(cudaStreamDestroy(copy),"release copy stream");
         ready={};arrival={};compute={};copy={};
+        resources_released=true;
     }
     ~Rank(){release();}
     void sync() const {select(w.device);check(cudaStreamSynchronize(compute),"rank completion");}
@@ -219,6 +234,18 @@ struct Rank {
         check(cudaStreamEndCapture(compute,&node.graph),"end rank-local capture");
         check(cudaGraphInstantiate(&node.executable,node.graph,nullptr,nullptr,0),"instantiate rank-local graph");
     }
+#if defined(STRATA_TP2_GDN_RCCL)
+    template<class Launch> void capture_rccl(CapturedNode& node,Launch launch) {
+        // A failed RCCL capture may still own live library plans. Throw directly
+        // to the paired worker boundary, which aborts/exits without freeing any
+        // graph/buffer or trying to unwind a possibly blocked capture.
+        select(w.device);
+        check(cudaStreamBeginCapture(compute,cudaStreamCaptureModeThreadLocal),"begin RCCL capture");
+        launch();
+        check(cudaStreamEndCapture(compute,&node.graph),"end RCCL capture");
+        check(cudaGraphInstantiate(&node.executable,node.graph,nullptr,nullptr,0),"instantiate RCCL graph");
+    }
+#endif
     void launch(const CapturedNode& node) {
         select(w.device);check(cudaGraphLaunch(node.executable,compute),"launch rank-local graph");
     }
@@ -247,15 +274,32 @@ struct TpGdnLayer::Impl {
     int missing_rank=-1,delayed_rank=-1;
     uint64_t delay_us=0;
     bool flat_mode() const {return execution==TpGdnExecution::FlatCaptured||execution==TpGdnExecution::FlatHcCaptured;}
+    bool rccl_mode() const {return execution==TpGdnExecution::HybridRcclCaptured;}
+    std::array<bool,9> rccl_prepared{};
+    TpGdnRcclOptions rccl_options;
+    int rccl_first=0;
+#if defined(STRATA_TP2_GDN_RCCL)
+    std::unique_ptr<detail::RcclSession> rccl;
+#endif
     void abort_flat() noexcept {
         if(host_control)__atomic_store_n(&host_control->host_abort.value,uint64_t{1},__ATOMIC_RELEASE);
     }
     void poison_and_drain() noexcept {
         abort_flat();poisoned=true;
+#if defined(STRATA_TP2_GDN_RCCL)
+        if(rccl)rccl->fail("layer device failure; no output or commit is valid");
+#endif
         for(auto& rank:r)if(rank){cudaSetDevice(rank->w.device);cudaStreamSynchronize(rank->compute);cudaStreamSynchronize(rank->copy);}
     }
     ~Impl(){
         abort_flat(); // release any bounded waits before owning streams drain
+#if defined(STRATA_TP2_GDN_RCCL)
+        if(rccl){
+            rccl->shutdown([&](int rank){select(r[rank]->w.device);r[rank]->destroy_graphs(true);},
+                           [&](int rank){r[rank]->release(true);});
+            rccl.reset();
+        }
+#endif
         for(auto& rank:r)rank.reset();
 #if defined(STRATA_HIP_GFX906)
         if(host_control){host_control->~TpGdnProtocolControl();hipHostFree(host_control);}
@@ -332,7 +376,12 @@ struct TpGdnLayer::Impl {
 #endif
     }
     void healthy() const {if(poisoned)throw std::runtime_error("TP GDN session poisoned by prior device failure");}
-    void sync() const {for(int i=0;i<count;++i)r[i]->sync();}
+    void sync() const {
+#if defined(STRATA_TP2_GDN_RCCL)
+        if(rccl){auto command=[&](int rank){rccl->complete(rank);};rccl->paired("layer-synchronize",std::ref(command));return;}
+#endif
+        for(int i=0;i<count;++i)r[i]->sync();
+    }
     // Each receiving rank's copy stream waits for BOTH producers, fills disjoint
     // local slots, then releases its own consumer. No peer kernel writes/spins.
     template<class Copy> void exchange(Copy copy) {
@@ -435,6 +484,57 @@ struct TpGdnLayer::Impl {
         }else if(ph==3){a.stamp(24);column_reduce(a,1);a.stamp(25);a.finish(tokens);a.stamp(27);}
         else throw std::logic_error("TP GDN invalid hybrid phase");
     }
+#if defined(STRATA_TP2_GDN_RCCL)
+    void rccl_graph(Rank& a) {
+        const int rank=a.w.rank;
+        a.mixer(tokens);
+        rccl->exchange(rank,a.y,a.rccl_attention_receive,size_t(tokens)*(V/2));
+        k::tp_gdn_gather_y_local(a.y,a.rccl_attention_receive,a.full_y,tokens,rank,a.compute);
+        a.output_projection(tokens);
+        // Attention projection is packed T*1280, even though hybrid local_out
+        // has capacity T*2560 for the later full-width FFN partial.
+        rccl->exchange(rank,a.local_out,a.rccl_attention_receive,size_t(tokens)*(N/2));
+        k::tp_gdn_gather_output_local(a.local_out,a.rccl_attention_receive,a.bo,tokens,rank,a.compute);
+        check(cudaMemcpyAsync(a.mixer_output,a.bo,tokens*N*sizeof(float),cudaMemcpyDeviceToDevice,a.compute),"RCCL mixer seam");
+        a.ffn_gu(tokens,mode);
+        // Same fused down/combine arithmetic; transport now owns publication.
+        a.ffn_down(tokens,mode,nullptr);
+        rccl->exchange(rank,a.local_out,a.peer_partial[1],size_t(tokens)*N);
+        column_reduce(a,1);a.finish(tokens);
+    }
+    template<class Input> void run_rccl(Input input) {
+        if(!rccl)throw std::logic_error("TP GDN RCCL session was not prepared");
+        const int omit=missing_rank,delay_rank=delayed_rank,first=rccl_first;
+        const uint64_t delay=delay_us;
+        missing_rank=delayed_rank=-1;delay_us=0;
+        std::atomic<int> admission{0};
+        const char* stage=omit>=0?"layer-missing-rank":delay_rank>=0?"layer-delayed-rank":"layer-proposal";
+        auto command=[&](int rank){
+            auto& a=*r[rank];select(a.w.device);
+            if(rank==omit){std::printf("RCCL_LAYER_PEER_OMITTED rank=%d\n",rank);return;}
+            if(rank==delay_rank&&delay)std::this_thread::sleep_for(std::chrono::microseconds(delay));
+            input(a);
+            // Release BEFORE entering HIP. A first launch may not return until
+            // the other host thread has submitted its participating graph.
+            if(omit<0){
+                const int turn=rank==first?0:1;
+                while(admission.load(std::memory_order_acquire)!=turn){rccl->check_peer();std::this_thread::yield();}
+                admission.fetch_add(1,std::memory_order_release);
+            }
+            if(omit>=0||delay_rank>=0)std::printf("RCCL_LAYER_GRAPH_LAUNCH_ENTER rank=%d\n",rank);
+            a.launch(a.captured[tokens].rccl[a.state_bank]);
+            rccl->complete(rank);
+            uint32_t error=0;
+            check(cudaMemcpy(&error,a.plan_error,sizeof(error),cudaMemcpyDeviceToHost),"RCCL final plan status");
+            if(error)throw std::runtime_error("TP GDN RCCL static expert plan rejected a route");
+        };
+        // Borrow the stack callback through the synchronous paired boundary.
+        // Copying a reference_wrapper avoids heap-copying this larger closure
+        // into the controller and both rank workers on every proposal.
+        rccl->paired(stage,std::ref(command));
+        last_profiled=false;pending=true;
+    }
+#endif
     void run_hybrid(bool graphs) {
         for(int ph=0;ph<4;++ph){
             for(int i=0;i<count;++i){auto& a=*r[i];
@@ -553,6 +653,9 @@ struct TpGdnLayer::Impl {
         }
     }
     void run() {
+#if defined(STRATA_TP2_GDN_RCCL)
+        if(rccl_mode()){run_rccl([](Rank&){});return;}
+#endif
         if(hybrid())run_hybrid(execution==TpGdnExecution::HybridCaptured);
         else if(projection_columns())run_column(execution==TpGdnExecution::ColumnCaptured);
         else if(flat_mode())run_flat();
@@ -571,6 +674,7 @@ struct TpGdnLayer::Impl {
         if((execution==TpGdnExecution::Captured||execution==TpGdnExecution::ColumnCaptured||execution==TpGdnExecution::HybridCaptured)&&!(profile_enabled?prepared_profile[t]:prepared[t]))throw std::logic_error("TP GDN token count was not captured during startup");
         if(flat_mode()&&!flat_prepared[t][execution==TpGdnExecution::FlatHcCaptured][profile_enabled])
             throw std::logic_error("TP GDN flat token/profile/HC variant was not prepared during startup");
+        if(rccl_mode()&&!rccl_prepared[t])throw std::logic_error("TP GDN RCCL token count was not captured during startup");
         tokens=t;epoch=e;seen_epoch=true;
     }
 };
@@ -615,6 +719,60 @@ void TpGdnLayer::prepare_captured(int tokens,bool profile) {
         (profile?p.prepared_profile[tokens]:p.prepared[tokens])=true;
         p.execution=old_execution;p.tokens=old_tokens;p.profile_enabled=old_profile;
     }catch(...){p.execution=old_execution;p.tokens=old_tokens;p.profile_enabled=old_profile;p.pending=false;p.poisoned=true;throw;}
+}
+void TpGdnLayer::prepare_rccl(int tokens,const TpGdnRcclOptions& options) {
+    auto& p=*impl_;p.healthy();
+    if(!p.hybrid()||tokens<1||tokens>p.capacity||p.seen_epoch||p.pending||p.profile_enabled)
+        throw std::invalid_argument("TP GDN RCCL preparation requires idle startup hybrid owners and T within capacity");
+    if(options.library.empty()||options.library.front()!='/'||options.timeout_ms<100||options.timeout_ms>120000||
+       options.init_timeout_ms<100||options.init_timeout_ms>120000)
+        throw std::invalid_argument("TP GDN RCCL requires an explicit library and bounded 100..120000 ms timeouts");
+#if defined(STRATA_TP2_GDN_RCCL)
+    if(p.rccl&&(options.library!=p.rccl_options.library||options.timeout_ms!=p.rccl_options.timeout_ms||
+                options.init_timeout_ms!=p.rccl_options.init_timeout_ms))
+        throw std::invalid_argument("TP GDN RCCL startup options cannot change within a session");
+    if(p.rccl_prepared[tokens])return;
+    const int old_tokens=p.tokens;
+    try{
+        if(!p.rccl){
+            // Warm lazy dispatch and capture ordinary commit graphs on both
+            // devices before any RCCL owner thread or communicator is created.
+            for(int t=1;t<=p.capacity;++t)prepare_captured(t);
+            for(int rank=0;rank<2;++rank){auto& a=*p.r[rank];select(a.w.device);
+                a.rccl_attention_receive=a.alloc<float>(size_t(p.capacity)*(V/2));
+                check(cudaDeviceSynchronize(),"RCCL allocation initialization fence");}
+            p.rccl_options=options;
+            p.rccl=std::make_unique<detail::RcclSession>(
+                std::array<int,2>{p.r[0]->w.device,p.r[1]->w.device},
+                std::array<void*,2>{p.r[0]->compute,p.r[1]->compute},options.library,options.timeout_ms,options.init_timeout_ms);
+        }
+        p.tokens=tokens;
+        // Actual dependent compute and all seam connections are warmed together;
+        // this changes no committed state and is outside all benchmark clocks.
+        p.rccl->paired("layer-warmup",[&](int rank){p.rccl_graph(*p.r[rank]);p.rccl->complete(rank);});
+        p.rccl->paired("layer-capture",[&](int rank){
+            auto& a=*p.r[rank];const int original=a.state_bank;
+            try{
+                for(int bank=0;bank<2;++bank){
+                    if(a.state_bank!=bank)a.swap_state_bank();
+                    a.capture_rccl(a.captured[tokens].rccl[bank],[&]{p.rccl_graph(a);});
+                }
+                if(a.state_bank!=original)a.swap_state_bank();
+            }catch(...){if(a.state_bank!=original)a.swap_state_bank();throw;}
+        },true);
+        p.rccl_prepared[tokens]=true;p.tokens=old_tokens;
+    }catch(...){p.tokens=old_tokens;p.pending=false;p.poison_and_drain();throw;}
+#else
+    (void)tokens;
+    throw std::runtime_error("TP GDN RCCL was not built; configure STRATA_TP2_GDN_RCCL_BUILD=ON");
+#endif
+}
+void TpGdnLayer::set_rccl_launch_for_test(int first,int missing,int delayed,uint64_t delay) {
+    auto& p=*impl_;p.healthy();
+    if(!p.rccl_mode()||p.pending||(first!=0&&first!=1)||missing < -1||missing>1||
+       delayed < -1||delayed>1||delay>10000000||(missing>=0&&delayed>=0))
+        throw std::invalid_argument("TP GDN RCCL launch test requires idle RCCL mode and valid rank/delay");
+    p.rccl_first=first;p.missing_rank=missing;p.delayed_rank=delayed;p.delay_us=delay;
 }
 std::vector<TpGdnCalibrationSample> TpGdnLayer::calibrate_frozen(
         const std::vector<float>& residual,int tokens,int warmup,int trials) {
@@ -1331,16 +1489,21 @@ void TpGdnLayer::prepare_flat(int tokens,bool shard_hc,bool profile,uint64_t tim
 void TpGdnLayer::set_execution(TpGdnExecution mode,bool profile) {
     auto& p=*impl_;p.healthy();
     if(p.pending)throw std::logic_error("TP GDN execution mode cannot change during an outstanding proposal");
-    if(mode!=TpGdnExecution::RuntimeCopies&&mode!=TpGdnExecution::Consolidated&&mode!=TpGdnExecution::Captured&&mode!=TpGdnExecution::ColumnCaptured&&mode!=TpGdnExecution::HybridCaptured&&mode!=TpGdnExecution::FlatCaptured&&mode!=TpGdnExecution::FlatHcCaptured)
+    if(mode!=TpGdnExecution::RuntimeCopies&&mode!=TpGdnExecution::Consolidated&&mode!=TpGdnExecution::Captured&&mode!=TpGdnExecution::ColumnCaptured&&mode!=TpGdnExecution::HybridCaptured&&mode!=TpGdnExecution::HybridRcclCaptured&&mode!=TpGdnExecution::FlatCaptured&&mode!=TpGdnExecution::FlatHcCaptured)
         throw std::invalid_argument("TP GDN invalid execution mode");
     if(p.projection_columns()&&mode!=TpGdnExecution::ColumnCaptured)
         throw std::invalid_argument("TP GDN input-column owners require ColumnCaptured execution");
     if(p.count==2&&!p.projection_columns()&&mode==TpGdnExecution::ColumnCaptured)
         throw std::invalid_argument("TP GDN ColumnCaptured requires input-column weights");
-    if(p.hybrid()&&mode!=TpGdnExecution::HybridCaptured)
-        throw std::invalid_argument("TP GDN hybrid owners require HybridCaptured execution");
+    if(p.hybrid()&&mode!=TpGdnExecution::HybridCaptured&&mode!=TpGdnExecution::HybridRcclCaptured)
+        throw std::invalid_argument("TP GDN hybrid owners require a hybrid execution mode");
     if(p.count==2&&!p.hybrid()&&mode==TpGdnExecution::HybridCaptured)
         throw std::invalid_argument("TP GDN HybridCaptured requires hybrid weights");
+    if(mode==TpGdnExecution::HybridRcclCaptured&&(!p.hybrid()||profile))
+        throw std::invalid_argument("TP GDN RCCL requires unprofiled hybrid weights");
+#if !defined(STRATA_TP2_GDN_RCCL)
+    if(mode==TpGdnExecution::HybridRcclCaptured)throw std::runtime_error("TP GDN RCCL was not built");
+#endif
     if(profile&&mode!=TpGdnExecution::Captured&&mode!=TpGdnExecution::ColumnCaptured&&mode!=TpGdnExecution::HybridCaptured&&mode!=TpGdnExecution::FlatCaptured&&mode!=TpGdnExecution::FlatHcCaptured)
         throw std::invalid_argument("TP GDN GPU profiling requires a captured graph variant");
     p.execution=mode;p.profile_enabled=profile;p.last_profiled=false;
@@ -1403,27 +1566,51 @@ void TpGdnLayer::reset_state(const std::vector<float>& state,const std::vector<f
 void TpGdnLayer::propose(const std::vector<float>& residual,int tokens,uint64_t epoch) {
     auto& p=*impl_;if(residual.size()!=static_cast<size_t>(tokens)*HC*N)throw std::invalid_argument("TP GDN residual shape mismatch");
     p.begin(tokens,epoch);
-    try{for(int i=0;i<p.count;++i){auto& r=*p.r[i];select(r.w.device);check(cudaMemcpyAsync(r.R,residual.data(),residual.size()*sizeof(float),cudaMemcpyHostToDevice,r.compute),"residual upload");}p.run();}
+    try{
+#if defined(STRATA_TP2_GDN_RCCL)
+        if(p.rccl_mode()){p.run_rccl([&](Rank& r){check(cudaMemcpyAsync(r.R,residual.data(),residual.size()*sizeof(float),cudaMemcpyHostToDevice,r.compute),"RCCL residual upload");});return;}
+#endif
+        for(int i=0;i<p.count;++i){auto& r=*p.r[i];select(r.w.device);check(cudaMemcpyAsync(r.R,residual.data(),residual.size()*sizeof(float),cudaMemcpyHostToDevice,r.compute),"residual upload");}p.run();}
     catch(...){p.poison_and_drain();throw;}
 }
 void TpGdnLayer::propose_device(const std::array<const float*,2>& residual,int tokens,uint64_t epoch) {
     auto& p=*impl_;for(int i=0;i<p.count;++i)if(!residual[i])throw std::invalid_argument("TP GDN missing rank residual");
     p.begin(tokens,epoch);
-    try{for(int i=0;i<p.count;++i){auto& r=*p.r[i];select(r.w.device);check(cudaMemcpyAsync(r.R,residual[i],tokens*HC*N*sizeof(float),cudaMemcpyDeviceToDevice,r.compute),"residual device copy");}p.run();}
+    try{
+#if defined(STRATA_TP2_GDN_RCCL)
+        if(p.rccl_mode()){p.run_rccl([&](Rank& r){check(cudaMemcpyAsync(r.R,residual[r.w.rank],tokens*HC*N*sizeof(float),cudaMemcpyDeviceToDevice,r.compute),"RCCL residual device copy");});return;}
+#endif
+        for(int i=0;i<p.count;++i){auto& r=*p.r[i];select(r.w.device);check(cudaMemcpyAsync(r.R,residual[i],tokens*HC*N*sizeof(float),cudaMemcpyDeviceToDevice,r.compute),"residual device copy");}p.run();}
     catch(...){p.poison_and_drain();throw;}
 }
 void TpGdnLayer::commit(int keep) {
     auto& p=*impl_;p.healthy();if(!p.pending||keep<0||keep>p.tokens)throw std::invalid_argument("TP GDN commit requires an outstanding window and keep in 0..T");
     if(keep==0){p.pending=false;return;}
-    try{for(int i=0;i<p.count;++i){auto& r=*p.r[i];select(r.w.device);
+    try{
+#if defined(STRATA_TP2_GDN_RCCL)
+        if(p.rccl_mode()){
+            auto command=[&](int rank){auto& r=*p.r[rank];select(r.w.device);
+                check(cudaMemcpyAsync(r.keep,&keep,sizeof(keep),cudaMemcpyHostToDevice,r.compute),"RCCL commit count");
+                r.launch(r.captured[p.tokens].commit[r.state_bank]);p.rccl->complete(rank);};
+            p.rccl->paired("layer-commit",std::ref(command));
+        }
+        else
+#endif
+        {for(int i=0;i<p.count;++i){auto& r=*p.r[i];select(r.w.device);
         check(cudaMemcpyAsync(r.keep,&keep,sizeof(keep),cudaMemcpyHostToDevice,r.compute),"commit count");
         if(p.execution==TpGdnExecution::Captured||p.execution==TpGdnExecution::ColumnCaptured||p.execution==TpGdnExecution::HybridCaptured||p.flat_mode())r.launch(r.captured[p.tokens].commit[r.state_bank]);
         else r.stage_commit(p.tokens);
-    }p.sync();
+    }p.sync();}
     // Pointer publication is all-host, after both successful device completions.
     for(int i=0;i<p.count;++i)p.r[i]->swap_state_bank();
     p.pending=false;
-    }catch(...){p.poisoned=true;throw;}
+    }catch(...){
+        p.poisoned=true;
+#if defined(STRATA_TP2_GDN_RCCL)
+        if(p.rccl)p.rccl->fail("layer commit failed; no bank publication is valid");
+#endif
+        throw;
+    }
 }
 const float* TpGdnLayer::residual(int rank) const {impl_->healthy();if(rank<0||rank>=impl_->count)throw std::out_of_range("TP GDN rank");return impl_->r[rank]->R;}
 int TpGdnLayer::device(int rank) const {if(rank<0||rank>=impl_->count)throw std::out_of_range("TP GDN rank");return impl_->r[rank]->w.device;}

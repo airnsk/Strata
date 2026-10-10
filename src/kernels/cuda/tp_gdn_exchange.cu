@@ -1,6 +1,7 @@
 #include "strata/kernels/tp_gdn_exchange.hpp"
 
 #include <cuda_runtime.h>
+#include "strata/kernels/tp_gdn_gather_layout.hpp"
 #include <cstddef>
 #include <limits>
 #include <stdexcept>
@@ -36,6 +37,29 @@ void launch_check() {
     const auto status = cudaGetLastError();
     if (status != cudaSuccess)
         throw std::runtime_error(std::string("TP GDN exchange launch: ") + cudaGetErrorString(status));
+}
+
+template<bool Y>
+__global__ void gather_local_kernel(const uint32_t* local, const uint32_t* peer,
+                                     uint32_t* full, int tokens, int rank) {
+    constexpr int half = tp_gdn_gather_layout::half_width(Y);
+    const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i >= tokens * half) return;
+    const int row = (i / half) * (2 * half), col = i % half;
+    full[row + tp_gdn_gather_layout::column(Y, rank, col)] = local[i];
+    full[row + tp_gdn_gather_layout::column(Y, 1 - rank, col)] = peer[i];
+}
+
+template<bool Y>
+void gather_local(const float* local, const float* peer, float* full, int t, int rank, void* stream) {
+    constexpr int half = tp_gdn_gather_layout::half_width(Y);
+    const size_t bytes = size_t(t > 0 ? t : 0) * half * sizeof(float);
+    const Span spans[] = {{local, bytes}, {peer, bytes}, {full, 2 * bytes}};
+    validate(t, rank, spans, 3);
+    gather_local_kernel<Y><<<(t * half + kThreads - 1) / kThreads, kThreads, 0, (cudaStream_t)stream>>>(
+        reinterpret_cast<const uint32_t*>(local), reinterpret_cast<const uint32_t*>(peer),
+        reinterpret_cast<uint32_t*>(full), t, rank);
+    launch_check();
 }
 
 __global__ void push_y_kernel(const uint32_t* src, uint32_t* local, uint32_t* peer, int tokens, int rank) {
@@ -119,6 +143,12 @@ void tp_gdn_push_hidden(const uint8_t* routed_src, uint8_t* routed_local, uint8_
     launch_check();
 }
 
+void tp_gdn_gather_y_local(const float* local, const float* peer, float* full, int t, int rank, void* stream) {
+    gather_local<true>(local, peer, full, t, rank, stream);
+}
+void tp_gdn_gather_output_local(const float* local, const float* peer, float* full, int t, int rank, void* stream) {
+    gather_local<false>(local, peer, full, t, rank, stream);
+}
 }  // namespace strata::kernels
 
 namespace strata::kernels {

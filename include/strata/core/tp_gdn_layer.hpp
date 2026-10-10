@@ -33,7 +33,13 @@ enum class TpGdnExecution {
     ColumnCaptured,// input-column owners, two event-ordered output reductions
     FlatCaptured,  // one graph/rank, bounded device protocol, original HC
     FlatHcCaptured,// same graph/protocol, exact HC row-sharded compute
-    HybridCaptured // row attention / column FFN, three joins, no FFN hidden gather
+    HybridCaptured, // row attention / column FFN, three joins, no FFN hidden gather
+    HybridRcclCaptured // opt-in test build: same arithmetic, one RCCL proposal graph/rank
+};
+
+struct TpGdnRcclOptions {
+    std::string library; // required canonical identity, checked against the loaded DSO
+    int timeout_ms = 10000, init_timeout_ms = 60000;
 };
 
 struct TpGdnLayerProfile {
@@ -90,6 +96,17 @@ public:
     // row TP retains five segments/four gathers. Failure is fatal to
     // this instance, with no silent fallback to another execution mode.
     void prepare_captured(int tokens, bool profile = false);
+    // Isolated benchmark only, HybridRowsColumns owners. Requires the optional
+    // RCCL build and an explicitly verified library. Persistent rank workers own
+    // communicator calls/capture/replay; no device allocation or host phase joins during
+    // a proposal. Captures both physical state banks. Profiling is not supported.
+    // A blocked/failed RCCL operation terminates this diagnostic subprocess;
+    // possibly live graph/communicator/buffer storage is never freed on failure.
+    void prepare_rccl(int tokens, const TpGdnRcclOptions& options);
+    // Host admission order, not guaranteed driver execution order. Missing/late
+    // rank injection applies to the next proposal only and requires a subprocess.
+    void set_rccl_launch_for_test(int first, int missing_rank = -1,
+                                 int delayed_rank = -1, uint64_t delay_us = 0);
     // Flat modes require the model-free protocol preflight on the target runtime.
     // They are incompatible with InputColumns/HybridRowsColumns owners.
     // A separate profiled graph is explicit: timestamp overhead is not benchmark

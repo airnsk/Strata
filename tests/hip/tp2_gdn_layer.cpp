@@ -41,7 +41,10 @@ void on(int d) { ck(cudaSetDevice(d),"set device"); }
 struct Options {
     std::vector<std::string> shards; std::string pack,execution="runtime";
     int layer=0,mode=8,warmup=3,trials=12,block_calls=16,block_trials=4; bool benchmark=false,calibrate=false,model_probe=false,profile_flat=false,execution_explicit=false;
-    bool warmup_explicit=false,trials_explicit=false;
+    bool warmup_explicit=false,trials_explicit=false,rccl_options_explicit=false;
+    tp::TpGdnRcclOptions rccl;
+    std::string rccl_scenario="normal";
+    int rccl_first=0,rccl_delay_ms=200;
 };
 Options parse(int argc,char**argv) {
     Options o;
@@ -56,6 +59,16 @@ Options parse(int argc,char**argv) {
         if(a=="--gguf") o.shards.push_back(v);
         else if(a=="--pack") o.pack=v;
         else if(a=="--execution"){o.execution=v;o.execution_explicit=true;}
+        else if(a=="--rccl-library"){o.rccl.library=v;o.rccl_options_explicit=true;}
+        else if(a=="--rccl-scenario"){o.rccl_scenario=v;o.rccl_options_explicit=true;}
+        else if(a=="--rccl-timeout-ms"||a=="--rccl-init-timeout-ms"||a=="--rccl-launch-first"||a=="--rccl-delay-ms"){
+            size_t used=0;const int n=std::stoi(v,&used);if(used!=v.size())throw std::invalid_argument("invalid RCCL integer");
+            o.rccl_options_explicit=true;
+            if(a=="--rccl-timeout-ms")o.rccl.timeout_ms=n;
+            else if(a=="--rccl-init-timeout-ms")o.rccl.init_timeout_ms=n;
+            else if(a=="--rccl-launch-first")o.rccl_first=n;
+            else o.rccl_delay_ms=n;
+        }
         else if(a=="--layer" || a=="--mode" || a=="--bench-warmup" || a=="--bench-trials" || a=="--bench-block-calls" || a=="--bench-block-trials") {
             size_t used=0; int n=std::stoi(v,&used);
             if(used!=v.size()) throw std::invalid_argument("invalid integer");
@@ -64,8 +77,20 @@ Options parse(int argc,char**argv) {
     }
     if(o.shards.empty() || o.pack.empty() || o.layer<0 || o.layer>=48 || o.layer==1 || o.layer%4==3 ||
        (o.mode!=7 && o.mode!=8) || o.warmup<1 || o.warmup>100 || o.trials<2 || o.trials>1000 || o.block_calls<2 || o.block_calls>64 || o.block_trials<2 || o.block_trials>20 ||
-       (o.execution!="runtime"&&o.execution!="consolidated"&&o.execution!="captured"&&o.execution!="flat"&&o.execution!="flat-hc"&&o.execution!="column"&&o.execution!="hybrid"&&o.execution!="all"))
-        throw std::invalid_argument("usage: tp2_gdn_layer --pack PACK --gguf SHARD [--gguf SHARD ...] [--layer non-PLE-GDN-index] [--mode 7|8] [--execution runtime|consolidated|captured|column|hybrid|flat|flat-hc|all] [--benchmark | --calibrate | --model-probe] [--bench-warmup 3] [--bench-trials 12] [--profile-stages] [--bench-block-calls 16] [--bench-block-trials 4]");
+       (o.execution!="runtime"&&o.execution!="consolidated"&&o.execution!="captured"&&o.execution!="flat"&&o.execution!="flat-hc"&&o.execution!="column"&&o.execution!="hybrid"&&o.execution!="hybrid-rccl"&&o.execution!="all"))
+        throw std::invalid_argument("usage: tp2_gdn_layer --pack PACK --gguf SHARD [--gguf SHARD ...] [--layer non-PLE-GDN-index] [--mode 7|8] [--execution runtime|consolidated|captured|column|hybrid|hybrid-rccl|flat|flat-hc|all] [--benchmark | --calibrate | --model-probe] [--bench-warmup 3] [--bench-trials 12] [--profile-stages] [--bench-block-calls 16] [--bench-block-trials 4]");
+    if(o.execution=="hybrid-rccl"){
+#ifndef STRATA_TP2_GDN_RCCL
+        throw std::invalid_argument("hybrid-rccl requires STRATA_TP2_GDN_RCCL_BUILD=ON");
+#endif
+        if(o.rccl.library.empty()||o.rccl.library.front()!='/'||o.calibrate||o.model_probe||o.profile_flat||
+           o.rccl.timeout_ms<100||o.rccl.timeout_ms>120000||o.rccl.init_timeout_ms<100||o.rccl.init_timeout_ms>120000||
+           (o.rccl_first!=0&&o.rccl_first!=1)||o.rccl_delay_ms<1||o.rccl_delay_ms>10000||
+           (o.rccl_scenario!="normal"&&o.rccl_scenario!="delayed-rank"&&o.rccl_scenario!="missing-rank")||
+           (o.rccl_scenario!="normal"&&o.benchmark)||
+           (o.rccl_scenario=="delayed-rank"&&o.rccl_delay_ms>=o.rccl.timeout_ms))
+            throw std::invalid_argument("hybrid-rccl needs --rccl-library ABS_PATH, bounded timeouts and unprofiled normal/fault scope; fault timing is forbidden");
+    }else if(o.rccl_options_explicit)throw std::invalid_argument("RCCL options require --execution hybrid-rccl");
     if(o.calibrate){
         if(o.benchmark||o.profile_flat||(o.execution_explicit&&o.execution!="captured"))
             throw std::invalid_argument("--calibrate only supports unprofiled output-row captured; do not combine with --benchmark/--profile-stages/other execution");
@@ -325,6 +350,23 @@ void seams(Checks& c,const tp::TpGdnLayerSnapshot& a,const tp::TpGdnLayerSnapsho
     c.floats("committed recurrence",a.state,b.state,replica?Gate{0,0,0}:gdn_gate);
     c.floats("committed conv",a.conv,b.conv,replica?Gate{0,0,0}:gdn_gate);
 }
+void exact_hybrid(Checks& c,const tp::TpGdnLayerSnapshot& a,const tp::TpGdnLayerSnapshot& b,bool same_epoch=true) {
+    c.require(a.tokens==b.tokens&&(!same_epoch||a.epoch==b.epoch),"RCCL exact snapshot identity");
+    // Every materialized seam and rank-local diagnostic must retain its bits.
+    // This is stricter than the unchanged original-full numerical contract.
+#define RCCL_EXACT(field) c.exact("RCCL exact " #field,a.field,b.field)
+    RCCL_EXACT(residual);RCCL_EXACT(attention_input);RCCL_EXACT(gdn_output);
+    RCCL_EXACT(mixer_output);RCCL_EXACT(ffn_input);RCCL_EXACT(route_weights);
+    RCCL_EXACT(route_logits);RCCL_EXACT(output);RCCL_EXACT(state);RCCL_EXACT(conv);
+    RCCL_EXACT(shared_output);RCCL_EXACT(shared_gate_logits);RCCL_EXACT(expert_parts);
+    RCCL_EXACT(local_output_partial);RCCL_EXACT(local_shared_partial);RCCL_EXACT(local_expert_parts);
+    RCCL_EXACT(ids);RCCL_EXACT(routed_hidden_q8);RCCL_EXACT(shared_hidden_q8);
+#undef RCCL_EXACT
+}
+void exact_hybrid_layers(Checks& c,const tp::TpGdnLayer& old,const tp::TpGdnLayer& candidate) {
+    for(int rank=0;rank<2;++rank){std::printf("RCCL_EXACT_OWNER rank=%d\n",rank);exact_hybrid(c,old.snapshot(rank),candidate.snapshot(rank));}
+    if(c.failures)throw std::runtime_error("RCCL transport changed old-hybrid bits; timing prohibited");
+}
 std::vector<int> sequence(int first,int count) {std::vector<int> r(count);std::iota(r.begin(),r.end(),first);return r;}
 void mapped_bytes(Checks& c,const char* label,const void* full,const void* shard,size_t rowbytes,
                   const std::vector<int>& rows,int full_device,int shard_device) {
@@ -547,12 +589,13 @@ void committed(Checks& c,const tp::TpGdnLayerSnapshot& a,const tp::TpGdnLayerSna
 }
 
 const char* execution_name(tp::TpGdnExecution mode) {
-    switch(mode){case tp::TpGdnExecution::RuntimeCopies:return "runtime";case tp::TpGdnExecution::Consolidated:return "consolidated";case tp::TpGdnExecution::Captured:return "captured";case tp::TpGdnExecution::FlatCaptured:return "flat";case tp::TpGdnExecution::FlatHcCaptured:return "flat-hc";case tp::TpGdnExecution::ColumnCaptured:return "column";case tp::TpGdnExecution::HybridCaptured:return "hybrid";}
+    switch(mode){case tp::TpGdnExecution::RuntimeCopies:return "runtime";case tp::TpGdnExecution::Consolidated:return "consolidated";case tp::TpGdnExecution::Captured:return "captured";case tp::TpGdnExecution::FlatCaptured:return "flat";case tp::TpGdnExecution::FlatHcCaptured:return "flat-hc";case tp::TpGdnExecution::ColumnCaptured:return "column";case tp::TpGdnExecution::HybridCaptured:return "hybrid";case tp::TpGdnExecution::HybridRcclCaptured:return "hybrid-rccl";}
     throw std::invalid_argument("unknown execution mode");
 }
 std::vector<tp::TpGdnExecution> execution_modes(const Options& o) {
     if(o.benchmark&&!o.execution_explicit)return {tp::TpGdnExecution::Captured,tp::TpGdnExecution::ColumnCaptured};
     if(o.execution=="all")return {tp::TpGdnExecution::RuntimeCopies,tp::TpGdnExecution::Consolidated,tp::TpGdnExecution::Captured,tp::TpGdnExecution::FlatCaptured,tp::TpGdnExecution::FlatHcCaptured,tp::TpGdnExecution::ColumnCaptured};
+    if(o.execution=="hybrid-rccl")return {tp::TpGdnExecution::HybridCaptured,tp::TpGdnExecution::HybridRcclCaptured};
     if(o.execution=="hybrid")return o.benchmark?std::vector<tp::TpGdnExecution>{tp::TpGdnExecution::Captured,tp::TpGdnExecution::HybridCaptured}:std::vector<tp::TpGdnExecution>{tp::TpGdnExecution::HybridCaptured};
     if(o.execution=="column")return {tp::TpGdnExecution::ColumnCaptured};
     if(o.execution=="flat-hc")return {tp::TpGdnExecution::FlatHcCaptured};
@@ -566,10 +609,11 @@ std::vector<tp::TpGdnExecution> execution_modes(const Options& o) {
 void execution_metadata(tp::TpGdnExecution mode) {
     const bool flat=mode==tp::TpGdnExecution::FlatCaptured||mode==tp::TpGdnExecution::FlatHcCaptured;
     const bool column=mode==tp::TpGdnExecution::ColumnCaptured;
-    const bool hybrid=mode==tp::TpGdnExecution::HybridCaptured;
+    const bool hybrid=mode==tp::TpGdnExecution::HybridCaptured||mode==tp::TpGdnExecution::HybridRcclCaptured;
     const bool graph=flat||column||hybrid||mode==tp::TpGdnExecution::Captured;
-    std::printf("EXECUTION_LAYOUT mode=%s full-proposal-graph-launches=%d full-commit-graph-launches=%d tp-proposal-graph-launches-per-rank=%d tp-commit-graph-launches-per-rank=%d positive-keep-only; graph-counts-exclude-copy/host-commands\n",execution_name(mode),graph?1:0,graph?1:0,flat?1:(column?3:(hybrid?4:(graph?5:0))),graph?1:0);
-    if(hybrid)std::printf("HYBRID_TRANSPORT row-attention Y/projection gathers; local-hidden320 column-FFN fused down; three joins/four segments vs row four/five; one fewer join, wall-time saving unmeasured; no new GPU kernel; expert-parts snapshot diagnostic recomputation\n");
+    std::printf("EXECUTION_LAYOUT mode=%s full-proposal-graph-launches=%d full-commit-graph-launches=%d tp-proposal-graph-launches-per-rank=%d tp-commit-graph-launches-per-rank=%d positive-keep-only; graph-counts-exclude-copy/host-commands\n",execution_name(mode),graph?1:0,graph?1:0,(flat||mode==tp::TpGdnExecution::HybridRcclCaptured)?1:(column?3:(hybrid?4:(graph?5:0))),graph?1:0);
+    if(mode==tp::TpGdnExecution::HybridRcclCaptured)std::printf("RCCL_LAYER_TRANSPORT one-complete-proposal-graph-per-rank; Y=raw-mapped-gather output=raw-row-gather FFN=rank0-then-rank1-fadd_rn; no-host-phase-joins; end-of-proposal-plan-status-only; worker-dispatch-and-completion-in-wall; replicated-original-HC; no-new-quantization\n");
+    if(mode==tp::TpGdnExecution::HybridCaptured)std::printf("HYBRID_TRANSPORT row-attention Y/projection gathers; local-hidden320 column-FFN fused down; three joins/four segments vs row four/five; one fewer join, wall-time saving unmeasured; no new GPU kernel; expert-parts snapshot diagnostic recomputation\n");
     if(column)std::printf("COLUMN_TRANSPORT local-Y3072/local-hidden320; fullN partial outputs; two reductions; no Y/hidden gather in timed execution; expert parts snapshot is diagnostic recomputation\n");
     std::printf("HC_OWNERSHIP mode=%s TP=%s full-reference=original-full-HC norm/injection=replicated weight-allocation=full-canonical-BF16-on-each-rank\n",execution_name(mode),mode==tp::TpGdnExecution::FlatHcCaptured?"down160-rows-per-rank/up1280-channels-in-each-of-four-streams-per-rank":"replicated-full-compute");
 }
@@ -619,6 +663,59 @@ void flat_failure_gate(Checks& c,const Options& o,const strata::core::ModelGeome
     }
     std::printf("FLAT_LAYER_FAULT_GATE PASS missing/late both ranks, no output/commit/reset/reuse accepted, clean drain; following correctness uses fresh sessions\n");
 }
+void rccl_lifecycle_gate(Checks& c,const Options& o,const strata::core::ModelGeometry& g,
+                         const tp::TpGdnRankWeights& rank0,const tp::TpGdnRankWeights& rank1,
+                         const std::vector<float>& state,const std::vector<float>& conv) {
+    for(int life=0;life<2;++life){
+        {
+            tp::TpGdnLayer old(g,rank0,&rank1,8,o.mode),candidate(g,rank0,&rank1,8,o.mode);
+            for(int t:{1,8}){old.prepare_captured(t);candidate.prepare_rccl(t,o.rccl);}
+            old.set_execution(tp::TpGdnExecution::HybridCaptured);
+            candidate.set_execution(tp::TpGdnExecution::HybridRcclCaptured);
+            uint64_t epoch=0;
+            for(int first:{0,1})for(int t:{1,8}){
+                old.reset_state(state,conv);candidate.reset_state(state,conv);
+                candidate.set_rccl_launch_for_test(first);
+                // Two evolving calls exercise both captured physical banks on
+                // every T/order, without reset between them. T changes reuse the
+                // same capacity buffers and communicators.
+                for(int step=0;step<2;++step){
+                    const auto input=signed_input(size_t(t)*H*N,7001+life*101+first*31+t*7+step,0.65f);
+                    old.propose(input,t,++epoch);candidate.propose(input,t,epoch);
+                    exact_hybrid_layers(c,old,candidate);
+                    old.commit(t);candidate.commit(t);exact_hybrid_layers(c,old,candidate);
+                }
+            }
+        } // A lifecycle passes only after graph/communicator/buffer destruction.
+        std::printf("RCCL_LAYER_LIFECYCLE_PASS life=%d orders=2 tokens=1,8 banks=2 graph_before_comm=1 comm_before_buffers=1\n",life);
+    }
+}
+void rccl_fault_gate(const Options& o) {
+    strata::core::ModelGeometry g;tp::TpGdnWeights weights0,weights1;std::string error;
+    if(!weights0.load(o.shards,o.pack,g,o.layer,0,0,error,tp::TpGdnPartition::HybridRowsColumns))throw std::runtime_error(error);
+    if(!weights1.load(o.shards,o.pack,g,o.layer,1,1,error,tp::TpGdnPartition::HybridRowsColumns))throw std::runtime_error(error);
+    Checks c;
+    {
+        tp::TpGdnLayer old(g,weights0.weights(),&weights1.weights(),1,o.mode),candidate(g,weights0.weights(),&weights1.weights(),1,o.mode);
+        old.prepare_captured(1);candidate.prepare_rccl(1,o.rccl);
+        old.set_execution(tp::TpGdnExecution::HybridCaptured);candidate.set_execution(tp::TpGdnExecution::HybridRcclCaptured);
+        const auto state=signed_input(STATE,17,0.015f),conv=signed_input(CONV,31,0.12f);
+        old.reset_state(state,conv);candidate.reset_state(state,conv);
+        const int other=1-o.rccl_first;const bool missing=o.rccl_scenario=="missing-rank";
+        candidate.set_rccl_launch_for_test(o.rccl_first,missing?other:-1,missing?-1:other,uint64_t(o.rccl_delay_ms)*1000);
+        const auto input=signed_input(H*N,7901,0.65f);
+        old.propose(input,1,1);
+        std::printf("RCCL_LAYER_FAULT_ARMED scenario=%s launch_rank=%d omitted_or_delayed_rank=%d\n",o.rccl_scenario.c_str(),o.rccl_first,other);
+        candidate.propose(input,1,1);
+        if(missing)throw std::runtime_error("RCCL missing peer unexpectedly produced a successful proposal");
+        exact_hybrid_layers(c,old,candidate);
+        old.commit(1);candidate.commit(1);exact_hybrid_layers(c,old,candidate);
+        const auto next=signed_input(H*N,7902,0.55f);
+        old.propose(next,1,2);candidate.propose(next,1,2);exact_hybrid_layers(c,old,candidate);
+        old.commit(1);candidate.commit(1);exact_hybrid_layers(c,old,candidate);
+    }
+    std::printf("RCCL_LAYER_FAULT_PASS scenario=delayed-rank first=%d delay_ms=%d exact_continuation=1 timing_admitted=0\n",o.rccl_first,o.rccl_delay_ms);
+}
 struct LayerTime {double propose_ms=0,commit_ms=0,total_ms=0;};
 LayerTime timed_layer(tp::TpGdnLayer& layer,const std::array<const float*,2>& input,int tokens,uint64_t epoch) {
     using Clock=std::chrono::steady_clock;
@@ -640,12 +737,13 @@ struct BenchStudy {
     tp::TpGdnLayer& baseline;tp::TpGdnLayer& candidate;
     tp::TpGdnExecution baseline_mode,candidate_mode;
     const char* baseline_label;const char* candidate_label;
+    bool exact_transport=false;
 };
 void sustained_benchmark(Checks& c,const Options& o,const BenchStudy& study,const tp::TpGdnRankWeights& oracle,
                          uint64_t& epoch,const std::vector<float>& state,const std::vector<float>& conv) {
     auto& reference=study.baseline;auto& parallel=study.candidate;const auto mode=study.candidate_mode;
     const bool association=mode==tp::TpGdnExecution::ColumnCaptured;
-    const bool hybrid=mode==tp::TpGdnExecution::HybridCaptured;
+    const bool hybrid=mode==tp::TpGdnExecution::HybridCaptured||mode==tp::TpGdnExecution::HybridRcclCaptured;
     std::printf("BLOCK_STUDY baseline=%s candidate=%s\n",study.baseline_label,study.candidate_label);
     std::printf("BLOCK_SCOPE complete-call evolving-state blocks; shadow pass checks every step, measured blocks download no intermediate outputs/state and check final results only; not full-model throughput\n");
     std::printf("BLOCK_METHOD calls=%d crossovers=%d same preuploaded input sequence in both orders; equal untimed %d-call evolving warm block immediately before each measured arm; initial state reset outside clock; block wall includes all host looping/proposals/commits/sync; no snapshots within block\n",o.block_calls,o.block_trials,o.block_calls);
@@ -662,6 +760,7 @@ void sustained_benchmark(Checks& c,const Options& o,const BenchStudy& study,cons
             shadow_full=reference.snapshot();shadow_tp=parallel.snapshot();
             std::printf("BLOCK_SHADOW mode=%s T=%d step=%d\n",execution_name(mode),tokens,j);
             seams(c,shadow_full,shadow_tp,false,true,association,&oracle,hybrid);seams(c,shadow_tp,parallel.snapshot(1),true);
+            if(study.exact_transport)exact_hybrid_layers(c,reference,parallel);
             if(c.failures)throw std::runtime_error("sustained shadow parity failed; timing prohibited");}
         auto run=[&](tp::TpGdnLayer& layer){
             layer.reset_state(state,conv);const auto start=std::chrono::steady_clock::now();
@@ -678,6 +777,7 @@ void sustained_benchmark(Checks& c,const Options& o,const BenchStudy& study,cons
                 // initial state, token count and number of transitions match.
                 const auto aa=reference.snapshot(),bb=parallel.snapshot();seams(c,aa,bb,false,false,association,&oracle,hybrid);seams(c,bb,parallel.snapshot(1),true);
                 seams(c,shadow_full,aa,false,false);seams(c,shadow_tp,bb,false,false);
+                if(study.exact_transport)for(int rank=0;rank<2;++rank)exact_hybrid(c,reference.snapshot(rank),parallel.snapshot(rank),false);
                 if(c.failures)throw std::runtime_error("measured block final parity failed; timing rejected");
                 fs+=a;ps+=b;full_times.push_back(a/o.block_calls);tp_times.push_back(b/o.block_calls);
             }
@@ -690,7 +790,7 @@ void benchmark(Checks& c,const Options& o,const BenchStudy& study,const tp::TpGd
                uint64_t& epoch,const std::vector<float>& state,const std::vector<float>& conv) {
     auto& reference=study.baseline;auto& parallel=study.candidate;const auto mode=study.candidate_mode;
     const bool association=mode==tp::TpGdnExecution::ColumnCaptured;
-    const bool hybrid=mode==tp::TpGdnExecution::HybridCaptured;
+    const bool hybrid=mode==tp::TpGdnExecution::HybridCaptured||mode==tp::TpGdnExecution::HybridRcclCaptured;
     std::printf("BENCH_STUDY baseline=%s candidate=%s\n",study.baseline_label,study.candidate_label);
     std::printf("\nBENCH_SCOPE real-weight-one-GDN-layer; explicit-arm-labels-above; matched-input-and-state; not-EP-or-full-model-generation\n");
     std::printf("BENCH_METHOD wall=propose_device+commit(T), includes D2D input/host launch/P2P/compute/commit/sync; excludes reset/H2D/weight-load/graph-preparation/snapshots; fixed initialized state, varying matched signed input; keep=T is a workload choice, not measured speculative acceptance\n");
@@ -714,7 +814,7 @@ void benchmark(Checks& c,const Options& o,const BenchStudy& study,const tp::TpGd
             const bool start_tp=((trial+o.warmup)&1)!=0;
             auto one=[&](tp::TpGdnLayer& layer,uint64_t e){layer.reset_state(state,conv);return timed_layer(layer,inputs,tokens,e);};
             double full_sum=0,tp_sum=0;
-            std::array<tp::TpGdnLayerSnapshot,2> full_snap,split_snap,replica_snap;
+            std::array<tp::TpGdnLayerSnapshot,2> full_snap,split_snap,replica_snap,baseline_replica_snap;
             for(int order=0;order<2;++order){
                 if(trial>=0){
                     // Refresh both cards after out-of-band diagnostics. This is
@@ -727,13 +827,15 @@ void benchmark(Checks& c,const Options& o,const BenchStudy& study,const tp::TpGd
                 if(tp_first){b=one(parallel,e);a=one(reference,e);}else{a=one(reference,e);b=one(parallel,e);}
                 std::printf("BENCH_%s baseline=%s candidate=%s mode=%s T=%d trial=%d crossover-leg=%d first=%s baseline-propose-ms=%.6f baseline-commit-ms=%.6f baseline-total-ms=%.6f candidate-propose-ms=%.6f candidate-commit-ms=%.6f candidate-total-ms=%.6f\n",trial<0?"WARMUP":"SAMPLE",study.baseline_label,study.candidate_label,execution_name(mode),tokens,trial,order,tp_first?study.candidate_label:study.baseline_label,a.propose_ms,a.commit_ms,a.total_ms,b.propose_ms,b.commit_ms,b.total_ms);
                 full_snap[order]=reference.snapshot();split_snap[order]=parallel.snapshot();replica_snap[order]=parallel.snapshot(1);
+                if(study.exact_transport)baseline_replica_snap[order]=reference.snapshot(1);
                 full_sum+=a.total_ms;tp_sum+=b.total_ms;
                 if(trial>=0){rt.push_back(a.total_ms);pt.push_back(b.total_ms);rp.push_back(a.propose_ms);pp.push_back(b.propose_ms);rc.push_back(a.commit_ms);pc.push_back(b.commit_ms);}
             }
             // Every measured proposal/commit pair is retained and checked,
             // including the first order leg. Snapshot gaps are outside clocks;
             // explicit untimed warming precedes the next measured pair.
-            for(int order=0;order<2;++order){seams(c,full_snap[order],split_snap[order],false,true,association,&oracle,hybrid);seams(c,split_snap[order],replica_snap[order],true);}
+            for(int order=0;order<2;++order){seams(c,full_snap[order],split_snap[order],false,true,association,&oracle,hybrid);seams(c,split_snap[order],replica_snap[order],true);
+                if(study.exact_transport){exact_hybrid(c,full_snap[order],split_snap[order]);exact_hybrid(c,baseline_replica_snap[order],replica_snap[order]);}}
             if(c.failures)throw std::runtime_error("benchmark parity failed; timing is not an accepted result");
             if(trial>=0)std::printf("BENCH_CROSSOVER baseline=%s candidate=%s mode=%s T=%d trial=%d baseline-mean-ms=%.6f candidate-mean-ms=%.6f crossed-ratio=%.6f\n",study.baseline_label,study.candidate_label,execution_name(mode),tokens,trial,full_sum/2,tp_sum/2,full_sum/tp_sum);
             if(trial>=0)ratio.push_back(full_sum/tp_sum);
@@ -884,7 +986,7 @@ void model_probe(const Options& o) {
 } // namespace
 int main(int argc,char** argv) {
     try {
-        const auto o=parse(argc,argv);if(o.model_probe)std::setvbuf(stdout,nullptr,_IOLBF,0);hc_source_metadata(o);int devices=0;ck(cudaGetDeviceCount(&devices),"device count");
+        const auto o=parse(argc,argv);if(o.model_probe||o.execution=="hybrid-rccl")std::setvbuf(stdout,nullptr,_IOLBF,0);hc_source_metadata(o);int devices=0;ck(cudaGetDeviceCount(&devices),"device count");
         if(devices<2)throw std::runtime_error("two GPUs required; this is not a CPU or single-GPU pass");
         for(int d=0;d<2;++d){cudaDeviceProp prop{};ck(cudaGetDeviceProperties(&prop,d),"device properties");std::printf("device=%d name=%s\n",d,prop.name);int access=0;ck(cudaDeviceCanAccessPeer(&access,d,1-d),"P2P check");if(!access)throw std::runtime_error("bidirectional P2P required");}
         for(const char* flag:{"STRATA_GR_V3","STRATA_GR_SPLIT"}){
@@ -894,13 +996,15 @@ int main(int argc,char** argv) {
         }
         k::gr_set_native_mmvf(true);k::shared_expert_set_native_bf16(true);k::native_mmvq_set_multi_exact(true);k::native_expert_set_mode(o.mode,0);
         if(o.model_probe){model_probe(o);return 0;}
+        if(o.execution=="hybrid-rccl"&&o.rccl_scenario!="normal"){rccl_fault_gate(o);return 0;}
         const auto executions=execution_modes(o);
         const bool use_flat=std::find(executions.begin(),executions.end(),tp::TpGdnExecution::FlatCaptured)!=executions.end()||
                             std::find(executions.begin(),executions.end(),tp::TpGdnExecution::FlatHcCaptured)!=executions.end();
         Checks preflight;if(use_flat)flat_protocol_preflight(preflight);
         const bool use_column=std::find(executions.begin(),executions.end(),tp::TpGdnExecution::ColumnCaptured)!=executions.end();
         const bool use_hybrid=std::find(executions.begin(),executions.end(),tp::TpGdnExecution::HybridCaptured)!=executions.end();
-        const bool profiles=o.profile_flat||o.benchmark;
+        const bool use_rccl=o.execution=="hybrid-rccl";
+        const bool profiles=(o.profile_flat||o.benchmark)&&!use_rccl;
         strata::core::ModelGeometry g;tp::TpGdnWeights full,rank0,rank1,column0,column1,hybrid0,hybrid1;std::string err;
         if(!full.load(o.shards,o.pack,g,o.layer,-1,0,err))throw std::runtime_error("full reference load: "+err);
         if(!rank0.load(o.shards,o.pack,g,o.layer,0,0,err))throw std::runtime_error("rank0 load: "+err);
@@ -925,13 +1029,16 @@ int main(int argc,char** argv) {
         if(use_column)std::printf("COLUMN_REFERENCE_CONTRACT original-full seam/residual/state bounds unchanged; original router IDs exact; router logits/weights use predeclared hc_gate(abs2e-6,scaled2e-5,rms5e-6) only when FFN inputs differ; candidate-same-input original full GU/Q8 exact and complete FFN numerical gate; original-input Q8 differences diagnostic, not exact PASS; diagnostic recomputed expert parts do not establish fused output correctness; engineering parity only\n");
         const auto state=signed_input(STATE,17,0.015f),conv=signed_input(CONV,31,0.12f);
         if(use_flat)flat_failure_gate(c,o,g,rank0.weights(),rank1.weights(),state,conv);
+        if(use_rccl)rccl_lifecycle_gate(c,o,g,hybrid0.weights(),hybrid1.weights(),state,conv);
         tp::TpGdnLayer reference(g,full.weights(),nullptr,8,o.mode),row_parallel(g,rank0.weights(),&rank1.weights(),8,o.mode);
-        std::unique_ptr<tp::TpGdnLayer> column_parallel,hybrid_parallel;
+        std::unique_ptr<tp::TpGdnLayer> column_parallel,hybrid_parallel,rccl_parallel;
         if(use_column)column_parallel=std::make_unique<tp::TpGdnLayer>(g,column0.weights(),&column1.weights(),8,o.mode);
         if(use_hybrid)hybrid_parallel=std::make_unique<tp::TpGdnLayer>(g,hybrid0.weights(),&hybrid1.weights(),8,o.mode);
+        if(use_rccl)rccl_parallel=std::make_unique<tp::TpGdnLayer>(g,hybrid0.weights(),&hybrid1.weights(),8,o.mode);
         auto candidate_for=[&](tp::TpGdnExecution mode)->tp::TpGdnLayer&{
             if(mode==tp::TpGdnExecution::ColumnCaptured)return *column_parallel;
             if(mode==tp::TpGdnExecution::HybridCaptured)return *hybrid_parallel;
+            if(mode==tp::TpGdnExecution::HybridRcclCaptured)return *rccl_parallel;
             return row_parallel;
         };
         for(auto execution:executions){
@@ -940,17 +1047,19 @@ int main(int argc,char** argv) {
                 for(int t=1;t<=8;++t){candidate.prepare_captured(t);if(profiles)candidate.prepare_captured(t,true);}
                 if(o.benchmark||o.calibrate)for(int t:{1,2,4,5,8})reference.prepare_captured(t);
             }
+            if(execution==tp::TpGdnExecution::HybridRcclCaptured)for(int t=1;t<=8;++t)candidate.prepare_rccl(t,o.rccl);
             if(execution==tp::TpGdnExecution::FlatCaptured||execution==tp::TpGdnExecution::FlatHcCaptured){
                 const bool shard_hc=execution==tp::TpGdnExecution::FlatHcCaptured;
                 for(int t=1;t<=8;++t){candidate.prepare_flat(t,shard_hc,false);if(profiles)candidate.prepare_flat(t,shard_hc,true);}
                 if(o.benchmark)for(int t:{1,2,4,5,8})reference.prepare_flat(t,shard_hc,false);
             }
         }
-        uint64_t epoch=0;int cases=0;
+        uint64_t epoch=0;int cases=0,rccl_cases=0;
         std::vector<int32_t> prior_routes;bool routes_changed=false,repeated_ids=false;
         for(auto execution:executions){
+        const bool rccl=execution==tp::TpGdnExecution::HybridRcclCaptured;
         const bool association=execution==tp::TpGdnExecution::ColumnCaptured;
-        const bool hybrid=execution==tp::TpGdnExecution::HybridCaptured;
+        const bool hybrid=execution==tp::TpGdnExecution::HybridCaptured||execution==tp::TpGdnExecution::HybridRcclCaptured;
         auto& parallel=candidate_for(execution);
         const bool profiled=profiles&&(execution==tp::TpGdnExecution::Captured||association||hybrid||execution==tp::TpGdnExecution::FlatCaptured||execution==tp::TpGdnExecution::FlatHcCaptured);
         parallel.set_execution(execution,false);execution_metadata(execution);
@@ -959,7 +1068,9 @@ int main(int argc,char** argv) {
             std::printf("\nCASE T=%d keep=%d epoch=%llu\n",tokens,keep,(unsigned long long)(epoch+1));std::fflush(stdout);
             const auto input=signed_input(size_t(tokens)*H*N,43+tokens*19+keep*7,0.65f);
             reference.reset_state(state,conv);parallel.reset_state(state,conv);
+            if(rccl){hybrid_parallel->reset_state(state,conv);parallel.set_rccl_launch_for_test((tokens+keep)&1);}
             reference.propose(input,tokens,++epoch);parallel.propose(input,tokens,epoch);
+            if(rccl){hybrid_parallel->propose(input,tokens,epoch);exact_hybrid_layers(c,*hybrid_parallel,parallel);}
             auto a=reference.snapshot(),b=parallel.snapshot();seams(c,a,b,false,true,association,&full.weights(),hybrid);seams(c,b,parallel.snapshot(1),true);
             c.exact("proposal leaves state",state,b.state);c.exact("proposal leaves conv",conv,b.conv);
             if(!prior_routes.empty()&&std::vector<int32_t>(b.ids.begin(),b.ids.begin()+K)!=prior_routes)routes_changed=true;
@@ -972,15 +1083,18 @@ int main(int argc,char** argv) {
             c.floats("serial legacy mixer output",legacy.mixer,b.mixer_output,gdn_gate);
             legacy_hc(c,full.weights(),input,b);if(!association&&!hybrid)same_input_ffn_oracle(c,full.weights(),b);
             reference.commit(keep);parallel.commit(keep);a=reference.snapshot();b=parallel.snapshot();committed(c,a,b,legacy);
+            if(rccl){hybrid_parallel->commit(keep);exact_hybrid_layers(c,*hybrid_parallel,parallel);}
             // A new input after EVERY keep catches accidental full-window commit,
             // rejected-tail leakage, stale exchange slots and zero-keep rollback.
             const auto next=signed_input(size_t(2)*H*N,101+tokens*13+keep*23,0.55f);
             reference.propose(next,2,++epoch);parallel.propose(next,2,epoch);
+            if(rccl){hybrid_parallel->propose(next,2,epoch);exact_hybrid_layers(c,*hybrid_parallel,parallel);}
             const auto na=reference.snapshot(),nb=parallel.snapshot();seams(c,na,nb,false,true,association,&full.weights(),hybrid);seams(c,nb,parallel.snapshot(1),true);
             const auto continuation=legacy_gdn(full.weights(),na.attention_input,legacy.state,legacy.conv,2,2);
             c.floats("continuation legacy GDN",continuation.output,nb.gdn_output,gdn_gate);
             c.floats("continuation legacy mixer",continuation.mixer,nb.mixer_output,gdn_gate);
             reference.commit(2);parallel.commit(2);committed(c,reference.snapshot(),parallel.snapshot(),continuation);++cases;
+            if(rccl){hybrid_parallel->commit(2);exact_hybrid_layers(c,*hybrid_parallel,parallel);++rccl_cases;}
         }
         if(profiled){
             // Instrumentation may change scheduling. It never replaces the
@@ -1001,10 +1115,18 @@ int main(int argc,char** argv) {
         c.require(repeated_ids,"multi-token fixtures exercise repeated expert IDs");
         std::printf("\n%s whole-GDN engineering parity cases=%d continuation-cases=%d failures=%d; no full-model inference/quality/performance claim\n",c.failures?"FAIL":"PASS",cases,cases,c.failures);
         if(c.failures)return 1;
+        if(use_rccl){
+            if(rccl_cases!=44)throw std::runtime_error("RCCL all-prefix gate incomplete; timing prohibited");
+            std::printf("RCCL_LAYER_EXACT_GATE_PASS prefix_cases=%d continuation_cases=%d T=1..8 orders=2 banks=2 old_hybrid_tolerance_bits=0 original_full_gates=unchanged\n",rccl_cases,rccl_cases);
+            rccl_parallel->set_rccl_launch_for_test(o.rccl_first);
+        }
         if(o.calibrate)calibration(c,o,g,reference,row_parallel,full.weights(),epoch,state,conv);
         if(o.benchmark){
             std::vector<BenchStudy> studies;
-            if(o.execution=="hybrid"){
+            if(use_rccl){
+                studies.push_back({reference,*rccl_parallel,tp::TpGdnExecution::Captured,tp::TpGdnExecution::HybridRcclCaptured,"single-gpu-captured","tp-hybrid-rccl"});
+                studies.push_back({*hybrid_parallel,*rccl_parallel,tp::TpGdnExecution::HybridCaptured,tp::TpGdnExecution::HybridRcclCaptured,"tp-hybrid-captured","tp-hybrid-rccl",true});
+            }else if(o.execution=="hybrid"){
                 studies.push_back({reference,*hybrid_parallel,tp::TpGdnExecution::Captured,tp::TpGdnExecution::HybridCaptured,"single-gpu-captured","tp-hybrid-captured"});
                 studies.push_back({row_parallel,*hybrid_parallel,tp::TpGdnExecution::Captured,tp::TpGdnExecution::HybridCaptured,"tp-row-captured","tp-hybrid-captured"});
             }else if(!o.execution_explicit){

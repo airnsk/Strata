@@ -36,6 +36,14 @@ void tp_gdn_push_y(const float* src, float* local_full, float* peer_full,
 void tp_gdn_push_output(const float* src, float* local_full, float* peer_full,
                         int T, int rank, void* stream);
 
+// Local-only raw-word gathers after a stream-ordered RCCL receive. local and
+// received_peer are packed T*3072 (Y) or T*1280 (output), full has twice that
+// extent. All three ranges must be distinct. No peer pointer, fence or sum.
+void tp_gdn_gather_y_local(const float* local, const float* received_peer,
+                           float* full, int T, int rank, void* stream);
+void tp_gdn_gather_output_local(const float* local, const float* received_peer,
+                                float* full, int T, int rank, void* stream);
+
 // Routed src[T*10,360 bytes] and shared src[T,360 bytes] contain native q8_1
 // blocks for F/2=320. Copy rank's raw half into corresponding local/peer full
 // rows of 720 bytes (F=640), preserving entry order. All six ranges are disjoint.
