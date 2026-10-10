@@ -112,6 +112,31 @@ void native_expert_grouped_explicit(const NativeExpertLayout& L, const unsigned 
                                     const int32_t* ent_tok, int64_t cap_groups, int64_t cap_entries,
                                     const void* x_q8_1, void* scratch, float* out, void* stream,
                                     const NativeExpertCallOptions& options, int64_t grid_groups = 0);
+/// Opt-in column-TP local FFN producer, K=10, T=1..8, N=2560, F=320 (or full F=640).
+/// Down types: IQ4_NL(20), Q2_0(42). GU type is immaterial: hidden_q8 is the
+/// already computed entry-major q8_1 payload, NOT the scratch allocation base.
+/// Group metadata has exactly cap_entries=T*10 entries and ent_dst is a bijection
+/// to [token*10+route_slot]. Each block builds that inverse, so grouped expert order
+/// never changes routing accumulation order. shared_partial is [T,N] before its
+/// scalar sigmoid gate. No expert-parts tensor is materialized.
+/// Finish each native 32-lane dot before ordered route weighting; preserve 0+hit,
+/// first rounded product, later FMAs and separately rounded shared-gate product.
+/// Column splitting and final rank addition still reassociate the full-model dot;
+/// this API makes NO full-reference bitwise-equality promise.
+/// error must be zeroed by the caller before route planning. Invalid device-side
+/// metadata ORs kNativeDownCombinePlanError and writes safe zeros, never indexes
+/// missing entries. The owner must reject the proposal when error is nonzero.
+/// Inputs, output and error spans must be aligned, sufficiently sized and disjoint
+/// from writable outputs. Shape/layout and visible pointer spans are checked on host.
+/// Optional peer_output is a distinct full-sized peer inbox. Every writer publishes
+/// its local and peer stores with a system fence; consumers require a stream event join.
+constexpr uint32_t kNativeDownCombinePlanError = uint32_t{1} << 30;
+void native_expert_down_combine(const NativeExpertLayout& L, const unsigned long long* grp_ptr,
+                                const int32_t* grp_start, const int32_t* n_groups, const int32_t* ent_dst,
+                                int64_t cap_groups, int64_t cap_entries, const void* hidden_q8,
+                                const float* route_weights, const float* shared_partial, const float* shared_gate,
+                                float* out, uint32_t* error, int n_tokens, void* stream, float* peer_output = nullptr);
+
 /// true: `native_expert_grouped`'s launches before the group stride (STRATA_GROUPED_V1=1 at startup) - a block row
 /// per possible group, SwiGLU and the q8_1 quantization as two kernels over all cap_entries.  Bitwise the same results
 /// (native_grouped_parity checks it); kept for A/B timing.  Set before graph capture; captured graphs keep theirs.

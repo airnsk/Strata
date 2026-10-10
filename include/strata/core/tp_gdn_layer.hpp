@@ -19,6 +19,9 @@ struct TpGdnLayerSnapshot {
     std::vector<float> residual, attention_input, gdn_output, mixer_output, ffn_input;
     std::vector<float> route_weights, route_logits, output, state, conv;
     std::vector<float> shared_output, shared_gate_logits, expert_parts; // shared output is BEFORE sigmoid scale
+    // Input-column diagnostics: one rank's pre-reduction FFN result and
+    // independently recomputed expert partials. Empty for output-row owners.
+    std::vector<float> local_output_partial, local_shared_partial, local_expert_parts;
     std::vector<int32_t> ids;
     std::vector<uint8_t> routed_hidden_q8, shared_hidden_q8;
 };
@@ -27,6 +30,7 @@ enum class TpGdnExecution {
     RuntimeCopies, // validated baseline: individual runtime P2P copies
     Consolidated,  // one system-fenced peer push per exchange/rank
     Captured,      // rank-local compute/push graphs; event edges stay outside
+    ColumnCaptured,// input-column owners, two event-ordered output reductions
     FlatCaptured,  // one graph/rank, bounded device protocol, original HC
     FlatHcCaptured // same graph/protocol, exact HC row-sharded compute
 };
@@ -35,7 +39,7 @@ struct TpGdnLayerProfile {
     uint64_t epoch = 0;
     int tokens = 0, rank = 0;
     std::vector<std::string> labels;
-    std::vector<uint64_t> nanoseconds; // absolute stamps: compare within ONE rank only
+    std::vector<uint64_t> nanoseconds; // absolute stamps: compare within ONE rank only; zero means inactive
     std::array<uint64_t,8> wait_nanoseconds{}, wait_polls{}, wait_status{};
 };
 
@@ -58,10 +62,14 @@ public:
     // Explicit startup-only preparation, before the first proposal. Warms the
     // kernels without committing state, then captures both physical state banks.
     // Allocations and graph instantiation happen here, never in propose/commit.
-    // Prepare each token count that Captured mode will use. Failure is fatal to
+    // Prepare each token count that Captured/ColumnCaptured will use. Optional
+    // profile=true creates separate stamped graphs; timing graphs stay untouched.
+    // Column TP uses three compute segments and two full-output reductions;
+    // row TP retains five segments/four gathers. Failure is fatal to
     // this instance, with no silent fallback to another execution mode.
-    void prepare_captured(int tokens);
+    void prepare_captured(int tokens, bool profile = false);
     // Flat modes require the model-free protocol preflight on the target runtime.
+    // They are incompatible with InputColumns owners.
     // A separate profiled graph is explicit: timestamp overhead is not benchmark
     // evidence. HC splitting changes compute ownership, not weight allocation.
     void prepare_flat(int tokens, bool shard_hc = false, bool profile = false,

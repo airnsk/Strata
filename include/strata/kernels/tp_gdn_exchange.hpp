@@ -44,6 +44,17 @@ void tp_gdn_push_hidden(const uint8_t* routed_src, uint8_t* routed_local, uint8_
                         const uint8_t* shared_src, uint8_t* shared_local, uint8_t* shared_peer,
                         int T, int rank, void* stream);
 
+// Ordered rank0 + rank1 reduction of full-width partials. Both devices MUST pass
+// pointers in the same rank order, irrespective of which one is local. Source
+// delivery must already be ordered by the producer events. No peer reads/spins
+// or system fences are hidden here. Output must be distinct from both inputs.
+/// Capturable bitwise full-partial peer publication. Each writing thread system-fences;
+/// consumer must wait for the producing stream's completion event before reading.
+void tp_gdn_publish_partial(const float* src, float* peer_inbox, int values, void* stream);
+
+void tp_gdn_reduce_partials(const float* rank0, const float* rank1, float* full,
+                            int values, void* stream);
+
 // Flat graph protocol. These are plain integer objects with an explicit lifetime,
 // not std::atomic representations. The owner placement-news a zero-initialized
 // control in hipHostMallocMapped | hipHostMallocCoherent memory before device use.

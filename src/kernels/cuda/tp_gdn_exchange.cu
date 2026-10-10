@@ -121,6 +121,38 @@ void tp_gdn_push_hidden(const uint8_t* routed_src, uint8_t* routed_local, uint8_
 
 }  // namespace strata::kernels
 
+namespace strata::kernels {
+namespace {
+__global__ void publish_partial_kernel(const uint32_t* src, uint32_t* peer, int values) {
+    const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i < values) { peer[i] = src[i]; __threadfence_system(); }
+}
+__global__ void reduce_partials_kernel(const float* rank0, const float* rank1, float* full, int values) {
+    const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i < values) full[i] = __fadd_rn(rank0[i], rank1[i]);
+}
+}
+void tp_gdn_publish_partial(const float* src, float* peer_inbox, int values, void* stream) {
+    if (values <= 0 || values > 8 * 2560 || values % 2560)
+        throw std::invalid_argument("TP GDN partial publication requires T1..8 full N2560 rows");
+    const Span spans[] = {{src, size_t(values) * sizeof(float)}, {peer_inbox, size_t(values) * sizeof(float)}};
+    validate(values / 2560, 0, spans, 2);
+    publish_partial_kernel<<<(values + kThreads - 1) / kThreads, kThreads, 0, (cudaStream_t) stream>>>(
+        reinterpret_cast<const uint32_t*>(src), reinterpret_cast<uint32_t*>(peer_inbox), values);
+    launch_check();
+}
+void tp_gdn_reduce_partials(const float* rank0, const float* rank1, float* full, int values, void* stream) {
+    if (values <= 0 || values > 8 * 2560 || values % 2560 != 0)
+        throw std::invalid_argument("TP GDN reduction requires T1..8 full N2560 rows");
+    const size_t bytes = size_t(values) * sizeof(float);
+    const Span spans[] = {{rank0, bytes}, {rank1, bytes}, {full, bytes}};
+    validate(1, 0, spans, 3);
+    reduce_partials_kernel<<<(values + kThreads - 1) / kThreads, kThreads, 0, (cudaStream_t) stream>>>(
+        rank0, rank1, full, values);
+    launch_check();
+}
+}  // namespace strata::kernels
+
 // Source contract verified against ROCm/clr rocm-7.2.4 amd_hip_atomic.h and
 // amd_device_functions.h, plus ROCm/HIP hip_runtime_api.h. This guard only
 // establishes compilation support; the session must pass the hardware preflight.

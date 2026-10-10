@@ -1,8 +1,9 @@
 # Full-layer TP2 implementation contract for two MI50s
 
-Source review: `8cdc127`, 2026-10-10. This is an implementation specification,
-not a delivered inference mode or a speed result. The existing TP2 harness covers
-routed experts only. The target here is one conversation whose layers execute on
+Initial source review: `8cdc127`, 2026-10-10. This remains a whole-model
+implementation specification, not a delivered inference mode or generation-speed
+result. The opt-in harness now covers one complete non-PLE GDN layer; see
+`TP2_GDN_LAYER_TEST.md` for hardware results and rejected candidates. The target here is one conversation whose layers execute on
 both cards, with static shards of every expert and dense projection. It replaces
 whole-expert ownership, rather than wrapping `PeerExperts` in another exchange.
 
@@ -79,7 +80,30 @@ Each exchange has `(window_epoch, layer, phase, token_count)` identity. Expert
 entries use the same `(token, top-k position, expert id)` order on both ranks.
 Local pointers must never be copied as usable remote-local addresses.
 
-### Routed FFN: literal output-row partition
+### Current acceleration candidate: input-column reductions
+
+The measured captured/event row baseline is retained. The new column-owned
+GDN-layer candidate pairs local GU output rows with down input columns:
+
+- Local GDN Y3072 feeds matching mapped columns of `ssm_out`; every rank
+  produces all N2560 output partials, followed by one ordered rank0+rank1 sum.
+- Local F320 hidden blocks feed full-N routed/shared down partials. Routed down,
+  ordered expert weighting, shared contribution and peer publication are fused
+  without materializing routed `[T,K,N]` parts in the timed path.
+- Each producer publishes to a separate peer inbox for its sublayer. Captured
+  compute segments use ordinary event dependencies, with no mapped-host polling.
+- There are two output reductions and three captured compute segments per rank.
+  HC remains replicated; the rejected HC split is not a prerequisite.
+
+Native weight blocks remain unchanged. The partition changes floating-point
+association: column-mode engineering gates use predeclared numerical bounds
+against the original full reference, exact ordered router IDs, exact candidate-
+same-input GU/Q8 checks and independent FFN reconstruction. Original-reference
+hidden-byte differences are diagnostic, never relabelled exact passes. Original
+row-mode exact gates remain intact. No quality or speed conclusion follows until
+the corresponding hardware and full-model validation passes.
+
+### Reference routed FFN: literal output-row partition
 
 For rank r in {0,1}, source matrices are GU `[F,N]`, down `[N,F]`:
 
@@ -100,8 +124,8 @@ The two shards together must reconstruct every original byte.
 The GU/down dispatch needs independent dimensions and pitches:
 `input_N`, `local_F`, `full_F`, `local_output_N`, `hidden_stride`,
 `output_stride`, explicit gate/up/down pointers and entry metadata. A new
-shard format must not masquerade as a full `ExpertCache` slot. Keep existing
-FFN-column TP tests as an alternative/reference, not the production contract.
+shard format must not masquerade as a full `ExpertCache` slot. Retain both row and column ownership as explicit immutable descriptors; neither
+may silently reinterpret the other's dimensions or byte strides.
 
 At T=8,K=10, each rank sends 28,800 hidden-Q8 bytes and 40,960 combined-output
 bytes per FFN, excluding protocol overhead. For T=1 the totals are 3,600 and
@@ -186,8 +210,8 @@ full-dot arithmetic and avoids column-block boundary problems for the
 noncontiguous V mapping. Quantize only after restoring original global order,
 or scatter independently quantized complete Q8_1 blocks into that order.
 
-Later alternative: column-shard `ssm_out`, repack the matching mapped input
-blocks, and all-reduce N partial outputs. Every gathered 128-value segment
+The current GDN column candidate instead shards `ssm_out`, repacks the matching
+mapped input blocks, and reduces N partial outputs. Every gathered 128-value segment
 must align with that weight format's native block; 256-value formats cannot
 be split/reordered on arbitrary single-head boundaries. Validate block
 alignment or group heads accordingly. Measure the alternative separately.

@@ -41,7 +41,9 @@ struct Rank {
     cudaStream_t compute{},copy{};
     cudaEvent_t ready{},arrival{};
     std::vector<void*> owned;
-    std::array<CapturedWindow,9> captured{};
+    std::array<CapturedWindow,9> captured{}, captured_profile{};
+    bool columns() const {return w.rank>=0 && w.partition==TpGdnPartition::InputColumns;}
+    CapturedWindow& window(int t,bool profile){return profile?captured_profile[t]:captured[t];}
     int state_bank=0;
     bool trace=false;
     unsigned long long* stamps{};
@@ -51,6 +53,7 @@ struct Rank {
     k::TpGdnProtocolControl* control{};
     uint64_t wall_khz=0;
     float *R{},*mixed{},*attn_input{},*ffn_input{},*mixer_output{},*lo{},*rs{},*xn{},*inj[2]{},*bo{},*local_out{};
+    float* peer_partial[2]{}; // distinct attention/FFN receive payloads
     float *state{},*conv{},*candidate_state{},*candidate_conv{},*qkv{},*h{},*gate{},*beta{},*z{},*y{},*full_y{};
     float *logits{},*weights{},*sg{},*su{},*scalar{},*shared{},*parts{};
     uint8_t *xq{},*shared_local_q{},*shared_full_q{},*gu_scratch{},*down_scratch{};
@@ -60,7 +63,7 @@ struct Rank {
     int cap_entries, ptr_offset;
     explicit Rank(const TpGdnRankWeights& weights_in,int cap):w(weights_in),capacity(cap),
         hk(w.rank<0?16:8),hv(w.rank<0?48:24),channels(w.rank<0?C:C/2),
-        value(w.rank<0?V:V/2),ff(w.rank<0?F:F/2),width(w.rank<0?N:N/2),cap_entries(cap*K) {
+        value(w.rank<0?V:V/2),ff(w.rank<0?F:F/2),width(w.rank<0||w.partition==TpGdnPartition::InputColumns?N:N/2),cap_entries(cap*K) {
         select(w.device);
         try {
             check(cudaStreamCreateWithFlags(&compute,cudaStreamNonBlocking),"compute stream");
@@ -72,18 +75,19 @@ struct Rank {
             lo=alloc<float>(cap*320);rs=alloc<float>(cap*HC);xn=alloc<float>(cap*HC*N);
             for(auto& p:inj)p=alloc<float>(cap*HC);
             bo=alloc<float>(cap*N);local_out=w.rank<0?bo:alloc<float>(cap*width);
+            if(columns())for(auto& p:peer_partial)p=alloc<float>(cap*N);
             state=alloc<float>(128*hv*128);conv=alloc<float>(3*channels);
             candidate_state=alloc<float>(128*hv*128);candidate_conv=alloc<float>(3*channels);
             qkv=alloc<float>(cap*channels);h=alloc<float>(cap*channels);gate=alloc<float>(cap*hv);beta=alloc<float>(cap*hv);
-            z=alloc<float>(cap*value);y=alloc<float>(cap*value);full_y=w.rank<0?y:alloc<float>(cap*V);
+            z=alloc<float>(cap*value);y=alloc<float>(cap*value);full_y=w.rank<0||columns()?y:alloc<float>(cap*V);
             logits=alloc<float>(cap*NE);weights=alloc<float>(cap*K);ids=alloc<int32_t>(cap*K);
             sg=alloc<float>(cap*ff);su=alloc<float>(cap*ff);scalar=alloc<float>(cap);shared=alloc<float>(cap*width);
             parts=alloc<float>(cap*K*width);xq=alloc<uint8_t>(cap*(V/32)*36);
-            shared_local_q=alloc<uint8_t>(cap*(ff/32)*36);shared_full_q=w.rank<0?shared_local_q:alloc<uint8_t>(cap*(F/32)*36);
+            shared_local_q=alloc<uint8_t>(cap*(ff/32)*36);shared_full_q=w.rank<0||columns()?shared_local_q:alloc<uint8_t>(cap*(F/32)*36);
             gu_scratch=alloc<uint8_t>(k::native_expert_scratch_bytes(cap_entries,ff));
-            // The direct single-rank reference consumes the same full hidden
-            // buffer in GU/down. Only TP needs a distinct full-width gather.
-            down_scratch=w.rank<0?gu_scratch:alloc<uint8_t>(k::native_expert_scratch_bytes(cap_entries,F));
+            // Full reference and input-column owners consume their own GU
+            // hidden in down. Only output-row TP needs a full-width gather.
+            down_scratch=w.rank<0||columns()?gu_scratch:alloc<uint8_t>(k::native_expert_scratch_bytes(cap_entries,F));
             res=alloc<int32_t>(NE);offsets=alloc<unsigned long long>(NE);keep=alloc<int32_t>(1);plan_error=alloc<uint32_t>(1);
             ptr_offset=((4+(cap_entries+1)+2*cap_entries)+1)&~1;
             plan=alloc<int32_t>(ptr_offset+4*cap_entries+(cap_entries+1)+1);
@@ -111,7 +115,7 @@ struct Rank {
             if(node.graph)cudaGraphDestroy(node.graph);
             node={};
         };
-        for(auto& window:captured){
+        for(auto* windows:{&captured,&captured_profile})for(auto& window:*windows){
             for(auto& node:window.mixer)destroy(node);
             for(auto& node:window.middle)destroy(node);
             for(auto& node:window.commit)destroy(node);
@@ -150,7 +154,7 @@ struct Rank {
         k::gdn_step_norm_multi(state,h,channels,gate,beta,z,w.norm,eps,y,hk,hv,t,nullptr,compute);stamp(5);
     }
     void output_projection(int t) {
-        select(w.device);k::native_quantize_q8_1(full_y,xq,V,t,compute);matrix(w.out,xq,local_out,t);stamp(9);
+        select(w.device);k::native_quantize_q8_1(full_y,xq,w.out.input,t,compute);matrix(w.out,xq,local_out,t);stamp(9);
     }
     void ffn_gu(int t,int mode,bool hc_ready=false) {
         select(w.device);if(!hc_ready)hc(1,t,true);stamp(13);
@@ -171,12 +175,19 @@ struct Rank {
         k::native_expert_grouped_explicit(layout,ptr,starts,plan,dst,tok,t*K,t*K,xq,scratch,parts,compute,{phase,mode});
     }
     uint8_t* hidden(bool full,int t) const {
-        return (full?down_scratch:gu_scratch)+k::native_expert_hidden_q8_offset(t*K,full?F:ff);
+        return (full?down_scratch:gu_scratch)+k::native_expert_hidden_q8_offset(t*K,full&&!columns()?F:ff);
     }
-    void ffn_down(int t,int mode) {
+    void ffn_down(int t,int mode,float* peer_output=nullptr) {
         select(w.device);matrix(w.shared_down,shared_full_q,shared,t);stamp(20);
-        grouped(t,mode,k::NativeExpertPhase::Down,w.down_layout,down_scratch);stamp(21);
-        k::native_moe_combine_multi_hits_gated(parts,weights,shared,scalar,local_out,width,K,t,compute);stamp(22);
+        if(columns()){
+            const int32_t* starts=plan+4;const int32_t* dst=starts+cap_entries+1;
+            const auto* ptr=reinterpret_cast<const unsigned long long*>(plan+ptr_offset);
+            k::native_expert_down_combine(w.down_layout,ptr,starts,plan,dst,t*K,t*K,
+                hidden(false,t),weights,shared,scalar,local_out,plan_error,t,compute,peer_output);stamp(21);stamp(22);
+        }else{
+            grouped(t,mode,k::NativeExpertPhase::Down,w.down_layout,down_scratch);stamp(21);
+            k::native_moe_combine_multi_hits_gated(parts,weights,shared,scalar,local_out,width,K,t,compute);stamp(22);
+        }
     }
     void swap_state_bank() {
         std::swap(state,candidate_state);std::swap(conv,candidate_conv);state_bank^=1;
@@ -217,7 +228,8 @@ struct TpGdnLayer::Impl {
     uint64_t epoch=0;
     bool seen_epoch=false,pending=false,poisoned=false;
     TpGdnExecution execution=TpGdnExecution::RuntimeCopies;
-    std::array<bool,9> prepared{};
+    std::array<bool,9> prepared{},prepared_profile{};
+    bool columns() const {return count==2 && r[0]->columns();}
     bool flat_prepared[9][2][2]{};
     uint64_t flat_timeout[9][2][2]{};
     k::TpGdnProtocolControl* host_control{};
@@ -246,7 +258,7 @@ struct TpGdnLayer::Impl {
         if(cap<1||cap>8)throw std::invalid_argument("TP GDN capacity must be 1..8");
         if(!k::native_expert_call_options_valid({k::NativeExpertPhase::GateUp,m}))
             throw std::invalid_argument("TP GDN invalid native expert mode");
-        if((b&&(a.rank!=0||b->rank!=1||a.device==b->device||a.layer!=b->layer))||(!b&&a.rank!=-1))
+        if((b&&(a.rank!=0||b->rank!=1||a.device==b->device||a.layer!=b->layer||a.partition!=b->partition))||(!b&&a.rank!=-1))
             throw std::invalid_argument("TP GDN needs ranks 0,1 on different devices or rank -1 reference");
         if(a.layer<0||a.layer>=g.n_layers||is_qsa_layer(g,a.layer)||a.layer==1)
             throw std::invalid_argument("TP GDN requires an ordinary non-PLE GDN layer");
@@ -255,18 +267,21 @@ struct TpGdnLayer::Impl {
         const char* resident_bias=std::getenv("STRATA_ROUTE_RESIDENT");
         if(resident_bias&&std::strtof(resident_bias,nullptr)!=0.0f)throw std::invalid_argument("TP GDN does not support residency-biased routing");
         auto validate=[](const TpGdnRankWeights& w) {
-            const bool full=w.rank<0;const int c=full?C:C/2,v=full?V:V/2,f=full?F:F/2,n=full?N:N/2;
+            const bool full=w.rank<0,col=!full&&w.partition==TpGdnPartition::InputColumns;
+            if(w.partition!=TpGdnPartition::OutputRows&&w.partition!=TpGdnPartition::InputColumns)
+                throw std::invalid_argument("TP GDN unknown weight partition");
+            const int c=full?C:C/2,v=full?V:V/2,f=full?F:F/2,n=full||col?N:N/2,df=col?F/2:F;
             auto matrix=[](const TpNativeMatrix& x,int in,int out){if(!x.data||!k::native_mmvq_supported(x.type)||x.input!=in||x.output!=out)throw std::invalid_argument("TP GDN invalid native matrix descriptor");
                 (void)k::native_mmvq_weight_bytes(x.type,in,out);};
-            matrix(w.qkv,N,c);matrix(w.z,N,v);matrix(w.out,V,n);matrix(w.shared_gate,N,f);matrix(w.shared_up,N,f);matrix(w.shared_down,F,n);
+            matrix(w.qkv,N,c);matrix(w.z,N,v);matrix(w.out,col?V/2:V,n);matrix(w.shared_gate,N,f);matrix(w.shared_up,N,f);matrix(w.shared_down,df,n);
             for(const auto& h:w.hc)if(!h.norm||!h.down||!h.up||!h.inject)throw std::invalid_argument("TP GDN missing HC weights");
             if(!w.alpha||!w.beta||!w.router||!w.shared_scalar||!w.dt||!w.a||!w.conv||!w.norm||!w.expert_arena||!w.expert_bytes)
                 throw std::invalid_argument("TP GDN missing layer weights");
-            if(w.gu_layout.n_embd!=N||w.gu_layout.n_ff!=f||w.down_layout.n_embd!=n||w.down_layout.n_ff!=F)
+            if(w.gu_layout.n_embd!=N||w.gu_layout.n_ff!=f||w.down_layout.n_embd!=n||w.down_layout.n_ff!=df)
                 throw std::invalid_argument("TP GDN expert shape mismatch");
             const auto& gu=w.gu_layout;const auto& down=w.down_layout;
             if(!k::native_expert_supported(gu.gu_type,down.d_type,N,F)||gu.bytes!=w.expert_bytes||down.bytes!=w.expert_bytes||
-               gu.gu_row!=k::iq_row_bytes(gu.gu_type,N)||down.d_row!=k::iq_row_bytes(down.d_type,F)||
+               gu.gu_row!=k::iq_row_bytes(gu.gu_type,N)||down.d_row!=k::iq_row_bytes(down.d_type,df)||
                gu.up_off>gu.bytes||static_cast<size_t>(f)*gu.gu_row>gu.up_off||
                static_cast<size_t>(f)*gu.gu_row>gu.bytes-gu.up_off||
                down.down_off>down.bytes||static_cast<size_t>(n)*down.d_row>down.bytes-down.down_off)
@@ -277,6 +292,7 @@ struct TpGdnLayer::Impl {
             check(cudaDeviceCanAccessPeer(&yes,src,dst),"P2P query");if(!yes)throw std::runtime_error("TP GDN requires bidirectional direct P2P");
             select(src);auto e=cudaDeviceEnablePeerAccess(dst,0);if(e==cudaErrorPeerAccessAlreadyEnabled)cudaGetLastError();else check(e,"enable P2P");}
         r[0]=std::make_unique<Rank>(a,cap);if(b)r[1]=std::make_unique<Rank>(*b,cap);
+        if(columns())execution=TpGdnExecution::ColumnCaptured;
     }
     void setup_flat() {
         if(host_control)return;
@@ -358,14 +374,15 @@ struct TpGdnLayer::Impl {
     }
     void phase(Rank& a,int phase_index) {
         select(a.w.device);
+        if(phase_index==0&&a.trace){check(cudaMemsetAsync(a.stamps,0,44*sizeof(uint64_t),a.compute),"clear captured stamps");a.stamp(0);}
         switch(phase_index){
-        case 0:a.mixer(tokens);push_y(a);break;
-        case 1:a.output_projection(tokens);push_output(a);break;
+        case 0:a.mixer(tokens);push_y(a);a.stamp(6);break;
+        case 1:a.stamp(8);a.output_projection(tokens);push_output(a);a.stamp(10);break;
         case 2:
-            check(cudaMemcpyAsync(a.mixer_output,a.bo,tokens*N*sizeof(float),cudaMemcpyDeviceToDevice,a.compute),"mixer seam");
-            a.ffn_gu(tokens,mode);push_hidden(a);break;
-        case 3:a.ffn_down(tokens,mode);push_output(a);break;
-        case 4:a.finish(tokens);break;
+            a.stamp(12);check(cudaMemcpyAsync(a.mixer_output,a.bo,tokens*N*sizeof(float),cudaMemcpyDeviceToDevice,a.compute),"mixer seam");
+            a.ffn_gu(tokens,mode);push_hidden(a);a.stamp(17);break;
+        case 3:a.stamp(19);a.ffn_down(tokens,mode);push_output(a);a.stamp(23);break;
+        case 4:a.stamp(25);a.finish(tokens);a.stamp(27);break;
         default:throw std::logic_error("TP GDN invalid compute phase");
         }
     }
@@ -378,15 +395,46 @@ struct TpGdnLayer::Impl {
         for(int i=0;i<count;++i){auto& a=*r[i];select(a.w.device);
             for(int j=0;j<count;++j)check(cudaStreamWaitEvent(a.compute,r[j]->ready,0),"phase consumer wait");}
     }
+    void column_reduce(Rank& a,int half) {
+        if(count==1)return;
+        k::tp_gdn_reduce_partials(a.w.rank==0?a.local_out:a.peer_partial[half],
+            a.w.rank==0?a.peer_partial[half]:a.local_out,a.bo,tokens*N,a.compute);
+    }
+    void column_phase(Rank& a,int ph) {
+        select(a.w.device);
+        if(ph==0){
+            if(a.trace){check(cudaMemsetAsync(a.stamps,0,44*sizeof(uint64_t),a.compute),"clear column stamps");a.stamp(0);}
+            a.mixer(tokens);a.output_projection(tokens);
+            k::tp_gdn_publish_partial(a.local_out,r[1-a.w.rank]->peer_partial[0],tokens*N,a.compute);a.stamp(10);
+        }else if(ph==1){
+            a.stamp(11);column_reduce(a,0);a.stamp(12);
+            check(cudaMemcpyAsync(a.mixer_output,a.bo,tokens*N*sizeof(float),cudaMemcpyDeviceToDevice,a.compute),"column mixer seam");
+            a.ffn_gu(tokens,mode);a.ffn_down(tokens,mode,r[1-a.w.rank]->peer_partial[1]);a.stamp(23);
+        }else if(ph==2){a.stamp(24);column_reduce(a,1);a.stamp(25);a.finish(tokens);a.stamp(27);}
+        else throw std::logic_error("TP GDN invalid column phase");
+    }
+    void run_column(bool graphs) {
+        for(int ph=0;ph<3;++ph){
+            for(int i=0;i<count;++i){auto& a=*r[i];
+                if(graphs){auto& c=a.window(tokens,profile_enabled);a.launch(ph==0?c.mixer[a.state_bank]:c.middle[ph-1]);}
+                else column_phase(a,ph);
+            }
+            // Each producer has already published its complete partial into
+            // its peer's dedicated sublayer inbox, with a writer-system fence.
+            // Both ready records precede both waits; runtime event acquisition
+            // provides the same peer visibility contract as the tested pushes.
+            if(ph<2)phase_barrier();
+        }
+    }
     void run_segmented(bool graphs) {
         if(graphs&&count==1){
             // A single GPU needs no inter-rank seams: use one complete proposal
             // graph, rather than burdening the reference with TP segmentation.
-            auto& a=*r[0];a.launch(a.captured[tokens].mixer[a.state_bank]);return;
+            auto& a=*r[0];a.launch(a.window(tokens,profile_enabled).mixer[a.state_bank]);return;
         }
         for(int ph=0;ph<5;++ph){
             for(int i=0;i<count;++i){auto& a=*r[i];
-                if(graphs){auto& c=a.captured[tokens];a.launch(ph==0?c.mixer[a.state_bank]:c.middle[ph-1]);}
+                if(graphs){auto& c=a.window(tokens,profile_enabled);a.launch(ph==0?c.mixer[a.state_bank]:c.middle[ph-1]);}
                 else phase(a,ph);
             }
             if(ph<4)phase_barrier();
@@ -474,20 +522,21 @@ struct TpGdnLayer::Impl {
         }
     }
     void run() {
-        if(flat_mode())run_flat();
+        if(columns())run_column(execution==TpGdnExecution::ColumnCaptured);
+        else if(flat_mode())run_flat();
         else if(execution==TpGdnExecution::RuntimeCopies)run_runtime_copies();
-        else run_segmented(execution==TpGdnExecution::Captured);
+        else run_segmented(execution==TpGdnExecution::Captured||execution==TpGdnExecution::ColumnCaptured);
         sync();
         if(flat_mode())check_flat();
         for(int i=0;i<count;++i){uint32_t error=0;select(r[i]->w.device);check(cudaMemcpy(&error,r[i]->plan_error,sizeof(error),cudaMemcpyDeviceToHost),"plan status");
             if(error)throw std::runtime_error("TP GDN static expert plan rejected a route");}
-        last_profiled=flat_mode()&&profile_enabled;pending=true;
+        last_profiled=profile_enabled;pending=true;
     }
     void begin(int t,uint64_t e) {
         healthy();if(pending)throw std::logic_error("TP GDN proposal requires commit(keep), including rollback with keep=0");
         if(t<1||t>capacity)throw std::invalid_argument("TP GDN token count exceeds capacity");
         if(seen_epoch&&e<=epoch)throw std::invalid_argument("TP GDN epoch must increase");
-        if(execution==TpGdnExecution::Captured&&!prepared[t])throw std::logic_error("TP GDN token count was not captured during startup");
+        if((execution==TpGdnExecution::Captured||execution==TpGdnExecution::ColumnCaptured)&&!(profile_enabled?prepared_profile[t]:prepared[t]))throw std::logic_error("TP GDN token count was not captured during startup");
         if(flat_mode()&&!flat_prepared[t][execution==TpGdnExecution::FlatHcCaptured][profile_enabled])
             throw std::logic_error("TP GDN flat token/profile/HC variant was not prepared during startup");
         tokens=t;epoch=e;seen_epoch=true;
@@ -496,42 +545,47 @@ struct TpGdnLayer::Impl {
 
 TpGdnLayer::TpGdnLayer(const ModelGeometry& g,const TpGdnRankWeights& a,const TpGdnRankWeights* b,int cap,int mode):impl_(std::make_unique<Impl>(g,a,b,cap,mode)){}
 TpGdnLayer::~TpGdnLayer()=default;
-void TpGdnLayer::prepare_captured(int tokens) {
+void TpGdnLayer::prepare_captured(int tokens,bool profile) {
     auto& p=*impl_;p.healthy();
     if(tokens<1||tokens>p.capacity)throw std::invalid_argument("TP GDN capture token count exceeds capacity");
-    if(p.prepared[tokens])return;
+    if((profile?p.prepared_profile[tokens]:p.prepared[tokens]))return;
     if(p.seen_epoch||p.pending)throw std::logic_error("TP GDN capture preparation is startup-only, before the first proposal");
-    const auto old_execution=p.execution;const int old_tokens=p.tokens;
+    if(profile)prepare_captured(tokens,false); // ordinary commit graphs are shared
+    const auto old_execution=p.execution;const int old_tokens=p.tokens;const bool old_profile=p.profile_enabled;
     try {
-        p.sync();p.tokens=tokens;p.execution=TpGdnExecution::Consolidated;
-        // Resolve kernel/environment dispatch and first-use tables outside
-        // capture. Verification never writes recurrence/conv. Candidate commit
-        // warmup uses keep=0 and is never published.
+        p.sync();p.tokens=tokens;p.execution=TpGdnExecution::Consolidated;p.profile_enabled=false;
+        // Warm ordinary kernels and dispatch outside capture, without publishing
+        // candidate state. Column owners execute their two-reduction DAG here.
         p.run();p.pending=false;
         const int zero=0;
         for(int i=0;i<p.count;++i){auto& a=*p.r[i];select(a.w.device);
             check(cudaMemcpyAsync(a.keep,&zero,sizeof(zero),cudaMemcpyHostToDevice,a.compute),"capture warmup keep");a.stage_commit(tokens);}
         p.sync();
-        for(int i=0;i<p.count;++i){auto& a=*p.r[i];auto& window=a.captured[tokens];
-            const int original_bank=a.state_bank;
+        for(int i=0;i<p.count;++i){auto& a=*p.r[i];auto& window=a.window(tokens,profile);
+            const int original_bank=a.state_bank;a.trace=profile;
             try{
                 for(int bank=0;bank<2;++bank){
                     if(a.state_bank!=bank)a.swap_state_bank();
                     a.capture(window.mixer[bank],[&]{
                         if(p.count==1)for(int ph=0;ph<5;++ph)p.phase(a,ph);
+                        else if(p.columns())p.column_phase(a,0);
                         else p.phase(a,0);
                     });
-                    a.capture(window.commit[bank],[&]{a.stage_commit(tokens);});
+                    if(!profile)a.capture(window.commit[bank],[&]{a.stage_commit(tokens);});
                 }
                 if(a.state_bank!=original_bank)a.swap_state_bank();
-                if(p.count==2)for(int ph=1;ph<5;++ph)a.capture(window.middle[ph-1],[&]{p.phase(a,ph);});
-            }catch(...){if(a.state_bank!=original_bank)a.swap_state_bank();throw;}
+                if(p.count==2)for(int ph=1;ph<(p.columns()?3:5);++ph)
+                    a.capture(window.middle[ph-1],[&]{if(p.columns())p.column_phase(a,ph);else p.phase(a,ph);});
+                a.trace=false;
+            }catch(...){if(a.state_bank!=original_bank)a.swap_state_bank();a.trace=false;throw;}
         }
-        p.prepared[tokens]=true;p.execution=old_execution;p.tokens=old_tokens;
-    }catch(...){p.execution=old_execution;p.tokens=old_tokens;p.pending=false;p.poisoned=true;throw;}
+        (profile?p.prepared_profile[tokens]:p.prepared[tokens])=true;
+        p.execution=old_execution;p.tokens=old_tokens;p.profile_enabled=old_profile;
+    }catch(...){p.execution=old_execution;p.tokens=old_tokens;p.profile_enabled=old_profile;p.pending=false;p.poisoned=true;throw;}
 }
 void TpGdnLayer::prepare_flat(int tokens,bool shard_hc,bool profile,uint64_t timeout_us) {
     auto& p=*impl_;p.healthy();
+    if(p.columns())throw std::invalid_argument("TP GDN column partition does not use the flat protocol");
     if(tokens<1||tokens>p.capacity||timeout_us<1||timeout_us>10000000)
         throw std::invalid_argument("TP GDN flat preparation requires T within capacity and timeout 1us..10s");
     if(p.flat_prepared[tokens][shard_hc][profile]){
@@ -555,11 +609,15 @@ void TpGdnLayer::prepare_flat(int tokens,bool shard_hc,bool profile,uint64_t tim
 void TpGdnLayer::set_execution(TpGdnExecution mode,bool profile) {
     auto& p=*impl_;p.healthy();
     if(p.pending)throw std::logic_error("TP GDN execution mode cannot change during an outstanding proposal");
-    if(mode!=TpGdnExecution::RuntimeCopies&&mode!=TpGdnExecution::Consolidated&&mode!=TpGdnExecution::Captured&&mode!=TpGdnExecution::FlatCaptured&&mode!=TpGdnExecution::FlatHcCaptured)
+    if(mode!=TpGdnExecution::RuntimeCopies&&mode!=TpGdnExecution::Consolidated&&mode!=TpGdnExecution::Captured&&mode!=TpGdnExecution::ColumnCaptured&&mode!=TpGdnExecution::FlatCaptured&&mode!=TpGdnExecution::FlatHcCaptured)
         throw std::invalid_argument("TP GDN invalid execution mode");
-    if(profile&&mode!=TpGdnExecution::FlatCaptured&&mode!=TpGdnExecution::FlatHcCaptured)
-        throw std::invalid_argument("TP GDN GPU profiling is available only for flat graph variants");
-    p.execution=mode;p.profile_enabled=profile;
+    if(p.columns()&&mode!=TpGdnExecution::ColumnCaptured)
+        throw std::invalid_argument("TP GDN input-column owners require ColumnCaptured execution");
+    if(p.count==2&&!p.columns()&&mode==TpGdnExecution::ColumnCaptured)
+        throw std::invalid_argument("TP GDN ColumnCaptured requires input-column weights");
+    if(profile&&mode!=TpGdnExecution::Captured&&mode!=TpGdnExecution::ColumnCaptured&&mode!=TpGdnExecution::FlatCaptured&&mode!=TpGdnExecution::FlatHcCaptured)
+        throw std::invalid_argument("TP GDN GPU profiling requires a captured graph variant");
+    p.execution=mode;p.profile_enabled=profile;p.last_profiled=false;
 }
 TpGdnExecution TpGdnLayer::execution() const {return impl_->execution;}
 void TpGdnLayer::set_flat_fault_for_test(int missing,int delayed,uint64_t delay) {
@@ -581,8 +639,21 @@ TpGdnLayerProfile TpGdnLayer::profile(int rank) const {
         "hc1_down_done","hc1_lo_push_done","hc1_lo_wait_done","hc1_lo_unpack_done","hc1_up_done","hc1_mix_push_done","hc1_mix_wait_done","hc1_mix_unpack_done"};
     TpGdnLayerProfile out;out.epoch=p.epoch;out.tokens=p.tokens;out.rank=rank;
     out.labels.assign(std::begin(labels),std::end(labels));out.nanoseconds.resize(44);
+    if(!p.flat_mode()){
+        // Inter-segment intervals include event/copy ordering and host arrival
+        // skew; they are not isolated transfer latency. No cross-GPU subtraction.
+        out.labels[6]="y_producer_end";out.labels[8]="y_consumer_begin";
+        out.labels[10]="attn_producer_end";out.labels[12]="attn_consumer_begin";
+        out.labels[17]="hidden_producer_end";out.labels[19]="hidden_consumer_begin";
+        out.labels[23]="ffn_producer_end";out.labels[25]="ffn_consumer_begin";
+        if(p.columns()){
+            out.labels[11]="attn_reduce_begin";out.labels[12]="attn_reduce_done";
+            out.labels[21]="routed_down_combine_done";
+            out.labels[24]="ffn_reduce_begin";out.labels[25]="ffn_reduce_done";
+        }
+    }
     check(cudaMemcpy(out.nanoseconds.data(),a.stamps,44*sizeof(uint64_t),cudaMemcpyDeviceToHost),"GPU phase stamps");
-    if(p.count==2){k::TpGdnProtocolStamp status[8];check(cudaMemcpy(status,a.protocol_stamps,sizeof(status),cudaMemcpyDeviceToHost),"GPU wait stamps");
+    if(p.count==2&&p.flat_mode()){k::TpGdnProtocolStamp status[8];check(cudaMemcpy(status,a.protocol_stamps,sizeof(status),cudaMemcpyDeviceToHost),"GPU wait stamps");
         for(int i=0;i<8;++i){out.wait_nanoseconds[i]=status[i].elapsed_ticks*1000000/a.wall_khz;out.wait_polls[i]=status[i].polls;out.wait_status[i]=status[i].status;}
     }
     return out;
@@ -618,7 +689,7 @@ void TpGdnLayer::commit(int keep) {
     if(keep==0){p.pending=false;return;}
     try{for(int i=0;i<p.count;++i){auto& r=*p.r[i];select(r.w.device);
         check(cudaMemcpyAsync(r.keep,&keep,sizeof(keep),cudaMemcpyHostToDevice,r.compute),"commit count");
-        if(p.execution==TpGdnExecution::Captured||p.flat_mode())r.launch(r.captured[p.tokens].commit[r.state_bank]);
+        if(p.execution==TpGdnExecution::Captured||p.execution==TpGdnExecution::ColumnCaptured||p.flat_mode())r.launch(r.captured[p.tokens].commit[r.state_bank]);
         else r.stage_commit(p.tokens);
     }p.sync();
     // Pointer publication is all-host, after both successful device completions.
@@ -635,18 +706,55 @@ TpGdnLayerSnapshot TpGdnLayer::snapshot(int rank) const {
     auto& r=*p.r[rank];select(r.w.device);TpGdnLayerSnapshot s;s.tokens=p.tokens;s.epoch=p.epoch;
     auto get=[]<class T>(std::vector<T>& out,const T* device,size_t n){out.resize(n);if(n)check(cudaMemcpy(out.data(),device,n*sizeof(T),cudaMemcpyDeviceToHost),"diagnostic read");};
     get(s.residual,r.R,p.tokens*HC*N);get(s.attention_input,r.attn_input,p.tokens*N);get(s.ffn_input,r.ffn_input,p.tokens*N);
-    get(s.gdn_output,r.full_y,p.tokens*V);get(s.output,r.bo,p.tokens*N);get(s.ids,r.ids,p.tokens*K);get(s.route_weights,r.weights,p.tokens*K);
+    if(!p.columns())get(s.gdn_output,r.full_y,p.tokens*V);
+    else{
+        s.gdn_output.resize(p.tokens*V);
+        for(int i=0;i<p.count;++i){auto& a=*p.r[i];select(a.w.device);std::vector<float> local;
+            get(local,a.y,p.tokens*a.value);const auto map=gdn_rank_layout(p.geometry,i);
+            for(int t=0;t<p.tokens;++t)for(int c=0;c<a.value;++c)s.gdn_output[t*V+map.value_rows[c]]=local[t*a.value+c];
+        }
+        select(r.w.device);
+    }
+    get(s.output,r.bo,p.tokens*N);get(s.ids,r.ids,p.tokens*K);get(s.route_weights,r.weights,p.tokens*K);
     get(s.mixer_output,r.mixer_output,p.tokens*N);get(s.route_logits,r.logits,p.tokens*NE);
     get(s.shared_gate_logits,r.scalar,p.tokens);
     s.shared_output.resize(p.tokens*N);s.expert_parts.resize(p.tokens*K*N);
+    if(p.columns()){
+        // Fused inference never materializes expert parts. Recompute only for
+        // diagnostics, from the retained grouped hidden rows and resident plan.
+        for(int i=0;i<p.count;++i){auto& a=*p.r[i];select(a.w.device);
+            a.grouped(p.tokens,p.mode,k::NativeExpertPhase::Down,a.w.down_layout,a.down_scratch);}
+        p.sync();select(r.w.device);
+        get(s.local_output_partial,r.local_out,p.tokens*N);
+        get(s.local_shared_partial,r.shared,p.tokens*N);
+        get(s.local_expert_parts,r.parts,p.tokens*K*N);
+    }
     for(int i=0;i<p.count;++i){auto& a=*p.r[i];select(a.w.device);std::vector<float> sh,part;get(sh,a.shared,p.tokens*a.width);get(part,a.parts,p.tokens*K*a.width);
-        const int offset=p.count==1?0:i*a.width;
-        for(int t=0;t<p.tokens;++t)std::copy_n(sh.data()+t*a.width,a.width,s.shared_output.data()+t*N+offset);
-        for(int e=0;e<p.tokens*K;++e)std::copy_n(part.data()+e*a.width,a.width,s.expert_parts.data()+e*N+offset);
+        if(p.columns()){
+            if(i==0){s.shared_output=sh;s.expert_parts=part;}
+            else{for(size_t j=0;j<sh.size();++j)s.shared_output[j]+=sh[j];
+                for(size_t j=0;j<part.size();++j)s.expert_parts[j]+=part[j];}
+        }else{
+            const int offset=p.count==1?0:i*a.width;
+            for(int t=0;t<p.tokens;++t)std::copy_n(sh.data()+t*a.width,a.width,s.shared_output.data()+t*N+offset);
+            for(int e=0;e<p.tokens*K;++e)std::copy_n(part.data()+e*a.width,a.width,s.expert_parts.data()+e*N+offset);
+        }
     }
     select(r.w.device);
-    get(s.routed_hidden_q8,r.hidden(true,p.tokens),static_cast<size_t>(p.tokens)*K*(F/32)*36);
-    get(s.shared_hidden_q8,r.shared_full_q,static_cast<size_t>(p.tokens)*(F/32)*36);
+    if(!p.columns()){
+        get(s.routed_hidden_q8,r.hidden(true,p.tokens),static_cast<size_t>(p.tokens)*K*(F/32)*36);
+        get(s.shared_hidden_q8,r.shared_full_q,static_cast<size_t>(p.tokens)*(F/32)*36);
+    }else{
+        constexpr size_t half=(F/2/32)*36,full=2*half;
+        s.routed_hidden_q8.resize(static_cast<size_t>(p.tokens)*K*full);
+        s.shared_hidden_q8.resize(static_cast<size_t>(p.tokens)*full);
+        for(int i=0;i<p.count;++i){auto& a=*p.r[i];select(a.w.device);std::vector<uint8_t> hidden,sh;
+            get(hidden,a.hidden(false,p.tokens),static_cast<size_t>(p.tokens)*K*half);
+            get(sh,a.shared_local_q,static_cast<size_t>(p.tokens)*half);
+            for(int e=0;e<p.tokens*K;++e)std::copy_n(hidden.data()+e*half,half,s.routed_hidden_q8.data()+e*full+i*half);
+            for(int t=0;t<p.tokens;++t)std::copy_n(sh.data()+t*half,half,s.shared_hidden_q8.data()+t*full+i*half);
+        }
+    }
     s.state.resize(128u*48u*128u);s.conv.resize(3u*C);
     for(int i=0;i<p.count;++i){auto& a=*p.r[i];select(a.w.device);std::vector<float> st,cv;get(st,a.state,128*a.hv*128);get(cv,a.conv,3*a.channels);
         if(p.count==1){s.state=std::move(st);s.conv=std::move(cv);}else{const auto map=gdn_rank_layout(p.geometry,i);

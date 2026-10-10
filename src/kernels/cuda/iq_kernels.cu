@@ -3678,4 +3678,151 @@ void native_expert_grouped_explicit(const NativeExpertLayout& L, const unsigned 
                                x_q8_1, scratch, out, stream, grid_groups, static_cast<int>(options.phase), mode, false);
 }
 
+// Local column-owned FFN: ordinary independent output tiles, no grid barrier.
+// Each 256-thread block owns one token and 16 output rows. Hidden staging is
+// 10*F/32 q8_1 blocks: 3600 bytes at F320, 7200 at F640, independent of T.
+template<int TD>
+__global__ void __launch_bounds__(256) native_down_combine_kernel(
+    NativeExpertLayout L, const unsigned long long* __restrict__ grp_ptr,
+    const int32_t* __restrict__ grp_start, const int32_t* __restrict__ n_groups,
+    const int32_t* __restrict__ ent_dst, int cap_groups, int cap_entries,
+    const block_q8_1* __restrict__ hidden, const float* __restrict__ weights,
+    const float* __restrict__ shared, const float* __restrict__ shared_gate,
+    float* __restrict__ out, uint32_t* __restrict__ error, float* __restrict__ peer_output) {
+    constexpr int K = 10;
+    __shared__ int entry[K], bad, ng;
+    __shared__ unsigned long long blob[K];
+    __shared__ float route[K];
+    extern __shared__ int hidden_words[];
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int token = blockIdx.y, row0 = blockIdx.x * 16 + warp, row1 = row0 + 8;
+    const int hb = static_cast<int>(L.n_ff / 32), width = static_cast<int>(L.n_embd);
+    if (tid < K) { entry[tid] = -1; blob[tid] = 0; route[tid] = weights[token * K + tid]; }
+    if (tid == 0) {
+        ng = *n_groups;
+        bad = ng <= 0 || ng > cap_groups;
+        if (!bad) bad = grp_start[0] != 0 || grp_start[ng] != cap_entries;
+    }
+    __syncthreads();
+    if (ng > 0 && ng <= cap_groups && tid < ng) {
+        const int begin = grp_start[tid], end = grp_start[tid + 1];
+        const unsigned long long ptr = grp_ptr[tid];
+        if (begin < 0 || end <= begin || end > cap_entries || ptr == 0) atomicOr(&bad, 1);
+        else for (int e = begin; e < end; ++e) {
+            const int dst = ent_dst[e];
+            if (dst < 0 || dst >= cap_entries) { atomicOr(&bad, 1); continue; }
+            if (dst / K == token) {
+                const int slot = dst % K;
+                if (atomicCAS(&entry[slot], -1, e) != -1) atomicOr(&bad, 1);
+                else blob[slot] = ptr;
+            }
+        }
+    }
+    __syncthreads();
+    if (tid < K && entry[tid] < 0) atomicOr(&bad, 1);
+    __syncthreads();
+    if (bad) {
+        if (tid == 0) atomicOr(error, kNativeDownCombinePlanError);
+        if (tid < 16) {
+            const size_t i = size_t(token) * width + blockIdx.x * 16 + tid;
+            out[i] = 0.0f;
+            if (peer_output) { peer_output[i] = 0.0f; __threadfence_system(); }
+        }
+        return;
+    }
+    // Inverse ent_dst above gathers the native grouped hidden rows into routing
+    // slot order. Never assume grouped entry e is token*K+slot.
+    const int words_per_entry = hb * 9;
+    const int* source = reinterpret_cast<const int*>(hidden);
+    for (int i = tid; i < K * words_per_entry; i += 256)
+        hidden_words[i] = source[size_t(entry[i / words_per_entry]) * words_per_entry + i % words_per_entry];
+    __syncthreads();
+    const auto* hq = reinterpret_cast<const block_q8_1*>(hidden_words);
+    const int nb = static_cast<int>(L.n_ff / Fmt<TD>::qk);
+    float sum0 = 0.0f, sum1 = 0.0f;
+#pragma unroll 1
+    for (int slot = 0; slot < K; ++slot) {
+        const auto* base = reinterpret_cast<const uint8_t*>(blob[slot]) + L.down_off;
+        const block_q8_1* x = hq + slot * hb;
+        // Existing native dot calls and the same 32-lane summation tree. Retain
+        // each complete expert dot before weighting; do not weight lane partials.
+        const float a = row_dot<TD>(base + size_t(row0) * L.d_row, x, nb, lane);
+        const float b = row_dot<TD>(base + size_t(row1) * L.d_row, x, nb, lane);
+        if (lane == 0) {
+            const float hit0 = __fadd_rn(0.0f, a), hit1 = __fadd_rn(0.0f, b);
+            if (slot == 0) {
+                sum0 = __fmul_rn(hit0, route[slot]);
+                sum1 = __fmul_rn(hit1, route[slot]);
+            } else {
+                sum0 = __fmaf_rn(hit0, route[slot], sum0);
+                sum1 = __fmaf_rn(hit1, route[slot], sum1);
+            }
+        }
+    }
+    if (lane == 0) {
+        const float gate = __fdividef(1.0f, 1.0f + __expf(-shared_gate[token]));
+        const size_t i0 = size_t(token) * width + row0, i1 = size_t(token) * width + row1;
+        const float shared0 = __fmul_rn(shared[i0], gate), shared1 = __fmul_rn(shared[i1], gate);
+        const float value0 = __fadd_rn(sum0, shared0), value1 = __fadd_rn(sum1, shared1);
+        out[i0] = value0;
+        out[i1] = value1;
+        if (peer_output) {
+            peer_output[i0] = value0;
+            peer_output[i1] = value1;
+            __threadfence_system();
+        }
+    }
+}
+
+void native_expert_down_combine(const NativeExpertLayout& L, const unsigned long long* grp_ptr,
+                                const int32_t* grp_start, const int32_t* n_groups, const int32_t* ent_dst,
+                                int64_t cap_groups, int64_t cap_entries, const void* hidden_q8,
+                                const float* route_weights, const float* shared_partial, const float* shared_gate,
+                                float* out, uint32_t* error, int n_tokens, void* stream, float* peer_output) {
+    if (n_tokens < 1 || n_tokens > 8 || cap_entries != int64_t(n_tokens) * 10 ||
+        cap_groups <= 0 || cap_groups > cap_entries || L.n_embd != 2560 ||
+        (L.n_ff != 320 && L.n_ff != 640) || (L.d_type != 20 && L.d_type != 42) ||
+        L.d_row != iq_row_bytes(L.d_type, L.n_ff) || !L.d_row || L.down_off > L.bytes ||
+        size_t(L.n_embd) > (L.bytes - L.down_off) / L.d_row)
+        throw std::invalid_argument("native down-combine requires valid N2560/F320-or-640/T1..8/K10 IQ4_NL or Q2_0 layout");
+    struct InputSpan { const void* p; size_t bytes; size_t alignment; };
+    const size_t output_bytes = size_t(n_tokens) * size_t(L.n_embd) * sizeof(float);
+    const InputSpan spans[] = {
+        {grp_ptr, size_t(cap_groups) * sizeof(*grp_ptr), alignof(unsigned long long)},
+        {grp_start, size_t(cap_groups + 1) * sizeof(*grp_start), alignof(int32_t)},
+        {n_groups, sizeof(*n_groups), alignof(int32_t)},
+        {ent_dst, size_t(cap_entries) * sizeof(*ent_dst), alignof(int32_t)},
+        {hidden_q8, size_t(cap_entries) * size_t(L.n_ff / 32) * sizeof(block_q8_1), alignof(block_q8_1)},
+        {route_weights, size_t(cap_entries) * sizeof(float), alignof(float)},
+        {shared_partial, output_bytes, alignof(float)}, {shared_gate, size_t(n_tokens) * sizeof(float), alignof(float)},
+        {out, output_bytes, alignof(float)}, {error, sizeof(*error), alignof(uint32_t)},
+        {peer_output, output_bytes, alignof(float)}
+    };
+    const size_t span_count = peer_output ? 11 : 10;
+    for (size_t i = 0; i < span_count; ++i) {
+        const auto& span = spans[i];
+        const uintptr_t begin = reinterpret_cast<uintptr_t>(span.p);
+        if (!span.p || begin % span.alignment || span.bytes > std::numeric_limits<uintptr_t>::max() - begin)
+            throw std::invalid_argument("native down-combine null, unaligned or wrapping span");
+    }
+    for (size_t write = 8; write < span_count; ++write) for (size_t other = 0; other < write; ++other) {
+        const auto a = reinterpret_cast<uintptr_t>(spans[write].p), b = reinterpret_cast<uintptr_t>(spans[other].p);
+        if (a < b + spans[other].bytes && b < a + spans[write].bytes)
+            throw std::invalid_argument("native down-combine output/error overlaps an input or each other");
+    }
+    const dim3 grid(2560 / 16, static_cast<unsigned>(n_tokens));
+    const size_t lds = 10 * size_t(L.n_ff / 32) * sizeof(block_q8_1);
+    const auto* hidden = static_cast<const block_q8_1*>(hidden_q8);
+    const auto s = static_cast<cudaStream_t>(stream);
+    if (L.d_type == 20)
+        native_down_combine_kernel<20><<<grid, 256, lds, s>>>(L, grp_ptr, grp_start, n_groups, ent_dst,
+            static_cast<int>(cap_groups), static_cast<int>(cap_entries), hidden, route_weights,
+            shared_partial, shared_gate, out, error, peer_output);
+    else
+        native_down_combine_kernel<42><<<grid, 256, lds, s>>>(L, grp_ptr, grp_start, n_groups, ent_dst,
+            static_cast<int>(cap_groups), static_cast<int>(cap_entries), hidden, route_weights,
+            shared_partial, shared_gate, out, error, peer_output);
+    check("native_expert_down_combine");
+}
+
 }  // namespace strata::kernels
