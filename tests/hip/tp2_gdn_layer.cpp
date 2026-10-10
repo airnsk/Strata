@@ -39,12 +39,13 @@ void ck(cudaError_t e,const char* where) {
 void on(int d) { ck(cudaSetDevice(d),"set device"); }
 struct Options {
     std::vector<std::string> shards; std::string pack,execution="runtime";
-    int layer=0,mode=8,warmup=3,trials=12,block_calls=16,block_trials=4; bool benchmark=false,profile_flat=false,execution_explicit=false;
+    int layer=0,mode=8,warmup=3,trials=12,block_calls=16,block_trials=4; bool benchmark=false,calibrate=false,profile_flat=false,execution_explicit=false;
 };
 Options parse(int argc,char**argv) {
     Options o;
     for(int i=1;i<argc;++i) {
         const std::string a=argv[i];
+        if(a=="--calibrate"){o.calibrate=true;continue;}
         if(a=="--benchmark"){o.benchmark=true;continue;}
         if(a=="--profile-flat"||a=="--profile-stages"){o.profile_flat=true;continue;}
         if(i+1==argc) throw std::invalid_argument("missing argument for "+a);
@@ -61,7 +62,12 @@ Options parse(int argc,char**argv) {
     if(o.shards.empty() || o.pack.empty() || o.layer<0 || o.layer>=48 || o.layer==1 || o.layer%4==3 ||
        (o.mode!=7 && o.mode!=8) || o.warmup<1 || o.warmup>100 || o.trials<2 || o.trials>1000 || o.block_calls<2 || o.block_calls>64 || o.block_trials<2 || o.block_trials>20 ||
        (o.execution!="runtime"&&o.execution!="consolidated"&&o.execution!="captured"&&o.execution!="flat"&&o.execution!="flat-hc"&&o.execution!="column"&&o.execution!="all"))
-        throw std::invalid_argument("usage: tp2_gdn_layer --pack PACK --gguf SHARD [--gguf SHARD ...] [--layer non-PLE-GDN-index] [--mode 7|8] [--execution runtime|consolidated|captured|column|flat|flat-hc|all] [--benchmark] [--bench-warmup 3] [--bench-trials 12] [--profile-stages] [--bench-block-calls 16] [--bench-block-trials 4]");
+        throw std::invalid_argument("usage: tp2_gdn_layer --pack PACK --gguf SHARD [--gguf SHARD ...] [--layer non-PLE-GDN-index] [--mode 7|8] [--execution runtime|consolidated|captured|column|flat|flat-hc|all] [--benchmark | --calibrate] [--bench-warmup 3] [--bench-trials 12] [--profile-stages] [--bench-block-calls 16] [--bench-block-trials 4]");
+    if(o.calibrate){
+        if(o.benchmark||o.profile_flat||(o.execution_explicit&&o.execution!="captured"))
+            throw std::invalid_argument("--calibrate only supports unprofiled output-row captured; do not combine with --benchmark/--profile-stages/other execution");
+        o.execution="captured";o.execution_explicit=true;
+    }
     return o;
 }
 void hc_source_metadata(const Options& o) {
@@ -716,6 +722,53 @@ void benchmark(Checks& c,const Options& o,const BenchStudy& study,const tp::TpGd
         std::fflush(stdout);
     }
 }
+void calibration(Checks& c,const Options& o,const strata::core::ModelGeometry& g,
+                 tp::TpGdnLayer& full0,tp::TpGdnLayer& row,const tp::TpGdnRankWeights& oracle,
+                 uint64_t& epoch,const std::vector<float>& state,const std::vector<float>& conv) {
+    tp::TpGdnWeights weights1;std::string error;
+    if(!weights1.load(o.shards,o.pack,g,o.layer,-1,1,error))throw std::runtime_error("calibration GPU1 full load: "+error);
+    tp::TpGdnLayer full1(g,weights1.weights(),nullptr,8,o.mode);
+    for(int t:{1,4,8})full1.prepare_captured(t);
+    full0.set_execution(tp::TpGdnExecution::Captured);full1.set_execution(tp::TpGdnExecution::Captured);row.set_execution(tp::TpGdnExecution::Captured);
+    std::printf("CAL_SCOPE version=1 partition=output-rows T=1,4,8 phase-input=frozen-valid-own-trajectory half-input=identical-isolated-concurrent full-input=same-initial-residual-state full-phase-input=own-valid-trajectory phase-wall=launch-event-submit-stream-sync device-span=rank-local-own-graph-or-explicit-peer-join phase-additive=0 full-minus-phase=forbidden snapshot-restore=all-mutable-H2D-outside-timer cache=restore-conditioned calls=single-not-sustained idle-rank-sync=included weights=real hc-router=coarse-combined clocks-power=read-only-runner\n");
+    for(int tokens:{1,4,8}){
+        const auto input=signed_input(size_t(tokens)*H*N,2401+tokens*37,0.65f);
+        Buffer<float> input0(input.size(),0),input1(input.size(),1);input0.set(input);input1.set(input);
+        std::array<tp::TpGdnLayer*,3> layers{&full0,&full1,&row};
+        // Both full-device baselines are tested against row TP, with the same
+        // input, checkpoint and accept-all commit. Reset/download outside clocks.
+        for(int trial=-o.warmup;trial<o.trials;++trial)for(int device=0;device<2;++device){
+            const int d=(trial&1)?1-device:device;
+            std::array<tp::TpGdnLayerSnapshot,4> shots;
+            for(int order=0;order<4;++order){
+                const bool candidate=(order==1||order==2)^bool(trial&1);
+                auto& layer=candidate?row:*layers[d];layer.reset_state(state,conv);
+                const std::array<const float*,2> pointers=candidate?std::array<const float*,2>{input0.p,input1.p}:
+                    std::array<const float*,2>{d?input1.p:input0.p,nullptr};
+                const auto timing=timed_layer(layer,pointers,tokens,++epoch);shots[order]=layer.snapshot();
+                if(candidate)seams(c,shots[order],layer.snapshot(1),true);
+                if(trial>=0)std::printf("CAL_WALL T=%d trial=%d baseline-device=%d order=%d arm=%s propose-ms=%.6f commit-ms=%.6f total-ms=%.6f scope=propose-device-commit-accept-all\n",tokens,trial,d,order,candidate?"row-tp":"full",timing.propose_ms,timing.commit_ms,timing.total_ms);
+            }
+            const int a=(trial&1)?1:0,b=(trial&1)?0:1;
+            seams(c,shots[a],shots[b],false,false,false,&oracle);seams(c,shots[3-a],shots[3-b],false,false,false,&oracle);
+            c.floats("calibration committed state",shots[a].state,shots[b].state,gdn_gate);
+            c.floats("calibration committed conv",shots[a].conv,shots[b].conv,gdn_gate);
+            c.floats("calibration second state",shots[3-a].state,shots[3-b].state,gdn_gate);
+            c.floats("calibration second conv",shots[3-a].conv,shots[3-b].conv,gdn_gate);
+            if(c.failures)throw std::runtime_error("calibration whole-layer parity failed; samples invalid");
+        }
+        // Device ordering alternates by T. Full0/full1 and both row halves have
+        // identical initial residual/checkpoint; within-phase repeat inputs are
+        // byte-identical. No claim that full and row intermediate roundoff agrees.
+        for(int index:tokens==4?std::array<int,3>{1,0,2}:std::array<int,3>{0,1,2}){
+            auto& layer=*layers[index];layer.reset_state(state,conv);
+            const auto samples=layer.calibrate_frozen(input,tokens,o.warmup,o.trials);
+            for(const auto& x:samples)std::printf("CAL_PHASE T=%d owner=%s device0=%d device1=%d phase=%s arm=%s trial=%d order=%d calls=%d restore-H2D-bytes=%llu peer-bytes-per-rank=%llu wall-ms=%.6f rank0-event-ms=%.6f rank1-event-ms=%.6f event-scope=%s replay-output=%s\n",tokens,index==2?"row-tp":"full",layer.device(0),layer.ranks()==2?layer.device(1):-1,x.phase.c_str(),x.arm.c_str(),x.trial,x.order,x.calls,(unsigned long long)x.restored_bytes,(unsigned long long)x.peer_bytes_per_rank,x.wall_ms,x.device_ms[0],x.device_ms[1],x.event_scope.c_str(),x.arm.find("empty")!=std::string::npos?"not-applicable":"exact");
+            std::fflush(stdout);
+        }
+    }
+    std::printf("CAL_GATE PASS whole-layer-parity=checked frozen-compute-output=exact column=excluded scope=one-layer-no-full-model-speedup-claim\n");
+}
 } // namespace
 int main(int argc,char** argv) {
     try {
@@ -758,7 +811,7 @@ int main(int argc,char** argv) {
             auto& candidate=execution==tp::TpGdnExecution::ColumnCaptured?*column_parallel:row_parallel;
             if(execution==tp::TpGdnExecution::Captured||execution==tp::TpGdnExecution::ColumnCaptured){
                 for(int t=1;t<=8;++t){candidate.prepare_captured(t);if(profiles)candidate.prepare_captured(t,true);}
-                if(o.benchmark)for(int t:{1,2,4,5,8})reference.prepare_captured(t);
+                if(o.benchmark||o.calibrate)for(int t:{1,2,4,5,8})reference.prepare_captured(t);
             }
             if(execution==tp::TpGdnExecution::FlatCaptured||execution==tp::TpGdnExecution::FlatHcCaptured){
                 const bool shard_hc=execution==tp::TpGdnExecution::FlatHcCaptured;
@@ -820,6 +873,7 @@ int main(int argc,char** argv) {
         c.require(repeated_ids,"multi-token fixtures exercise repeated expert IDs");
         std::printf("\n%s whole-GDN engineering parity cases=%d continuation-cases=%d failures=%d; no full-model inference/quality/performance claim\n",c.failures?"FAIL":"PASS",cases,cases,c.failures);
         if(c.failures)return 1;
+        if(o.calibrate)calibration(c,o,g,reference,row_parallel,full.weights(),epoch,state,conv);
         if(o.benchmark){
             std::vector<BenchStudy> studies;
             if(!o.execution_explicit){

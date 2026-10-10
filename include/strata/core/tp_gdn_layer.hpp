@@ -43,6 +43,16 @@ struct TpGdnLayerProfile {
     std::array<uint64_t,8> wait_nanoseconds{}, wait_polls{}, wait_status{};
 };
 
+// Test-only frozen-input replay; wall and device-local event spans are separate
+// observables, never additive terms of a whole-layer latency decomposition.
+struct TpGdnCalibrationSample {
+    std::string phase, arm, event_scope;
+    int trial = 0, order = 0, calls = 1;
+    double wall_ms = 0;
+    uint64_t restored_bytes = 0, peer_bytes_per_rank = 0;
+    std::array<float,2> device_ms{};
+};
+
 // One non-PLE GDN layer, one in-flight proposal, T <= 8. Owns all session,
 // stream, exchange and commit storage; immutable weight owners must outlive it.
 // This is a layer component, not a full-model generation adapter.
@@ -76,6 +86,14 @@ public:
                       uint64_t timeout_us = 100000);
     void set_execution(TpGdnExecution mode, bool profile = false);
     TpGdnLayerProfile profile(int rank = 0) const;
+    // Opt-in diagnostic only, output-row owners or full reference. No outstanding
+    // proposal. Snapshots all mutable rank storage before each valid phase, then
+    // restores outside each timed replay. Graphs contain compute OR peer pushes,
+    // never stale-input consumers. Exact replay output gates throw on failure.
+    // Restores original storage/state; no commit, bank publication, or epoch change.
+    std::vector<TpGdnCalibrationSample> calibrate_frozen(
+        const std::vector<float>& residual, int tokens, int warmup, int trials);
+
     // Diagnostic fault injection, next flat proposal only. No successful output
     // or commit is permitted after timeout/abort. Missing rank is not launched;
     // delayed rank is launched after host delay. Never use in inference.

@@ -41,6 +41,7 @@ struct Rank {
     cudaStream_t compute{},copy{};
     cudaEvent_t ready{},arrival{};
     std::vector<void*> owned;
+    std::vector<size_t> owned_bytes; // diagnostic snapshot extents; excludes immutable weights
     std::array<CapturedWindow,9> captured{}, captured_profile{};
     bool columns() const {return w.rank>=0 && w.partition==TpGdnPartition::InputColumns;}
     CapturedWindow& window(int t,bool profile){return profile?captured_profile[t]:captured[t];}
@@ -101,7 +102,7 @@ struct Rank {
         } catch(...) { release();throw; }
     }
     template<class T> T* alloc(size_t n) {
-        void* p=nullptr;check(cudaMalloc(&p,n*sizeof(T)),"allocation");owned.push_back(p);
+        void* p=nullptr;check(cudaMalloc(&p,n*sizeof(T)),"allocation");owned.push_back(p);owned_bytes.push_back(n*sizeof(T));
         check(cudaMemset(p,0,n*sizeof(T)),"initial zero");return static_cast<T*>(p);
     }
     void release() noexcept {
@@ -313,7 +314,7 @@ struct TpGdnLayer::Impl {
             a.hc_local_lo=a.alloc<float>(capacity*160);a.hc_local_mixed=a.alloc<float>(capacity*1280);
             if(count==2)for(int phase=0;phase<8;++phase){void* ptr=nullptr;
                 check(hipExtMallocWithFlags(&ptr,capacity*per_token[phase],hipDeviceMallocUncached),"uncached peer inbox");
-                a.owned.push_back(ptr);a.inbox[phase]=static_cast<uint8_t*>(ptr);
+                a.owned.push_back(ptr);a.owned_bytes.push_back(capacity*per_token[phase]);a.inbox[phase]=static_cast<uint8_t*>(ptr);
                 check(cudaMemset(ptr,0,capacity*per_token[phase]),"initialize peer inbox");
             }
             check(cudaDeviceSynchronize(),"flat initialization fence");
@@ -583,6 +584,152 @@ void TpGdnLayer::prepare_captured(int tokens,bool profile) {
         p.execution=old_execution;p.tokens=old_tokens;p.profile_enabled=old_profile;
     }catch(...){p.execution=old_execution;p.tokens=old_tokens;p.profile_enabled=old_profile;p.pending=false;p.poisoned=true;throw;}
 }
+std::vector<TpGdnCalibrationSample> TpGdnLayer::calibrate_frozen(
+        const std::vector<float>& residual,int tokens,int warmup,int trials) {
+    auto& p=*impl_;p.healthy();
+    if(p.pending||p.columns()||p.profile_enabled||p.flat_mode()||tokens<1||tokens>p.capacity||
+       residual.size()!=size_t(tokens)*HC*N||warmup<1||trials<2)
+        throw std::invalid_argument("frozen calibration requires idle unprofiled output-row/full layer and valid input");
+    // Snapshot all allocations, including BOTH recurrent banks, scratch, routing
+    // plan/pointers, status and injection values. No immutable weights copied.
+    // Backups are host-owned: restoration traffic is deliberately outside clocks.
+    struct Saved {
+        Rank& a;std::vector<std::vector<uint8_t>> data;
+        explicit Saved(Rank& rank):a(rank){
+            select(a.w.device);a.sync();
+            if(a.owned.size()!=a.owned_bytes.size())throw std::logic_error("calibration allocation manifest mismatch");
+            for(size_t j=0;j<a.owned.size();++j){data.emplace_back(a.owned_bytes[j]);
+                check(cudaMemcpy(data.back().data(),a.owned[j],data.back().size(),cudaMemcpyDeviceToHost),"freeze phase storage");}
+        }
+        void verify(const std::vector<void*>& exclude={}){select(a.w.device);
+            for(size_t j=0;j<data.size();++j)if(std::find(exclude.begin(),exclude.end(),a.owned[j])==exclude.end()){
+                std::vector<uint8_t> actual(data[j].size());
+                check(cudaMemcpy(actual.data(),a.owned[j],actual.size(),cudaMemcpyDeviceToHost),"verify frozen allocation");
+                if(actual!=data[j])throw std::runtime_error("frozen replay allocation mismatch rank="+std::to_string(a.w.rank)+" allocation="+std::to_string(j));
+            }
+        }
+        void restore(){select(a.w.device);
+            for(size_t j=0;j<data.size();++j){
+                check(cudaMemcpyAsync(a.owned[j],data[j].data(),data[j].size(),cudaMemcpyHostToDevice,a.compute),"restore frozen storage");
+            }
+            a.sync();
+        }
+    };
+    struct Replay {
+        Rank& a;CapturedNode compute,push,empty;cudaEvent_t begin{},end{};
+        explicit Replay(Rank& rank):a(rank){select(a.w.device);check(cudaEventCreate(&begin),"calibration start event");
+            try{check(cudaEventCreate(&end),"calibration end event");}
+            catch(...){cudaEventDestroy(begin);begin={};throw;}
+        }
+        ~Replay(){cudaSetDevice(a.w.device);cudaStreamSynchronize(a.compute);
+            for(auto* n:{&compute,&push,&empty}){if(n->executable)cudaGraphExecDestroy(n->executable);if(n->graph)cudaGraphDestroy(n->graph);}
+            if(begin)cudaEventDestroy(begin);
+            if(end)cudaEventDestroy(end);}
+    };
+    std::array<std::unique_ptr<Saved>,2> original;
+    const int old_tokens=p.tokens;const auto old_execution=p.execution;
+    std::vector<TpGdnCalibrationSample> result;
+    try {
+        p.sync();for(int i=0;i<p.count;++i)original[i]=std::make_unique<Saved>(*p.r[i]);
+        p.tokens=tokens;p.execution=TpGdnExecution::Consolidated;
+        for(int i=0;i<p.count;++i){auto& a=*p.r[i];select(a.w.device);
+            check(cudaMemcpyAsync(a.R,residual.data(),residual.size()*sizeof(float),cudaMemcpyHostToDevice,a.compute),"calibration input");}p.sync();
+        const char* names[]={"hc-attn-qkv-gdn","out-projection","hc-ffn-router-gu","down-combine","final-write"};
+        for(int ph=0;ph<5;++ph){
+            std::array<std::unique_ptr<Saved>,2> frozen,produced;
+            std::array<std::unique_ptr<Replay>,2> replay;
+            auto destinations=[&](Rank& a)->std::vector<std::pair<void*,size_t>>{
+                if(p.count==1||ph==4)return {};
+                if(ph==0)return {{a.full_y,size_t(tokens)*V*sizeof(float)}};
+                if(ph==1||ph==3)return {{a.bo,size_t(tokens)*N*sizeof(float)}};
+                return {{a.hidden(true,tokens),size_t(tokens)*K*(F/32)*36},
+                        {a.shared_full_q,size_t(tokens)*(F/32)*36}};
+            };
+            auto excluded=[&](Rank& a)->std::vector<void*>{
+                if(p.count==1||ph==4)return {};
+                if(ph==0)return {a.full_y};
+                if(ph==1||ph==3)return {a.bo};
+                return {a.down_scratch,a.shared_full_q};
+            };
+            auto compute=[&](Rank& a){
+                if(ph==0)a.mixer(tokens);
+                else if(ph==1)a.output_projection(tokens);
+                else if(ph==2){check(cudaMemcpyAsync(a.mixer_output,a.bo,tokens*N*sizeof(float),cudaMemcpyDeviceToDevice,a.compute),"calibration mixer seam");a.ffn_gu(tokens,p.mode);}
+                else if(ph==3)a.ffn_down(tokens,p.mode);
+                else a.finish(tokens);
+            };
+            auto push=[&](Rank& a){if(ph==0)p.push_y(a);else if(ph==1||ph==3)p.push_output(a);else if(ph==2)p.push_hidden(a);};
+            // Materialize valid normal phase results and all gather destinations
+            // before any isolated replay. The peer never runs as a prerequisite.
+            for(int i=0;i<p.count;++i)frozen[i]=std::make_unique<Saved>(*p.r[i]);
+            for(int i=0;i<p.count;++i)p.phase(*p.r[i],ph);
+            if(ph<4)p.phase_barrier();
+            p.sync();
+            for(int i=0;i<p.count;++i){auto& a=*p.r[i];select(a.w.device);produced[i]=std::make_unique<Saved>(a);
+                replay[i]=std::make_unique<Replay>(a);a.capture(replay[i]->compute,[&]{compute(a);});
+                a.capture(replay[i]->push,[&]{push(a);});a.capture(replay[i]->empty,[]{});
+            }
+            auto restore=[&]{for(int i=0;i<p.count;++i)frozen[i]->restore();};
+            auto verify=[&](int mask,int kind){for(int i=0;i<p.count;++i)if(mask&(1<<i)){
+                auto& a=*p.r[i];produced[i]->verify(kind==0?excluded(a):std::vector<void*>{});
+                uint32_t error=0;select(a.w.device);check(cudaMemcpy(&error,a.plan_error,sizeof(error),cudaMemcpyDeviceToHost),"calibration plan status");
+                if(error)throw std::runtime_error("calibration resident plan failed");}};
+            auto measure=[&](const char* arm,int mask,int kind,int trial,int order){
+                if(kind==1){
+                    for(int i=0;i<p.count;++i)produced[i]->restore();
+                    for(int i=0;i<p.count;++i){auto& a=*p.r[i];select(a.w.device);
+                        for(const auto& dst:destinations(a))check(cudaMemsetAsync(dst.first,(trial&1)?0x5a:0xa5,dst.second,a.compute),"poison gather destination");}p.sync();
+                }else restore();
+                // Compute end events follow their graph immediately, before another
+                // rank is submitted. Joined controls end after both-rank joins.
+                // Wall includes event submissions, launch(es), joins and stream
+                // completion. Empty graph control exposes this measurement floor.
+                const bool joined=kind!=0&&p.count==2;
+                const auto start=std::chrono::steady_clock::now();
+                for(int i=0;i<p.count;++i)if(mask&(1<<i)){auto& q=*replay[i];select(q.a.w.device);
+                    check(cudaEventRecord(q.begin,q.a.compute),"calibration begin");
+                    q.a.launch(kind==0?q.compute:kind==1?q.push:q.empty);
+                    if(!joined)check(cudaEventRecord(q.end,q.a.compute),"calibration compute end");
+                }
+                if(joined){
+                    p.phase_barrier();
+                    for(int i=0;i<p.count;++i)if(mask&(1<<i)){auto& q=*replay[i];select(q.a.w.device);check(cudaEventRecord(q.end,q.a.compute),"calibration joined end");}
+                }
+                p.sync();const auto end=std::chrono::steady_clock::now();
+                TpGdnCalibrationSample sample;sample.phase=names[ph];sample.arm=arm;sample.event_scope=joined?"graph-plus-peer-event-join":"adjacent-own-graph-events";sample.trial=trial;sample.order=order;
+                sample.wall_ms=std::chrono::duration<double,std::milli>(end-start).count();
+                for(int i=0;i<p.count;++i)for(size_t bytes:p.r[i]->owned_bytes)sample.restored_bytes+=bytes;
+                if(kind==1){const uint64_t per_token[]={12288,5120,3960,5120,0};sample.peer_bytes_per_rank=per_token[ph]*tokens;}
+                for(int i=0;i<p.count;++i)if(mask&(1<<i)){select(p.r[i]->w.device);check(cudaEventElapsedTime(&sample.device_ms[i],replay[i]->begin,replay[i]->end),"calibration event span");}
+                if(kind<2)verify(mask,kind);
+                if(trial>=0)result.push_back(sample);
+            };
+            for(int trial=-warmup;trial<trials;++trial){
+                if(p.count==1){measure("full",1,0,trial,0);measure("empty-graph",1,2,trial,1);}
+                else {
+                    // Each crossover includes isolated and simultaneous replay
+                    // in ABBA order. Alternate isolated rank order as well.
+                    for(int order=0;order<4;++order){const bool alone=order==0||order==3;
+                        if(alone){for(int j=0;j<2;++j){const int i=(trial&1)?1-j:j;measure(i?"half1":"half0",1<<i,0,trial,order);}}
+                        else measure("concurrent-halves",3,0,trial,order);
+                    }
+                    if(ph<4){if(trial&1){measure("event-join-empty-graphs",3,2,trial,4);measure("push-and-event-join",3,1,trial,5);}
+                        else{measure("push-and-event-join",3,1,trial,4);measure("event-join-empty-graphs",3,2,trial,5);}}
+                }
+            }
+            // Rebuild the valid trajectory for the next phase only AFTER all
+            // replays; no timed arm consumes previous replay output.
+            restore();for(int i=0;i<p.count;++i)p.phase(*p.r[i],ph);
+            if(ph<4)p.phase_barrier();
+            p.sync();
+        }
+        for(int i=0;i<p.count;++i)original[i]->restore();
+        for(int i=0;i<p.count;++i)original[i]->verify();
+        p.tokens=old_tokens;p.execution=old_execution;
+        return result;
+    }catch(...){p.tokens=old_tokens;p.execution=old_execution;p.poison_and_drain();throw;}
+}
+
 void TpGdnLayer::prepare_flat(int tokens,bool shard_hc,bool profile,uint64_t timeout_us) {
     auto& p=*impl_;p.healthy();
     if(p.columns())throw std::invalid_argument("TP GDN column partition does not use the flat protocol");

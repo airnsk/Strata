@@ -275,3 +275,64 @@ These are opt-in settings on one rig, not defaults.
 
 With a layer split, `--batch N --batch-groups G --trim-stage-weights` decodes several conversations together and
 pipelines them through the cards: see [BATCHING.md](BATCHING.md).
+
+## MI50 output-row TP calibration (diagnostic only)
+
+`tools/run_tp2_gdn_mi50.sh` accepts `--calibrate`. It selects captured output-row
+TP, runs the existing all-prefix/continuation correctness gate first, and refuses
+column/flat modes, `--benchmark`, or profiling in the same run. It changes no
+production kernels, defaults, power limits, or clocks. The runner records
+read-only clock/power/utilization telemetry before and after the test.
+
+Use the existing locally built image and the same pack/GGUF arguments as the
+whole-GDN correctness test. For example (replace the two model filenames):
+
+```bash
+BUILD_JOBS=48 TP2_TIMEOUT=1200 bash tools/run_tp2_gdn_mi50.sh \
+  sha256:1947f7b9ea3514f137b3cabe5dc4f48ddabeb9c7bac78b4959a03b7dc7fcf4ca \
+  /mnt/nvme/models \
+  --pack /models/PACK --gguf /models/SHARD \
+  --calibrate --bench-warmup 3 --bench-trials 4
+```
+
+Pass every GGUF shard with another `--gguf`. Both GPUs must be idle. The image
+must already exist; the runner never pulls it. The 1200-second timeout bounds
+GPU execution, not compilation. This mode loads one extra full-layer weight set
+on GPU1 so both devices get their own full single-GPU baseline.
+
+At T=1,4,8, `CAL_WALL` records matched full-versus-row-TP ABBA/BAAB trials with
+identical residual, state and convolution checkpoints. It includes complete
+`propose_device + commit(T)` wall time, and checks each result. Reset, upload,
+graph preparation and snapshot download are outside that interval.
+
+`CAL_PHASE` records five coarse compute-only phases: HC-attention/QKV/GDN,
+output projection, HC-FFN/router/GU, down/combine, and final HC write. Each phase
+gets valid inputs from an ordered whole-layer trajectory. All mutable allocations
+(including both state banks, routing plans and gathered hidden/Y) are frozen and
+restored before every replay, outside the timer. Isolated rank0, isolated rank1,
+and simultaneous halves use byte-identical inputs in ABBA order. Every replay
+checks all mutable bytes against the valid phase, except destinations filled only
+by the deliberately omitted peer pushes. Full-GPU phases use their own valid
+trajectory from the same initial checkpoint; intermediate full/TP roundoff is
+not claimed to be identical.
+
+Push-plus-event-join and empty-graph/event-join controls are separate measurements.
+Pushes use immutable valid model payloads; receive spans are poisoned before each
+trial and checked exactly after both streams complete. Per-rank payloads for the
+four exchanges are T times 12288, 5120, 3960, and 5120 bytes respectively. Empty
+controls expose submission/acquisition overhead, but are not automatically
+subtracted. `rank0-event-ms` and `rank1-event-ms` are local event spans; inactive
+ranks report zero. Compute end events are submitted immediately after their own
+graph, before the other rank is submitted. Joined controls include peer-event
+acquisition and host submission skew; `event-scope` distinguishes these. Wall spans include event
+submissions, graph launches, joins and stream synchronization, including the idle
+rank's synchronization in isolated arms. No cross-device timestamps are compared.
+
+This is single-call, restore-conditioned calibration. H2D restoration changes
+cache/thermal conditions; it is not sustained decode, pure kernel time, or a P2P
+bandwidth benchmark. Do not sum phase times or subtract them from `CAL_WALL`.
+The coarse phases do not identify a separate HC or router fraction. Keep the raw
+`CAL_SCOPE`, `CAL_WALL`, `CAL_PHASE`, telemetry and final `CAL_GATE PASS` together;
+any failure or timeout invalidates the timing run. GPU compilation/execution is
+still required on the target machine; host-only checks do not establish parity
+or performance.
