@@ -54,6 +54,16 @@ struct TpGdnCalibrationSample {
     std::array<float,2> device_ms{};
 };
 
+// Fine calibration coordinates both full-device references and the hybrid
+// candidate so phase inputs and crossover order are actually matched.
+struct TpGdnFineCalibrationSample : TpGdnCalibrationSample {
+    std::string owner;
+    std::array<int,2> devices{{-1,-1}};
+    uint64_t input_hash = 0; // FNV-1a of canonical phase inputs, not weight identity
+    int groups = 0;
+    std::vector<int> group_entries; // canonical resident-plan entry counts, group order
+};
+
 // One non-PLE GDN layer, one in-flight proposal, T <= 8. Owns all session,
 // stream, exchange and commit storage; immutable weight owners must outlive it.
 // This is a layer component, not a full-model generation adapter.
@@ -94,6 +104,20 @@ public:
     // never stale-input consumers. Exact replay output gates throw on failure.
     // Restores original storage/state; no commit, bank publication, or epoch change.
     std::vector<TpGdnCalibrationSample> calibrate_frozen(
+        const std::vector<float>& residual, int tokens, int warmup, int trials);
+
+    // Bounded test-only coefficient probe, T=1 or 8. All layers must be idle,
+    // unprofiled, prepared, and reset to the same checkpoint by the caller.
+    // full0/full1 are unsharded references on the hybrid ranks' devices.
+    // Canonical full0 seams are transplanted before phase snapshots; hidden Q8
+    // is sliced by FFN ownership. Each replay restores ALL mutable allocations
+    // outside timing and requires byte-identical owner-local results.
+    // Down includes combine: full uses grouped Down plus combine, hybrid uses
+    // its actual fused local down/combine kernel, without peer publication.
+    // Standalone exchange controls are not an additive fused-peer cost estimate.
+    // No commits, epochs, bank publication, or production-path changes.
+    static std::vector<TpGdnFineCalibrationSample> calibrate_fine_frozen(
+        TpGdnLayer& full0, TpGdnLayer& full1, TpGdnLayer& hybrid,
         const std::vector<float>& residual, int tokens, int warmup, int trials);
 
     // Diagnostic fault injection, next flat proposal only. No successful output

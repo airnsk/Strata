@@ -6,6 +6,7 @@
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/tp_gdn_weights.hpp"
 #include "strata/kernels/fused_gdn.hpp"
+#include "strata/kernels/fused_gr.hpp"
 #include "strata/kernels/gr.hpp"
 #include "strata/kernels/tp_gdn_exchange.hpp"
 #include "strata/kernels/shared_expert.hpp"
@@ -39,13 +40,15 @@ void ck(cudaError_t e,const char* where) {
 void on(int d) { ck(cudaSetDevice(d),"set device"); }
 struct Options {
     std::vector<std::string> shards; std::string pack,execution="runtime";
-    int layer=0,mode=8,warmup=3,trials=12,block_calls=16,block_trials=4; bool benchmark=false,calibrate=false,profile_flat=false,execution_explicit=false;
+    int layer=0,mode=8,warmup=3,trials=12,block_calls=16,block_trials=4; bool benchmark=false,calibrate=false,model_probe=false,profile_flat=false,execution_explicit=false;
+    bool warmup_explicit=false,trials_explicit=false;
 };
 Options parse(int argc,char**argv) {
     Options o;
     for(int i=1;i<argc;++i) {
         const std::string a=argv[i];
         if(a=="--calibrate"){o.calibrate=true;continue;}
+        if(a=="--model-probe"){o.model_probe=true;continue;}
         if(a=="--benchmark"){o.benchmark=true;continue;}
         if(a=="--profile-flat"||a=="--profile-stages"){o.profile_flat=true;continue;}
         if(i+1==argc) throw std::invalid_argument("missing argument for "+a);
@@ -56,17 +59,26 @@ Options parse(int argc,char**argv) {
         else if(a=="--layer" || a=="--mode" || a=="--bench-warmup" || a=="--bench-trials" || a=="--bench-block-calls" || a=="--bench-block-trials") {
             size_t used=0; int n=std::stoi(v,&used);
             if(used!=v.size()) throw std::invalid_argument("invalid integer");
-            if(a=="--layer")o.layer=n;else if(a=="--mode")o.mode=n;else if(a=="--bench-warmup")o.warmup=n;else if(a=="--bench-trials")o.trials=n;else if(a=="--bench-block-calls")o.block_calls=n;else o.block_trials=n;
+            if(a=="--layer")o.layer=n;else if(a=="--mode")o.mode=n;else if(a=="--bench-warmup"){o.warmup=n;o.warmup_explicit=true;}else if(a=="--bench-trials"){o.trials=n;o.trials_explicit=true;}else if(a=="--bench-block-calls")o.block_calls=n;else o.block_trials=n;
         } else throw std::invalid_argument("unknown option "+a);
     }
     if(o.shards.empty() || o.pack.empty() || o.layer<0 || o.layer>=48 || o.layer==1 || o.layer%4==3 ||
        (o.mode!=7 && o.mode!=8) || o.warmup<1 || o.warmup>100 || o.trials<2 || o.trials>1000 || o.block_calls<2 || o.block_calls>64 || o.block_trials<2 || o.block_trials>20 ||
        (o.execution!="runtime"&&o.execution!="consolidated"&&o.execution!="captured"&&o.execution!="flat"&&o.execution!="flat-hc"&&o.execution!="column"&&o.execution!="hybrid"&&o.execution!="all"))
-        throw std::invalid_argument("usage: tp2_gdn_layer --pack PACK --gguf SHARD [--gguf SHARD ...] [--layer non-PLE-GDN-index] [--mode 7|8] [--execution runtime|consolidated|captured|column|hybrid|flat|flat-hc|all] [--benchmark | --calibrate] [--bench-warmup 3] [--bench-trials 12] [--profile-stages] [--bench-block-calls 16] [--bench-block-trials 4]");
+        throw std::invalid_argument("usage: tp2_gdn_layer --pack PACK --gguf SHARD [--gguf SHARD ...] [--layer non-PLE-GDN-index] [--mode 7|8] [--execution runtime|consolidated|captured|column|hybrid|flat|flat-hc|all] [--benchmark | --calibrate | --model-probe] [--bench-warmup 3] [--bench-trials 12] [--profile-stages] [--bench-block-calls 16] [--bench-block-trials 4]");
     if(o.calibrate){
         if(o.benchmark||o.profile_flat||(o.execution_explicit&&o.execution!="captured"))
             throw std::invalid_argument("--calibrate only supports unprofiled output-row captured; do not combine with --benchmark/--profile-stages/other execution");
         o.execution="captured";o.execution_explicit=true;
+    }
+    if(o.model_probe){
+        if(o.calibrate||o.benchmark||o.profile_flat||(o.execution_explicit&&o.execution!="hybrid"))
+            throw std::invalid_argument("--model-probe only supports unprofiled hybrid; do not combine with --calibrate/--benchmark/--profile-stages/other execution");
+        o.execution="hybrid";o.execution_explicit=true;
+        if(!o.warmup_explicit)o.warmup=1;
+        if(!o.trials_explicit)o.trials=4;
+        if(o.warmup>16||o.trials>64||o.mode!=8)
+            throw std::invalid_argument("--model-probe requires mode=8, warmup=1..16 and trials=2..64");
     }
     return o;
 }
@@ -777,10 +789,102 @@ void calibration(Checks& c,const Options& o,const strata::core::ModelGeometry& g
     }
     std::printf("CAL_GATE PASS whole-layer-parity=checked frozen-compute-output=exact column=excluded scope=one-layer-no-full-model-speedup-claim\n");
 }
+
+uint64_t fixture_hash(const std::vector<float>& values) {
+    // Stable byte fingerprint of exactly the supplied float buffer. This is an
+    // identity aid, not a cryptographic hash or evidence of model authenticity.
+    uint64_t h=14695981039346656037ull;
+    for(const auto* p=reinterpret_cast<const uint8_t*>(values.data());
+        p!=reinterpret_cast<const uint8_t*>(values.data()+values.size());++p){h^=*p;h*=1099511628211ull;}
+    return h;
+}
+void probe_weight_metadata(const char* owner,const tp::TpGdnRankWeights& w) {
+    const auto& gu=w.gu_layout;const auto& down=w.down_layout;
+    std::printf("PROBE_NATIVE owner=%s rank=%d device=%d gu-type=%s gu-type-id=%d gu-input=%lld gu-hidden=%lld gu-row-bytes=%zu down-type=%s down-type-id=%d down-input=%lld down-output=%lld down-row-bytes=%zu\n",owner,w.rank,w.device,strata::ggml_type_name(gu.gu_type),gu.gu_type,(long long)gu.n_embd,(long long)gu.n_ff,gu.gu_row,strata::ggml_type_name(down.d_type),down.d_type,(long long)down.n_ff,(long long)down.n_embd,down.d_row);
+    for(const auto& item:std::array<std::pair<const char*,const tp::TpNativeMatrix*>,6>{{
+        {"qkv",&w.qkv},{"z",&w.z},{"attention-output",&w.out},{"shared-gate",&w.shared_gate},{"shared-up",&w.shared_up},{"shared-down",&w.shared_down}}}){
+        const auto& m=*item.second;
+        std::printf("PROBE_MATRIX owner=%s matrix=%s type=%s type-id=%d input=%d output=%d\n",owner,item.first,strata::ggml_type_name(m.type),m.type,m.input,m.output);
+    }
+}
+void model_probe(const Options& o) {
+    strata::core::ModelGeometry g;std::string error;
+    tp::TpGdnWeights weights0,weights1,hybrid0,hybrid1;
+    if(!weights0.load(o.shards,o.pack,g,o.layer,-1,0,error))throw std::runtime_error("probe full GPU0 load: "+error);
+    if(!weights1.load(o.shards,o.pack,g,o.layer,-1,1,error))throw std::runtime_error("probe full GPU1 load: "+error);
+    if(!hybrid0.load(o.shards,o.pack,g,o.layer,0,0,error,tp::TpGdnPartition::HybridRowsColumns))throw std::runtime_error("probe hybrid rank0 load: "+error);
+    if(!hybrid1.load(o.shards,o.pack,g,o.layer,1,1,error,tp::TpGdnPartition::HybridRowsColumns))throw std::runtime_error("probe hybrid rank1 load: "+error);
+    std::printf("PROBE_SCOPE version=1 layer=%d mode=%d T=1,8 attention=output-rows FFN=local-hidden-input-columns down-K-full=640 down-K-half=320 HC=replicated-full-BF16 warmup=%d trials=%d phase-additive=0 timing=diagnostic-only production-defaults=unchanged\n",o.layer,o.mode,o.warmup,o.trials);
+    std::printf("PROBE_WEIGHTS full0-bytes=%llu full1-bytes=%llu hybrid0-bytes=%llu hybrid1-bytes=%llu sources=supplied-real-layer only-selected-layer-no-model-generation\n",(unsigned long long)weights0.weight_bytes(),(unsigned long long)weights1.weight_bytes(),(unsigned long long)hybrid0.weight_bytes(),(unsigned long long)hybrid1.weight_bytes());
+    std::printf("PROBE_CONTRACT frozen-seams=canonical-full0 full-vs-half=coordinated isolated-vs-concurrent=identical-bytes restore=outside-timer restore-order=inactive-first-active-last cache=restore-conditioned calls=single-not-sustained GPU-event-clocks=rank-local event-spans=adjacent-graph-including-host-enqueue-gap no-full-minus-phase-arithmetic no-speedup-from-summed-phases concurrent=scheduled actual-overlap=not-verified down-production-comparison=shape-and-kernel-family-change production-EP-inference=out-of-scope\n");
+    probe_weight_metadata("full0",weights0.weights());probe_weight_metadata("full1",weights1.weights());
+    probe_weight_metadata("half0",hybrid0.weights());probe_weight_metadata("half1",hybrid1.weights());
+    for(const char* flag:{"STRATA_HC_PERSIST","STRATA_HC_SPLIT","STRATA_GR_FAST","STRATA_GR_DOWN_MAX4","STRATA_NO_MULTI_GR",
+                         "STRATA_OLD_IQ_MMVQ","STRATA_NO_SUB16_GU","STRATA_GROUPED_V1","STRATA_IQ_STAGE_GRID","STRATA_IQ_STAGE_GRID_MMVQ",
+                         "STRATA_EXPERT_V2","STRATA_EXPERT_V2K","STRATA_TSUM","STRATA_HIP_SWIGLU_FUSED","STRATA_EXP_MODE",
+                         "STRATA_MMVQ_WAVE","STRATA_NO_MMVQ_ROWS2","STRATA_MMVQ_IL_ROWS","STRATA_Q8_PACKED","STRATA_Q6_PACKED"}){
+        const char* value=std::getenv(flag);std::printf("PROBE_ENV %s=%s\n",flag,value?value:"unset");
+    }
+    for(int d=0;d<2;++d){on(d);std::printf("PROBE_DISPATCH device=%d hc-variant=%d hc-projections=BF16 hc-norm=F32 hc-down-rows=320 hc-streams=4 native-gr=1 native-shared-bf16=1 mmvq-multi-exact=1 expert-mode=%d\n",d,k::fused_gr_variant(),o.mode);}
+    Checks c;coherence(c,g,weights0.weights(),hybrid0.weights());coherence(c,g,weights0.weights(),hybrid1.weights());
+    if(c.failures)throw std::runtime_error("probe actual weight coherence gate failed; no timing admitted");
+    tp::TpGdnLayer full0(g,weights0.weights(),nullptr,8,o.mode),full1(g,weights1.weights(),nullptr,8,o.mode),
+        hybrid(g,hybrid0.weights(),&hybrid1.weights(),8,o.mode);
+    const std::array<tp::TpGdnLayer*,3> layers{&full0,&full1,&hybrid};
+    for(auto* layer:layers)for(int t:{1,8})layer->prepare_captured(t);
+    full0.set_execution(tp::TpGdnExecution::Captured);full1.set_execution(tp::TpGdnExecution::Captured);
+    hybrid.set_execution(tp::TpGdnExecution::HybridCaptured);
+    const auto state=signed_input(STATE,17,0.015f),conv=signed_input(CONV,31,0.12f);
+    uint64_t epoch=0;int cases=0;
+    std::printf("PROBE_CORRECTNESS scope=targeted-not-all44-prefixes cases=T1-keep0,T1-keep1,T8-keep0,T8-keep4,T8-keep8 continuation-T=1 gates=unchanged-original-reference-and-independent-legacy full-GPU1=checked\n");
+    for(const auto& spec:std::array<std::array<int,2>,5>{{{{1,0}},{{1,1}},{{8,0}},{{8,4}},{{8,8}}}}){
+        const int tokens=spec[0],keep=spec[1];
+        const auto input=signed_input(size_t(tokens)*H*N,2401+tokens*37,0.65f);
+        std::printf("PROBE_CASE T=%d keep=%d epoch=%llu residual-fnv1a64=%016llx state-fnv1a64=%016llx conv-fnv1a64=%016llx\n",tokens,keep,(unsigned long long)(epoch+1),(unsigned long long)fixture_hash(input),(unsigned long long)fixture_hash(state),(unsigned long long)fixture_hash(conv));
+        ++epoch;for(auto* layer:layers){layer->reset_state(state,conv);layer->propose(input,tokens,epoch);}
+        auto a=full0.snapshot(),b=hybrid.snapshot();
+        seams(c,a,full1.snapshot());seams(c,a,b,false,true,false,&weights0.weights(),true);seams(c,b,hybrid.snapshot(1),true);
+        c.exact("probe proposal leaves state",state,b.state);c.exact("probe proposal leaves conv",conv,b.conv);
+        route_margins(c,weights0.weights(),a);
+        const auto legacy=legacy_gdn(weights0.weights(),a.attention_input,state,conv,tokens,keep);
+        c.floats("probe serial legacy GDN",legacy.output,b.gdn_output,gdn_gate);
+        c.floats("probe serial legacy mixer",legacy.mixer,b.mixer_output,gdn_gate);
+        legacy_hc(c,weights0.weights(),input,b);
+        for(auto* layer:layers)layer->commit(keep);
+        committed(c,full0.snapshot(),hybrid.snapshot(),legacy);committed(c,full0.snapshot(),full1.snapshot(),legacy);
+        // One-token continuation keeps the probe limited to T1/T8 and catches
+        // stale banks, reject-all rollback, and partial-prefix tail leakage.
+        const auto next=signed_input(size_t(H)*N,5001+tokens*13+keep*23,0.55f);
+        ++epoch;for(auto* layer:layers)layer->propose(next,1,epoch);
+        a=full0.snapshot();b=hybrid.snapshot();
+        seams(c,a,full1.snapshot());seams(c,a,b,false,true,false,&weights0.weights(),true);seams(c,b,hybrid.snapshot(1),true);
+        const auto continuation=legacy_gdn(weights0.weights(),a.attention_input,legacy.state,legacy.conv,1,1);
+        c.floats("probe continuation GDN",continuation.output,b.gdn_output,gdn_gate);
+        c.floats("probe continuation mixer",continuation.mixer,b.mixer_output,gdn_gate);
+        for(auto* layer:layers)layer->commit(1);
+        committed(c,full0.snapshot(),hybrid.snapshot(),continuation);committed(c,full0.snapshot(),full1.snapshot(),continuation);
+        ++cases;std::fflush(stdout);
+        if(c.failures)throw std::runtime_error("probe targeted parity failed; no timing admitted");
+    }
+    std::printf("PROBE_CORRECTNESS_GATE PASS cases=%d continuation-cases=%d failures=%d coverage=bounded-not-all-prefixes\n",cases,cases,c.failures);
+    for(int tokens:{1,8}){
+        const auto input=signed_input(size_t(tokens)*H*N,2401+tokens*37,0.65f);
+        for(auto* layer:layers)layer->reset_state(state,conv);
+        std::printf("PROBE_FIXTURE T=%d residual-fnv1a64=%016llx state-fnv1a64=%016llx conv-fnv1a64=%016llx input-kind=synthetic-signed-activations-real-weights no-prompt-or-logits\n",tokens,(unsigned long long)fixture_hash(input),(unsigned long long)fixture_hash(state),(unsigned long long)fixture_hash(conv));
+        const auto samples=tp::TpGdnLayer::calibrate_fine_frozen(full0,full1,hybrid,input,tokens,o.warmup,o.trials);
+        for(const auto& x:samples){
+            std::string entries;for(int n:x.group_entries){if(!entries.empty())entries+=",";entries+=std::to_string(n);}
+            if(entries.empty())entries="none";
+            std::printf("PROBE_PHASE T=%d owner=%s device0=%d device1=%d phase=%s arm=%s trial=%d order=%d calls=%d input-fnv1a64=%016llx groups=%d group-entries=%s restore-H2D-bytes=%llu peer-bytes-per-rank=%llu wall-ms=%.6f rank0-event-ms=%.6f rank1-event-ms=%.6f event-scope=%s\n",tokens,x.owner.c_str(),x.devices[0],x.devices[1],x.phase.c_str(),x.arm.c_str(),x.trial,x.order,x.calls,(unsigned long long)x.input_hash,x.groups,entries.c_str(),(unsigned long long)x.restored_bytes,(unsigned long long)x.peer_bytes_per_rank,x.wall_ms,x.device_ms[0],x.device_ms[1],x.event_scope.c_str());
+        }
+        std::fflush(stdout);
+    }
+    std::printf("PROBE_GATE PASS targeted-whole-layer-parity=checked frozen-replay-gates=checked full-model-correctness=unmeasured full-model-throughput=unmeasured\n");
+}
 } // namespace
 int main(int argc,char** argv) {
     try {
-        const auto o=parse(argc,argv);hc_source_metadata(o);int devices=0;ck(cudaGetDeviceCount(&devices),"device count");
+        const auto o=parse(argc,argv);if(o.model_probe)std::setvbuf(stdout,nullptr,_IOLBF,0);hc_source_metadata(o);int devices=0;ck(cudaGetDeviceCount(&devices),"device count");
         if(devices<2)throw std::runtime_error("two GPUs required; this is not a CPU or single-GPU pass");
         for(int d=0;d<2;++d){cudaDeviceProp prop{};ck(cudaGetDeviceProperties(&prop,d),"device properties");std::printf("device=%d name=%s\n",d,prop.name);int access=0;ck(cudaDeviceCanAccessPeer(&access,d,1-d),"P2P check");if(!access)throw std::runtime_error("bidirectional P2P required");}
         for(const char* flag:{"STRATA_GR_V3","STRATA_GR_SPLIT"}){
@@ -789,6 +893,7 @@ int main(int argc,char** argv) {
             std::printf("HC_DISPATCH %s=%s effective=0\n",flag,value?value:"unset");
         }
         k::gr_set_native_mmvf(true);k::shared_expert_set_native_bf16(true);k::native_mmvq_set_multi_exact(true);k::native_expert_set_mode(o.mode,0);
+        if(o.model_probe){model_probe(o);return 0;}
         const auto executions=execution_modes(o);
         const bool use_flat=std::find(executions.begin(),executions.end(),tp::TpGdnExecution::FlatCaptured)!=executions.end()||
                             std::find(executions.begin(),executions.end(),tp::TpGdnExecution::FlatHcCaptured)!=executions.end();

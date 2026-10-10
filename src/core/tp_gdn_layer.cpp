@@ -20,6 +20,7 @@
 #include <limits>
 #include <thread>
 #include <chrono>
+#include <cmath>
 
 namespace strata::core::tp2 {
 namespace {
@@ -759,6 +760,549 @@ std::vector<TpGdnCalibrationSample> TpGdnLayer::calibrate_frozen(
         p.tokens=old_tokens;p.execution=old_execution;
         return result;
     }catch(...){p.tokens=old_tokens;p.execution=old_execution;p.poison_and_drain();throw;}
+}
+
+std::vector<TpGdnFineCalibrationSample> TpGdnLayer::calibrate_fine_frozen(
+        TpGdnLayer& full0, TpGdnLayer& full1, TpGdnLayer& hybrid,
+        const std::vector<float>& residual, int tokens, int warmup, int trials) {
+    auto& f0 = *full0.impl_;
+    auto& f1 = *full1.impl_;
+    auto& hp = *hybrid.impl_;
+    const std::array<Impl*,3> owners{{&f0, &f1, &hp}};
+    for (auto* owner : owners) owner->healthy();
+    if (&full0 == &full1 || &full0 == &hybrid || &full1 == &hybrid ||
+        f0.count != 1 || f1.count != 1 || hp.count != 2 || !hp.hybrid() ||
+        f0.r[0]->w.device != hp.r[0]->w.device ||
+        f1.r[0]->w.device != hp.r[1]->w.device ||
+        f0.r[0]->w.layer != hp.r[0]->w.layer || f1.r[0]->w.layer != hp.r[0]->w.layer ||
+        f0.mode != hp.mode || f1.mode != hp.mode ||
+        (tokens != 1 && tokens != 8) || residual.size() != size_t(tokens)*HC*N ||
+        warmup < 1 || warmup > 16 || trials < 2 || trials > 64)
+        throw std::invalid_argument("fine calibration requires matching full0/full1/hybrid, T1/8, warmup1..16, trials2..64");
+    for (auto* owner : owners) {
+        if (owner->pending || owner->profile_enabled || owner->flat_mode() ||
+            tokens > owner->capacity || !owner->prepared[tokens])
+            throw std::invalid_argument("fine calibration requires idle unprofiled prepared layers");
+    }
+    std::array<Rank*,4> ranks{{f0.r[0].get(), f1.r[0].get(), hp.r[0].get(), hp.r[1].get()}};
+    for (auto* rank : ranks) if (rank->trace)
+        throw std::invalid_argument("fine calibration cannot use stamped ranks");
+    auto sync_all = [&] { for (auto* rank : ranks) rank->sync(); };
+    auto download = [](Rank& rank, const void* ptr, size_t bytes) {
+        select(rank.w.device);
+        std::vector<uint8_t> data(bytes);
+        check(cudaMemcpy(data.data(), ptr, bytes, cudaMemcpyDeviceToHost), "fine calibration read");
+        return data;
+    };
+    auto upload = [](Rank& rank, void* ptr, const std::vector<uint8_t>& data) {
+        select(rank.w.device);
+        check(cudaMemcpyAsync(ptr, data.data(), data.size(), cudaMemcpyHostToDevice, rank.compute),
+              "fine calibration canonical input");
+        rank.sync(); // The host buffer may be temporary; its lifetime ends here.
+    };
+    struct SavedFine {
+        Rank& rank;
+        std::vector<std::vector<uint8_t>> data;
+        explicit SavedFine(Rank& r) : rank(r) {
+            rank.sync();
+            if (rank.owned.size() != rank.owned_bytes.size())
+                throw std::logic_error("fine calibration allocation manifest mismatch");
+            for (size_t j=0; j<rank.owned.size(); ++j) {
+                data.emplace_back(rank.owned_bytes[j]);
+                check(cudaMemcpy(data.back().data(), rank.owned[j], data.back().size(),
+                                 cudaMemcpyDeviceToHost), "fine calibration freeze");
+            }
+        }
+        void restore() {
+            select(rank.w.device);
+            for (size_t j=0; j<data.size(); ++j)
+                check(cudaMemcpyAsync(rank.owned[j], data[j].data(), data[j].size(),
+                                     cudaMemcpyHostToDevice, rank.compute), "fine calibration restore");
+            rank.sync();
+        }
+        void verify() const {
+            select(rank.w.device);
+            for (size_t j=0; j<data.size(); ++j) {
+                std::vector<uint8_t> actual(data[j].size());
+                check(cudaMemcpy(actual.data(), rank.owned[j], actual.size(), cudaMemcpyDeviceToHost),
+                      "fine calibration verify");
+                if (actual != data[j])
+                    throw std::runtime_error("fine calibration replay mismatch device=" +
+                        std::to_string(rank.w.device) + " rank=" + std::to_string(rank.w.rank) +
+                        " allocation=" + std::to_string(j));
+            }
+        }
+    };
+    struct FineGraph {
+        Rank& rank;
+        CapturedNode node;
+        cudaEvent_t begin{}, end{};
+        explicit FineGraph(Rank& r) : rank(r) {
+            select(rank.w.device);
+            check(cudaEventCreate(&begin), "fine calibration begin event");
+            try { check(cudaEventCreate(&end), "fine calibration end event"); }
+            catch (...) { cudaEventDestroy(begin); begin={}; throw; }
+        }
+        ~FineGraph() {
+            cudaSetDevice(rank.w.device);
+            cudaStreamSynchronize(rank.compute);
+            if (node.executable) cudaGraphExecDestroy(node.executable);
+            if (node.graph) cudaGraphDestroy(node.graph);
+            if (begin) cudaEventDestroy(begin);
+            if (end) cudaEventDestroy(end);
+        }
+    };
+    std::array<std::unique_ptr<SavedFine>,4> original;
+    const std::array<int,3> old_tokens{{f0.tokens, f1.tokens, hp.tokens}};
+    std::vector<TpGdnFineCalibrationSample> result;
+    uint64_t restored_bytes = 0;
+    for (auto* rank : ranks) for (size_t bytes : rank->owned_bytes) restored_bytes += bytes;
+    int groups = 0;
+    std::vector<int> group_entries;
+    // The checksum identifies canonical input bytes within this fixture, not
+    // model provenance or owner-specific resident pointers.
+    uint64_t input_hash = 14695981039346656037ull;
+    auto hash_bytes = [&](const std::vector<uint8_t>& data) {
+        for (uint8_t value : data) { input_hash ^= value; input_hash *= 1099511628211ull; }
+    };
+    auto canonical = [&](auto pointer, size_t bytes) {
+        auto data = download(*ranks[0], pointer(*ranks[0]), bytes);
+        hash_bytes(data);
+        for (int i=1; i<4; ++i) upload(*ranks[i], pointer(*ranks[i]), data);
+        return data;
+    };
+    std::vector<uint8_t> canonical_routed_hidden, canonical_shared_hidden;
+    auto sliced_hidden = [&](bool routed) {
+        const size_t rows = size_t(tokens)*(routed ? K : 1);
+        const size_t full_row = (F/32)*36, half_row = full_row/2;
+        auto pointer = [&](Rank& rank) -> uint8_t* {
+            return routed ? rank.hidden(false,tokens) : rank.shared_local_q;
+        };
+        const auto& data = routed ? canonical_routed_hidden : canonical_shared_hidden;
+        if (data.size()!=rows*full_row) throw std::logic_error("fine calibration canonical hidden shape");
+        hash_bytes(data);
+        upload(*ranks[0], pointer(*ranks[0]), data);
+        upload(*ranks[1], pointer(*ranks[1]), data);
+        for (int i=2; i<4; ++i) {
+            std::vector<uint8_t> half(rows*half_row);
+            for (size_t row=0; row<rows; ++row)
+                std::copy_n(data.data()+row*full_row+(i-2)*half_row, half_row, half.data()+row*half_row);
+            upload(*ranks[i], pointer(*ranks[i]), half);
+        }
+    };
+    auto exact_canonical = [&](auto pointer, size_t bytes, const char* label) {
+        const auto expected = download(*ranks[0], pointer(*ranks[0]), bytes);
+        for (int i=1; i<4; ++i) if (download(*ranks[i], pointer(*ranks[i]), bytes) != expected)
+            throw std::runtime_error(std::string("fine calibration canonical mismatch: ") + label);
+    };
+    auto exact_hidden = [&](bool routed) {
+        const size_t rows = size_t(tokens)*(routed ? K : 1);
+        const size_t full_row = (F/32)*36, half_row = full_row/2;
+        auto pointer = [&](Rank& rank) { return routed ? rank.hidden(false,tokens) : rank.shared_local_q; };
+        const auto expected = download(*ranks[0], pointer(*ranks[0]), rows*full_row);
+        if (download(*ranks[1], pointer(*ranks[1]), rows*full_row) != expected)
+            throw std::runtime_error("fine calibration full-device hidden mismatch");
+        for (int i=2; i<4; ++i) {
+            const auto half = download(*ranks[i], pointer(*ranks[i]), rows*half_row);
+            for (size_t row=0; row<rows; ++row)
+                if (std::memcmp(half.data()+row*half_row,
+                                expected.data()+row*full_row+(i-2)*half_row, half_row))
+                    throw std::runtime_error("fine calibration canonical hidden ownership mismatch");
+        }
+    };
+    auto numeric_gate = [](const std::vector<uint8_t>& reference,
+                           const std::vector<uint8_t>& actual, const char* label) {
+        if (reference.empty() || reference.size()!=actual.size() || reference.size()%sizeof(float))
+            throw std::logic_error("fine calibration numerical gate shape");
+        double square=0, error=0, maximum=0;
+        for (size_t j=0; j<reference.size(); j+=sizeof(float)) {
+            float expected_value, actual_value;
+            std::memcpy(&expected_value,reference.data()+j,sizeof(float));
+            std::memcpy(&actual_value,actual.data()+j,sizeof(float));
+            if (!std::isfinite(expected_value) || !std::isfinite(actual_value))
+                throw std::runtime_error(std::string("fine calibration nonfinite ")+label);
+            const double delta=double(expected_value)-actual_value;
+            square+=double(expected_value)*expected_value; error+=delta*delta;
+            maximum=std::max(maximum,std::abs(delta));
+        }
+        const double count=double(reference.size()/sizeof(float)), scale=std::sqrt(square/count);
+        // Unchanged ffn_gate from the targeted full-layer fixture.
+        if (maximum>1e-5+3e-4*scale || std::sqrt(error/count)>1e-5+5e-5*scale)
+            throw std::runtime_error(std::string("fine calibration numerical gate: ")+label);
+    };
+    auto reconstructed_gate = [&](auto pointer, const char* label) {
+        const size_t bytes=size_t(tokens)*N*sizeof(float);
+        const auto reference=download(*ranks[0],pointer(*ranks[0]),bytes);
+        const auto first=download(*ranks[2],pointer(*ranks[2]),bytes);
+        const auto second=download(*ranks[3],pointer(*ranks[3]),bytes);
+        std::vector<uint8_t> sum(bytes);
+        for (size_t j=0; j<bytes; j+=sizeof(float)) {
+            float a,b;
+            std::memcpy(&a,first.data()+j,sizeof(float));
+            std::memcpy(&b,second.data()+j,sizeof(float));
+            const float value=a+b;
+            std::memcpy(sum.data()+j,&value,sizeof(float));
+        }
+        numeric_gate(reference,sum,label);
+    };
+    try {
+        sync_all();
+        for (int i=0; i<4; ++i) original[i] = std::make_unique<SavedFine>(*ranks[i]);
+        for (auto* owner : owners) owner->tokens = tokens;
+        std::vector<uint8_t> input_bytes(residual.size()*sizeof(float));
+        std::memcpy(input_bytes.data(), residual.data(), input_bytes.size());
+        for (auto* rank : ranks) upload(*rank, rank->R, input_bytes);
+        // First execute the intact prepared graphs, without proposal/commit
+        // publication. These outputs gate the later decomposition independently
+        // of its own replay determinism. Restore all storage before proceeding.
+        for (int i=0; i<2; ++i)
+            ranks[i]->launch(ranks[i]->captured[tokens].mixer[ranks[i]->state_bank]);
+        hp.run_hybrid(true);
+        sync_all();
+        std::array<std::vector<uint8_t>,4> production_attention, production_ffn_input,
+            production_shared_hidden, production_routed_hidden, production_shared, production_down;
+        for (int i=0; i<4; ++i) {
+            auto& rank=*ranks[i];
+            production_attention[i]=download(rank,rank.attn_input,size_t(tokens)*N*sizeof(float));
+            production_ffn_input[i]=download(rank,rank.ffn_input,size_t(tokens)*N*sizeof(float));
+            production_shared_hidden[i]=download(rank,rank.shared_local_q,size_t(tokens)*(rank.ff/32)*36);
+            production_routed_hidden[i]=download(rank,rank.hidden(false,tokens),size_t(tokens)*K*(rank.ff/32)*36);
+            production_shared[i]=download(rank,rank.shared,size_t(tokens)*N*sizeof(float));
+            production_down[i]=download(rank,rank.local_out,size_t(tokens)*N*sizeof(float));
+            const auto error=download(rank,rank.plan_error,sizeof(uint32_t));
+            uint32_t status=0; std::memcpy(&status,error.data(),sizeof(status));
+            if (status) throw std::runtime_error("fine calibration intact graph plan failure");
+        }
+        for (int i=1; i<4; ++i) if (production_ffn_input[i]!=production_ffn_input[0])
+            throw std::runtime_error("fine calibration intact FFN inputs differ");
+        exact_canonical([](Rank& rank) { return rank.ids; },size_t(tokens)*K*sizeof(int32_t),"intact route IDs");
+        exact_canonical([](Rank& rank) { return rank.weights; },size_t(tokens)*K*sizeof(float),"intact route weights");
+        exact_hidden(false);
+        exact_hidden(true);
+        for (auto& saved : original) saved->restore();
+        for (auto* rank : ranks) upload(*rank, rank->R, input_bytes);
+        std::vector<uint8_t> canonical_y, canonical_attention, actual_full_down;
+        const char* names[] = {"hc-attn", "hc-ffn", "router-plan-quantize", "shared-gu-scalar",
+            "routed-gu", "shared-down", "routed-down-combine", "routed-down-combine-fused-control",
+            "empty-graph-control"};
+        for (int phase=0; phase<9; ++phase) {
+            input_hash = 14695981039346656037ull;
+            auto& reference = *ranks[0];
+            // Materialize only the canonical reference's intervening attention.
+            // Other owners receive the exact seam rather than a separately
+            // rounded trajectory. Their full-layer gates are the caller's job.
+            if (phase == 1) {
+                reference.mixer(tokens,true);
+                reference.output_projection(tokens);
+                reference.sync();
+                canonical_y = download(reference, reference.y, size_t(tokens)*V*sizeof(float));
+                canonical_attention = download(reference, reference.bo, size_t(tokens)*N*sizeof(float));
+            }
+            if (phase <= 1) {
+                canonical([](Rank& rank) { return rank.R; }, size_t(tokens)*HC*N*sizeof(float));
+                if (phase == 1) {
+                    canonical([](Rank& rank) { return rank.bo; }, size_t(tokens)*N*sizeof(float));
+                    canonical([](Rank& rank) { return rank.inj[0]; }, size_t(tokens)*HC*sizeof(float));
+                }
+            } else if (phase == 2) {
+                canonical([](Rank& rank) { return rank.mixed; }, size_t(tokens)*N*sizeof(float));
+            } else if (phase == 3 || phase == 4) {
+                canonical([](Rank& rank) { return rank.xq; }, size_t(tokens)*(N/32)*36);
+                if (phase == 3)
+                    canonical([](Rank& rank) { return rank.mixed; }, size_t(tokens)*N*sizeof(float));
+                else {
+                    canonical([](Rank& rank) { return rank.ids; }, size_t(tokens)*K*sizeof(int32_t));
+                    canonical([](Rank& rank) { return rank.weights; }, size_t(tokens)*K*sizeof(float));
+                }
+            } else if (phase < 8) {
+                sliced_hidden(phase != 5);
+                if (phase >= 6) {
+                    canonical([](Rank& rank) { return rank.ids; }, size_t(tokens)*K*sizeof(int32_t));
+                    canonical([](Rank& rank) { return rank.weights; }, size_t(tokens)*K*sizeof(float));
+                    canonical([](Rank& rank) { return rank.scalar; }, size_t(tokens)*sizeof(float));
+                    // Column owners retain their valid shared-down partials.
+                    // This canonical full shared value identifies the semantic
+                    // contribution; it cannot replace a local column partial.
+                    hash_bytes(download(reference, reference.shared, size_t(tokens)*N*sizeof(float)));
+                }
+            }
+            auto compute = [&](Rank& rank) {
+                select(rank.w.device);
+                if (phase == 8) return; // Same event/launch scope, no compute.
+                if (phase == 0 || phase == 1) {
+                    rank.hc(phase,tokens,phase == 1);
+                } else if (phase == 2) {
+                    k::bf16_gemv_fp32_mmvf_multi(rank.mixed,N,rank.w.router,rank.logits,NE,N,NE,tokens,rank.compute);
+                    k::native_router_top10_multi(rank.logits,rank.ids,rank.weights,tokens,rank.compute);
+                    check(cudaMemsetAsync(rank.plan_error,0,sizeof(uint32_t),rank.compute), "fine calibration plan reset");
+                    k::resident_plan(rank.ids,tokens*K,K,rank.res,NE,rank.w.expert_arena,rank.offsets,
+                        static_cast<long long>(rank.w.expert_bytes),rank.plan,rank.cap_entries,nullptr,0,rank.compute,rank.plan_error);
+                    k::native_quantize_q8_1(rank.mixed,rank.xq,N,tokens,rank.compute);
+                } else if (phase == 3) {
+                    rank.matrix(rank.w.shared_gate,rank.xq,rank.sg,tokens);
+                    rank.matrix(rank.w.shared_up,rank.xq,rank.su,tokens);
+                    k::native_swiglu_quantize_q8_1(rank.sg,rank.su,rank.shared_local_q,rank.ff,tokens,rank.compute);
+                    k::bf16_gemv_fp32_mmvf_multi(rank.mixed,N,rank.w.shared_scalar,rank.scalar,1,N,1,tokens,rank.compute);
+                } else if (phase == 4) {
+                    rank.grouped(tokens,hp.mode,k::NativeExpertPhase::GateUp,rank.w.gu_layout,rank.gu_scratch);
+                } else if (phase == 5) {
+                    rank.matrix(rank.w.shared_down,rank.shared_full_q,rank.shared,tokens);
+                } else if (rank.ffn_columns() || phase == 7) {
+                    const int32_t* starts = rank.plan+4;
+                    const int32_t* dst = starts+rank.cap_entries+1;
+                    const auto* ptr = reinterpret_cast<const unsigned long long*>(rank.plan+rank.ptr_offset);
+                    k::native_expert_down_combine(rank.w.down_layout,ptr,starts,rank.plan,dst,tokens*K,tokens*K,
+                        rank.hidden(false,tokens),rank.weights,rank.shared,rank.scalar,rank.local_out,
+                        rank.plan_error,tokens,rank.compute);
+                } else {
+                    rank.grouped(tokens,hp.mode,k::NativeExpertPhase::Down,rank.w.down_layout,rank.down_scratch);
+                    k::native_moe_combine_multi_hits_gated(rank.parts,rank.weights,rank.shared,rank.scalar,
+                        rank.local_out,rank.width,K,tokens,rank.compute);
+                }
+            };
+            std::array<std::unique_ptr<SavedFine>,4> frozen, produced;
+            std::array<std::unique_ptr<FineGraph>,4> graphs;
+            for (int i=0; i<4; ++i) frozen[i] = std::make_unique<SavedFine>(*ranks[i]);
+            for (auto* rank : ranks) compute(*rank);
+            sync_all();
+            // The factored phases must also reproduce their unfactored real
+            // owner outputs. Hybrid's admitted contract keeps FFN inputs exact.
+            for (int i=0; i<4; ++i) {
+                auto& rank=*ranks[i];
+                const std::vector<uint8_t>* expected=nullptr;
+                const void* output=nullptr;
+                if (phase==0 || phase==1) {
+                    expected=phase==0 ? &production_attention[i] : &production_ffn_input[i];
+                    output=rank.mixed;
+                } else if (phase==3) { expected=&production_shared_hidden[i]; output=rank.shared_local_q; }
+                else if (phase==4) { expected=&production_routed_hidden[i]; output=rank.hidden(false,tokens); }
+                else if (phase==5) { expected=&production_shared[i]; output=rank.shared; }
+                else if (phase==6 || (phase==7 && i>=2)) { expected=&production_down[i]; output=rank.local_out; }
+                if (expected && download(rank,output,expected->size())!=*expected)
+                    throw std::runtime_error(std::string("fine calibration intact graph mismatch: ")+names[phase]);
+            }
+            if (phase==5) reconstructed_gate([](Rank& rank) { return rank.shared; },"shared column reconstruction");
+            if (phase==6 || phase==7)
+                reconstructed_gate([](Rank& rank) { return rank.local_out; },"FFN column reconstruction");
+            if (phase == 0 || phase == 1) {
+                exact_canonical([](Rank& rank) { return rank.R; },size_t(tokens)*HC*N*sizeof(float),"HC residual");
+                exact_canonical([](Rank& rank) { return rank.mixed; },size_t(tokens)*N*sizeof(float),"HC mixed");
+                exact_canonical([&](Rank& rank) { return rank.inj[phase]; },size_t(tokens)*HC*sizeof(float),"HC injection");
+            }
+            if (phase == 2) {
+                exact_canonical([](Rank& rank) { return rank.ids; },size_t(tokens)*K*sizeof(int32_t),"route IDs");
+                exact_canonical([](Rank& rank) { return rank.weights; },size_t(tokens)*K*sizeof(float),"route weights");
+                exact_canonical([](Rank& rank) { return rank.logits; },size_t(tokens)*NE*sizeof(float),"router logits");
+                exact_canonical([](Rank& rank) { return rank.xq; },size_t(tokens)*(N/32)*36,"FFN input Q8");
+                // Only active logical plan fields are compared. Resident expert
+                // addresses necessarily differ by device and shard allocation.
+                const auto bytes = download(reference,reference.plan,sizeof(int32_t));
+                std::memcpy(&groups,bytes.data(),sizeof(groups));
+                if (groups < 1 || groups > tokens*K) throw std::runtime_error("fine calibration group count");
+                const auto start_bytes = download(reference,reference.plan+4,size_t(groups+1)*sizeof(int32_t));
+                std::vector<int32_t> starts(groups+1);
+                std::memcpy(starts.data(),start_bytes.data(),start_bytes.size());
+                group_entries.clear();
+                for (int group=0; group<groups; ++group) {
+                    if (starts[group+1] <= starts[group]) throw std::runtime_error("fine calibration group entries");
+                    group_entries.push_back(starts[group+1]-starts[group]);
+                }
+                if (starts.front()!=0 || starts.back()!=tokens*K) throw std::runtime_error("fine calibration plan coverage");
+                exact_canonical([](Rank& rank) { return rank.plan; },3*sizeof(int32_t),"plan counts");
+                exact_canonical([](Rank& rank) { return rank.plan+4; },size_t(groups+1)*sizeof(int32_t),"group starts");
+                exact_canonical([](Rank& rank) { return rank.plan+4+rank.cap_entries+1; },size_t(tokens)*K*sizeof(int32_t),"entry destinations");
+                exact_canonical([](Rank& rank) { return rank.plan+4+2*rank.cap_entries+1; },size_t(tokens)*K*sizeof(int32_t),"entry tokens");
+            }
+            if (phase == 3 || phase == 4) {
+                exact_hidden(phase == 4);
+                if (phase == 3) canonical_shared_hidden=download(reference,reference.shared_local_q,size_t(tokens)*(F/32)*36);
+                else canonical_routed_hidden=download(reference,reference.hidden(false,tokens),size_t(tokens)*K*(F/32)*36);
+            }
+            if (phase == 3)
+                exact_canonical([](Rank& rank) { return rank.scalar; },size_t(tokens)*sizeof(float),"shared scalar");
+            if (phase == 6) actual_full_down = download(reference,reference.local_out,size_t(tokens)*N*sizeof(float));
+            if (phase == 7) {
+                for (int index=0; index<2; ++index)
+                    numeric_gate(actual_full_down,
+                        download(*ranks[index],ranks[index]->local_out,actual_full_down.size()),
+                        "full fused control versus original grouped down/combine");
+            }
+            for (int i=0; i<4; ++i) {
+                produced[i] = std::make_unique<SavedFine>(*ranks[i]);
+                graphs[i] = std::make_unique<FineGraph>(*ranks[i]);
+                ranks[i]->capture(graphs[i]->node,[&,i] { compute(*ranks[i]); });
+            }
+            const int masks[] = {1,2,4,8,12};
+            const char* arms[] = {"full0","full1","half0","half1","concurrent-halves"};
+            for (int trial=-warmup; trial<trials; ++trial) for (int order=0; order<10; ++order) {
+                // Rotate the five-arm starting point and mirror the second leg.
+                // Every arm occurs twice per trial; rank launch order also flips.
+                const int rotated=(trial+warmup)%5;
+                const int step=order<5 ? order : 9-order;
+                const int arm=(step+rotated)%5, mask=masks[arm];
+                // Touch each active owner's storage last on its device. Fixed
+                // full-then-half restoration would systematically favor halves.
+                // This remains an H2D-restore-conditioned, not sustained, probe.
+                for (bool active : {false,true}) for (int i=0; i<4; ++i)
+                    if (bool(mask&(1<<i))==active) frozen[i]->restore();
+                const bool reverse=((trial+warmup+order)&1)!=0;
+                const auto start=std::chrono::steady_clock::now();
+                for (int j=0; j<4; ++j) {
+                    const int i=reverse ? 3-j : j;
+                    if (!(mask&(1<<i))) continue;
+                    auto& graph=*graphs[i];
+                    select(graph.rank.w.device);
+                    check(cudaEventRecord(graph.begin,graph.rank.compute),"fine calibration event begin");
+                    graph.rank.launch(graph.node);
+                    // End is adjacent to its graph, before submitting another
+                    // GPU. No cross-device timestamp subtraction is meaningful.
+                    check(cudaEventRecord(graph.end,graph.rank.compute),"fine calibration event end");
+                }
+                sync_all();
+                const auto end=std::chrono::steady_clock::now();
+                TpGdnFineCalibrationSample sample;
+                sample.phase=names[phase]; sample.arm=arms[arm]; sample.owner=arm<2 ? "full" : "hybrid";
+                sample.event_scope="adjacent-own-graph-events";
+                sample.trial=trial; sample.order=order; sample.restored_bytes=restored_bytes;
+                sample.wall_ms=std::chrono::duration<double,std::milli>(end-start).count();
+                sample.input_hash=input_hash; sample.groups=groups; sample.group_entries=group_entries;
+                for (int i=0; i<4; ++i) {
+                    if (mask&(1<<i)) {
+                        const int slot=i<2 ? 0 : i-2;
+                        select(ranks[i]->w.device);
+                        sample.devices[slot]=ranks[i]->w.device;
+                        check(cudaEventElapsedTime(&sample.device_ms[slot],graphs[i]->begin,graphs[i]->end),
+                              "fine calibration event span");
+                        produced[i]->verify();
+                    } else frozen[i]->verify();
+                    uint32_t error=0;
+                    select(ranks[i]->w.device);
+                    check(cudaMemcpy(&error,ranks[i]->plan_error,sizeof(error),cudaMemcpyDeviceToHost),"fine calibration plan status");
+                    if (error) throw std::runtime_error("fine calibration resident plan failed");
+                }
+                if (trial>=0) result.push_back(std::move(sample));
+            }
+            for (auto& saved : produced) saved->restore();
+        }
+        // Frozen standalone collectives use canonical attention payloads and
+        // valid local fused FFN partials. They do not time stale consumers or
+        // pretend an isolated publish equals the fused kernel's peer-store cost.
+        const std::array<std::vector<uint8_t>,2> ffn_partials{{
+            download(*hp.r[0],hp.r[0]->local_out,size_t(tokens)*N*sizeof(float)),
+            download(*hp.r[1],hp.r[1]->local_out,size_t(tokens)*N*sizeof(float))}};
+        for (int phase=0; phase<3; ++phase) {
+            input_hash=14695981039346656037ull;
+            for (int rank=0; rank<2; ++rank) {
+                auto& a=*hp.r[rank];
+                if (phase==0) {
+                    const auto mapping=gdn_rank_layout(hp.geometry,rank);
+                    std::vector<uint8_t> local(size_t(tokens)*(V/2)*sizeof(float));
+                    for (int token=0; token<tokens; ++token) for (int channel=0; channel<V/2; ++channel)
+                        std::memcpy(local.data()+(size_t(token)*(V/2)+channel)*sizeof(float),
+                            canonical_y.data()+(size_t(token)*V+mapping.value_rows[channel])*sizeof(float),sizeof(float));
+                    upload(a,a.y,local);
+                } else if (phase==1) {
+                    std::vector<uint8_t> local(size_t(tokens)*(N/2)*sizeof(float));
+                    for (int token=0; token<tokens; ++token)
+                        std::memcpy(local.data()+size_t(token)*(N/2)*sizeof(float),
+                            canonical_attention.data()+(size_t(token)*N+rank*(N/2))*sizeof(float),(N/2)*sizeof(float));
+                    upload(a,a.local_out,local);
+                }
+            }
+            if (phase==2) for (int rank=0; rank<2; ++rank)
+                upload(*hp.r[rank],hp.r[rank]->local_out,ffn_partials[rank]);
+            if (phase==0) hash_bytes(canonical_y);
+            else if (phase==1) hash_bytes(canonical_attention);
+            else for (const auto& partial : ffn_partials) hash_bytes(partial);
+            auto destination = [&](Rank& rank) -> float* {
+                return phase==0 ? rank.full_y : phase==1 ? rank.bo : rank.peer_partial[1];
+            };
+            const size_t destination_bytes=size_t(tokens)*(phase==0 ? V : N)*sizeof(float);
+            for (int rank=0; rank<2; ++rank) {
+                auto& a=*hp.r[rank]; select(a.w.device);
+                check(cudaMemsetAsync(destination(a),0xa5,destination_bytes,a.compute),"fine calibration poison exchange");
+            }
+            sync_all();
+            auto push = [&](Rank& rank) {
+                select(rank.w.device);
+                if (phase==0) hp.push_y(rank);
+                else if (phase==1) hp.push_output(rank);
+                else k::tp_gdn_publish_partial(rank.local_out,hp.r[1-rank.w.rank]->peer_partial[1],
+                                               tokens*N,rank.compute);
+            };
+            std::array<std::unique_ptr<SavedFine>,4> frozen, produced;
+            std::array<std::unique_ptr<FineGraph>,2> pushes, empty;
+            for (int i=0; i<4; ++i) frozen[i]=std::make_unique<SavedFine>(*ranks[i]);
+            for (int rank=0; rank<2; ++rank) push(*hp.r[rank]);
+            hp.phase_barrier(); sync_all();
+            for (int rank=0; rank<2; ++rank) {
+                const auto& expected=phase==0 ? canonical_y : phase==1 ? canonical_attention : ffn_partials[1-rank];
+                if (download(*hp.r[rank],destination(*hp.r[rank]),destination_bytes)!=expected)
+                    throw std::runtime_error("fine calibration exchange reconstruction mismatch");
+            }
+            for (int i=0; i<4; ++i) produced[i]=std::make_unique<SavedFine>(*ranks[i]);
+            for (int rank=0; rank<2; ++rank) {
+                auto& a=*hp.r[rank];
+                pushes[rank]=std::make_unique<FineGraph>(a);
+                empty[rank]=std::make_unique<FineGraph>(a);
+                a.capture(pushes[rank]->node,[&,rank] { push(*hp.r[rank]); });
+                a.capture(empty[rank]->node,[] {});
+            }
+            const char* names[]={"attn-y-exchange","attn-output-exchange","ffn-partial-exchange"};
+            const uint64_t payload_per_token[]={12288,5120,10240};
+            for (int trial=-warmup; trial<trials; ++trial) for (int order=0; order<4; ++order) {
+                const bool exchange=(order==1 || order==2)^bool(trial&1);
+                for (auto& saved : frozen) saved->restore();
+                auto& graphs=exchange ? pushes : empty;
+                const bool reverse=((trial+warmup+order)&1)!=0;
+                const auto start=std::chrono::steady_clock::now();
+                for (int j=0; j<2; ++j) {
+                    const int rank=reverse ? 1-j : j;
+                    auto& graph=*graphs[rank]; select(graph.rank.w.device);
+                    check(cudaEventRecord(graph.begin,graph.rank.compute),"fine calibration exchange begin");
+                    graph.rank.launch(graph.node);
+                }
+                hp.phase_barrier();
+                for (int j=0; j<2; ++j) {
+                    const int rank=reverse ? 1-j : j;
+                    auto& graph=*graphs[rank]; select(graph.rank.w.device);
+                    check(cudaEventRecord(graph.end,graph.rank.compute),"fine calibration exchange joined end");
+                }
+                sync_all();
+                const auto end=std::chrono::steady_clock::now();
+                TpGdnFineCalibrationSample sample;
+                sample.phase=names[phase]; sample.arm=exchange ? "exchange" : "event-join-empty";
+                sample.owner="hybrid"; sample.event_scope="graph-plus-peer-event-join";
+                sample.trial=trial; sample.order=order; sample.restored_bytes=restored_bytes;
+                sample.peer_bytes_per_rank=exchange ? payload_per_token[phase]*tokens : 0;
+                sample.input_hash=input_hash; sample.groups=groups; sample.group_entries=group_entries;
+                sample.wall_ms=std::chrono::duration<double,std::milli>(end-start).count();
+                for (int rank=0; rank<2; ++rank) {
+                    select(hp.r[rank]->w.device); sample.devices[rank]=hp.r[rank]->w.device;
+                    check(cudaEventElapsedTime(&sample.device_ms[rank],graphs[rank]->begin,graphs[rank]->end),
+                          "fine calibration exchange event span");
+                }
+                for (int i=0; i<4; ++i) (exchange ? produced[i] : frozen[i])->verify();
+                if (trial>=0) result.push_back(std::move(sample));
+            }
+        }
+        // Give every phase the route geometry from this canonical T fixture,
+        // including HC phases that execute before routing is materialized.
+        for (auto& sample : result) { sample.groups=groups; sample.group_entries=group_entries; }
+        for (auto& saved : original) saved->restore();
+        for (const auto& saved : original) saved->verify();
+        for (size_t i=0; i<owners.size(); ++i) owners[i]->tokens=old_tokens[i];
+        return result;
+    } catch (...) {
+        for (size_t i=0; i<owners.size(); ++i) {
+            owners[i]->tokens=old_tokens[i];
+            owners[i]->poison_and_drain();
+        }
+        // Preserve caller storage when the runtime remains usable. The owners
+        // still stay poisoned, so a failed probe never looks like a valid run.
+        try { for (auto& saved : original) if (saved) saved->restore(); } catch (...) {}
+        throw;
+    }
 }
 
 void TpGdnLayer::prepare_flat(int tokens,bool shard_hc,bool profile,uint64_t timeout_us) {
