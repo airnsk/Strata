@@ -225,12 +225,75 @@ the expected data, the original event-protocol failure remains a failure. There 
 automatic fallback, threshold change, or speculative event-flag change. Actual fenced
 peer-write/event behavior remains a hardware gate after the initialization correction.
 
-## Validation status of the updated reduced protocol
+## Corrected reduced-protocol hardware result, 2026-10-10
 
-CPU standalone strict-warning, optimized, Release/NDEBUG and ASan/UBSan checks passed.
+At `1a3d24c`, the corrected probe and all 32 synthetic cases passed on the two MI50s,
+mode 8, `--exchange reduced`, 12 measured iterations/case. Both directions passed 16
+monotonic direct-write/event/GPU-witness sequences. All 128 reported hidden-q8 checks
+were byte-exact; worst reported normalized max error was 2.61760e-7 and RMS-relative
+error 1.42847e-7. The old ordered join oracle remains independent and unchanged.
+
+The exchange correction materially reduces the microbenchmark's overhead, but TP still
+loses to balanced EP in 31/32 cases. Unweighted medians across eight synthetic format
+pairs (ratios are medians of paired ratios, not ratios of the displayed medians):
+
+| T | TP wall us | Balanced EP wall us | TP/balanced EP | TP/8-primary-2-peer EP | TP/single GPU |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1 | 166.12 | 155.12 | 1.058 | 1.051 | 1.114 |
+| 2 | 179.25 | 170.65 | 1.062 | 1.032 | 1.058 |
+| 4 | 217.34 | 201.90 | 1.087 | 0.986 | 0.959 |
+| 8 | 324.81 | 292.61 | 1.086 | 0.901 | 0.818 |
+
+TP wins against the single-GPU control in 16/32 and the primary-heavy EP control in
+15/32 cases. At T8 it wins all eight primary-heavy cases, about 10% by the paired median;
+at T1/T2 its median is still slower. These are synthetic local-subgraph results, not a
+model-weighted estimate or whole-decode result. The model's aggregate ownership hits
+cannot establish its per-layer critical-path distribution.
+
+TP input/return stage medians are now about 8.7/13.0 us at T1 and 12.0/16.3 us at T8.
+The return payload is T*N floats rather than K*T*N, metadata is packed/pinned, and the
+intermediate host join is removed. Those changes were tested together, so the result
+cannot assign a speedup to each separately or claim physical transport bandwidth.
+Balanced EP benefits from the same protocol and retains its advantage. Production TP
+FFN integration is not justified by this result alone.
+
+## Production exchange boundary and next bounded candidate
+
+The user's `PeerExperts` decode path is different from both test modes:
+
+- `src/core/peer_experts.cpp:227-247` uploads pinned-host input and packed metadata,
+  computes peer-owned rows, then directly scatters those rows to mapped **host** output.
+- `PeerExperts::finish` (`:255-267`) CPU-polls peer stream completion.
+- `src/core/expert_source.cpp:3250,3362` launches/joins this work. The verifier waits
+  for the host completion flag, gathers missing rows from mapped memory, adds primary
+  hits, and combines routing weights (`src/core/verify.cpp:1507-1548`). With batched
+  decode it already avoids copying primary-owned rows: its payload is peer_entries*N,
+  not automatically K*T*N.
+- A separate helper-cache optimization already reduces remote rows to T*N, then D2H
+  copies and host-accumulates them (`src/core/remote_expert_opt.cu:97-119`). It attaches
+  `RemoteExperts`, not `PeerExperts` (`src/program/generate.cpp:4830,4903`).
+
+A bounded next candidate is an opt-in reduced peer return, retaining expert ownership
+and the existing completion protocol: publish router weights, reduce peer-owned rows
+in original token/route order, write T*N into a fixed primary-device buffer, mask these
+rows out of the host gather, and add the peer sum at the existing combine boundary.
+This changes FP32 association and needs the independent row/combine oracle and real
+logit/greedy checks. It must support empty ownership, sparse per-token routes and replay.
+It can reuse the helper optimization's mask/combine semantics rather than inventing a
+second incompatible scheme. No engine changes have been made.
+
+Retain the host completion gate initially. The verifier captures the whole layer range
+for a window (`verify.cpp:1718,1982`), unlike the prototype's independently launched
+per-rank compute graphs. Moving its synchronization to cross-device events requires an
+explicit graph-generation/lifetime design; an event wait inserted into an already-running
+graph is not automatically equivalent to the prototype. No 30–50% model gain follows
+from this candidate.
+
+## Validation status
+
+CPU strict-warning, optimized, Release/NDEBUG and ASan/UBSan checks passed.
 LeakSanitizer is unavailable under this executor's ptrace, so its check was disabled.
-Host harness C++ syntax was checked with local API declarations; that is not a HIP compile.
-CMake was unavailable in the authoring executor. The initial rows-return version did
-compile/run on the owner's hardware as recorded above. The reduction/peer-write/event version compiled on hardware, but its initial probe failed
-before arithmetic/timing. The corrected probe's GPU build/visibility and subsequent
-reduced arithmetic/timing remain pending hardware validation. These test sources do not enable any production TP path.
+The authoring executor has no HIP toolchain; GPU compile and runtime evidence above
+comes from the owner's hardware logs. The corrected reduced protocol passed its hardware
+gate. Real-weight/model-quality and production integration remain untested. These test
+sources do not enable any production TP path.

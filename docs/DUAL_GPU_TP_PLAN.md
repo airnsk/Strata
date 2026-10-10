@@ -4,8 +4,9 @@ Decision document, updated 2026-10-10. Initial source review: Strata `6c32b09` a
 Castagna Veloce `3483d462715d61f21ed5877836be35a724446359`. The running configuration,
 manifest and GGUF header metadata have now been supplied. A build-off, routed-expert-only
 TP2 test prototype is implemented. Its initial rows-return version passed 32 synthetic GPU
-cases but was slower than balanced EP in 30/32; the updated reduced/event exchange is
-implemented and awaits hardware validation. No production
+cases but was slower than balanced EP in 30/32. The corrected reduced/event exchange
+also passed all 32 cases (12 measured iterations), yet TP lost to balanced EP in 31/32.
+Production routed-FFN TP integration is therefore deferred. No production
 TP integration or whole-decode speedup is claimed. See [TP2_FFN_TEST.md](TP2_FFN_TEST.md).
 
 Target hardware reported by the owner: two MI50 32 GB, gfx906, 60 CUs/card, 150 W/card;
@@ -36,9 +37,18 @@ weight ownership, dense/attention TP and inference graph integration remain unim
 
 ## Decision before production coding
 
-Prototype a complete routed-plus-shared FFN split, then a complete GDN layer. Do not
-start with an isolated output-head optimization or copy the donor's persistent FFN
-kernel without adapting its quantization contract. Keep existing HC experiments unchanged.
+The routed-only prototype now supplies a negative balanced-EP performance result. Do
+not integrate its weight sharding into production on that evidence. At T8 it improves
+synthetic 8/2 primary-heavy EP by about 10% (paired median), but loses at T1/T2; this
+does not establish the whole-model goal. A reduced PeerExperts return is a narrower
+engine candidate; its exact existing transport and the already-reduced RemoteExperts
+helper path are documented in [TP2_FFN_TEST.md](TP2_FFN_TEST.md). No engine change is
+authorized by this decision document alone.
+
+The complete routed-plus-shared FFN and GDN-layer designs below remain future feasibility
+work, not the next automatic implementation step. Do not start with an isolated
+output-head optimization or copy the donor's persistent FFN kernel without adapting its
+quantization contract. Keep existing HC experiments unchanged.
 
 **Existing expert parallelism is already parallel compute.** `PeerExperts::launch`
 (`src/core/peer_experts.cpp`) launches `native_expert_grouped` on the peer; the primary
@@ -213,9 +223,9 @@ both cards is not the proposed design.
    only if the measured critical-path saving justifies the remaining engineering cost.
 
 Configuration, manifest, header and startup memory evidence have arrived. Initial GPU
-phase parity passed, but transfer-inclusive timing was negative. The next bounded test
-reduces on both EP/TP ranks and uses explicit fenced peer writes/event dependencies;
-its results remain pending. Stop before production integration until measured performance
+phase parity passed, but transfer-inclusive timing was negative. The reduced exchange
+now also passes arithmetic and transport gates; TP still loses to balanced EP in 31/32
+cases. Stop before production TP integration until measured performance
 justifies it and the complete memory budget is checked. No GPU compiler/device was
 available in the authoring executor.
 
