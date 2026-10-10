@@ -17,6 +17,22 @@ Read alongside `DUAL_GPU_TP_PLAN.md`, `TP2_FFN_TEST.md`,
 negative measurements do not settle whole-layer performance. They also do not
 justify promising a 30–50% or 2x whole-generation improvement.
 
+## Current hardware decision
+
+The captured output-row layer remains the accepted baseline. The column-owned
+candidate at `1170cc2` failed seven unchanged whole-layer numerical checks
+(88 prefix cases and 88 continuations), so its timing gate did not run. See
+`TP2_GDN_LAYER_TEST.md` for the source log/hash and same-input diagnostics.
+Changing FP32 reduction association before activation quantization cannot inherit
+the earlier row-owned parity result. Neither this candidate nor the rejected
+flat schedules establishes a full-model acceleration result.
+
+The next isolated experiment is explicit BF16 HC down-row retiling, preserving
+the selected implementation's arithmetic and adding no TP join. Its real-weight
+whole-HC exact gate and T1/2/4/5/8 paired timing instructions are in
+`TP2_GDN_LAYER_TEST.md`. This is a component experiment, not a replacement for
+the complete-layer or generation gates.
+
 ## 1. Actual integration constraints
 
 The useful mathematical boundaries already exist in

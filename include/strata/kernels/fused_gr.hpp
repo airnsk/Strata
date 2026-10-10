@@ -59,6 +59,20 @@ constexpr int kFusedGrMaxT = 8;
 bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream,
                          unsigned long long* stamp_buf = nullptr, int stamp_i0 = 0);
 
+/// Explicit BF16 HC down-row retile experiment. Keeps the selected plain/split/staged
+/// variant, norm/up kernels, token chunks and each lane's arithmetic. Only down row
+/// ownership changes: four rows / 128 threads / 81 blocks instead of eight / 256 / 41.
+/// No Q8 weight overrides, persistent router fusion or K-split path. Call info/warmup
+/// before graph capture; no process-global selector is modified. Returns q8_mixed status.
+struct FusedGrRetileInfo {
+    int variant = 0, tile_floats = 0, chunk_tokens = 0;
+    int rows_per_block = 4, threads = 128, blocks = 81;
+    uint64_t dynamic_lds_bytes = 0;
+};
+void fused_gr_retiled_info(int n_tok, FusedGrRetileInfo* info);
+bool fused_gr_read_multi_retiled(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream,
+                                 unsigned long long* stamp_buf = nullptr, int stamp_i0 = 0);
+
 struct FusedGrRouter {
     const uint16_t* weights = nullptr; ///< BF16 [n_expert][2560], FP32 activations
     float* logits = nullptr;           ///< contiguous [n_tok][n_expert]

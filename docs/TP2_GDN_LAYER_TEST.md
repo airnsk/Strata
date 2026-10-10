@@ -184,6 +184,58 @@ unchanged; column mode is a distinct predeclared engineering experiment:
 Changing this contract does not establish model quality; end-to-end logits,
 routing and MTP acceptance still require later full-model validation.
 
+## Exact BF16 HC retiling experiment
+
+This separate opt-in experiment tests HC scheduling, not another TP exchange
+protocol. It keeps the canonical BF16 weights, FP32 activations and each row's
+existing dot-product accumulation/reduction order. The explicit
+`fused_gr_read_multi_retiled` entry changes down geometry from eight rows per
+256-thread block (41 blocks, including injection) to four rows per 128-thread
+block (81 blocks per down launch). It preserves the selected plain/split/staged
+variant, token chunks, and norm/up kernels. For example, staged T8 can still
+require 6+2 token chunks; this is not a claim of fewer launches. No inter-rank
+join is introduced. The production default is unchanged.
+
+`hc_retiled_bench` uses actual layer-0 HC weights and identical inputs. Direct
+exact checks cover all T=1..8, ordinary read, pending-residual write/read and
+optional-pointer/alias cases. Captured whole-HC timing covers T=1,2,4,5,8:
+attention HC read, pending write plus FFN HC read, then final HC write, using
+synthetic sublayer outputs. This does not execute a complete GDN/FFN layer.
+Whole-HC results must match exactly before unprofiled paired timing is admitted.
+Compare against the **actual selected** existing implementation; a comparison
+only against a forced slower plain variant is not an acceleration result.
+Warmup, input upload, output copies and correctness checks stay outside timing.
+Any separately instrumented measurements are diagnostic only.
+
+Run in the existing tested ROCm image with both GPUs idle:
+
+```sh
+bash tools/run_hc_retiled_mi50.sh EXISTING_IMAGE /absolute/model/root \
+  --pack /models/PACK_DIRECTORY \
+  --gguf /models/EXPERT_SHARD \
+  --gguf /models/COMPANION_SHARD \
+  --trials 8 --batch 32 --warmup 16
+```
+
+The script builds only `hc_retiled_bench` in `build-hc-retiled`, mounts the model
+root read-only, and measures GPU0 and GPU1 sequentially. It changes no service,
+clock or power settings. Defaults are `BUILD_JOBS=48` and `TP2_TIMEOUT=1200`.
+`STRATA_HC_SPLIT` and `STRATA_GR_FAST` must be unset: the runner checks/selects
+the accepted default on each device and reports its variant, tile, token chunks
+and LDS. Persistent HC, GR_V3 and K-split overrides are disabled for both arms;
+Q8 weight overrides are outside the candidate contract.
+
+Raw ABBA/BAAB crossover samples report host wall and GPU-event time per whole-HC
+call, followed by paired summaries. Fixtures change between trials but repeat
+identically within each timed batch; post-batch checks do not imply every timed
+intermediate was downloaded. Logs identify the source commit/file hashes and
+weight/input checksums. A timeout, error or numerical mismatch is not a pass.
+
+A faster HC fixture would still need complete-layer and full-model validation.
+It does not establish model tokens/s, TP scaling or a generation-speed gain.
+The authoring environment has no HIP compiler or GPU; source/CPU checks do not
+establish this candidate's hardware correctness or performance.
+
 ## Validation status
 
 Hardware gate passed on 2026-10-10 at `67a423a89305077772589f625a2087d65f256f31`:
@@ -249,11 +301,28 @@ approximately 320 us of added HC exchange spans. All 48 layers' supplied HC
 projection/injection tensors are actually BF16, so a Q8 HC path would require
 new quantization rather than recovering an original representation.
 
-The captured/event schedule remains the performance baseline. The next candidate
-changes ownership to local-input projection/down partials and two output
-reductions, without either intermediate Y or hidden all-gather. It retains
-replicated HC and native weights. It must establish its own numerical and
-whole-layer timing evidence; altered FP32 association is not bitwise equivalence.
+The captured/event output-row schedule remains the performance baseline.
+
+### Column-owned hardware result at 1170cc2
+
+The two-MI50 layer-0 gate at `1170cc2e8b272bb2584d3db99ac97ca9c7547ec2`
+failed the unchanged numerical contract. `tp2-gdn-20261010T154259Z.txt` reports
+88 prefix cases and 88 continuations with seven failures: five combined-FFN
+comparisons and two final-residual comparisons. Source SHA-256:
+`ea51321594631aaf9b410d9a1178a8fbab1fbb785b8f854673b0a1464b9e35e6`.
+The log contains stand-local paths and is not bundled here.
+
+The decision is **reject the column candidate**. Timing was not admitted after
+the failed correctness gate; separate instrumented traces are not a speed result.
+At the worst T6/keep5 case, mixer drift was only 1.788139e-7, but changed HC/FFN
+inputs crossed quantization boundaries and combined-FFN error reached 2.730414e-4.
+The candidate's hidden Q8 matched an independent full-GU calculation on its own
+input exactly, and the original full FFN on that same input differed by at most
+5.960464e-8. Replica, router-ID and recurrence/conv checks passed. This supports
+upstream FP32-association/quantization amplification rather than a hidden-shard
+or fused-FFN ownership error, but does not satisfy the original-reference gate.
+No thresholds were relaxed. The experiment establishes neither full-model
+correctness nor acceleration.
 
 The remaining integration includes QSA/KV/indexer commit, PLE, full-model rank
 residency, output head, prompt ingestion, MTP binding, graph capture and the

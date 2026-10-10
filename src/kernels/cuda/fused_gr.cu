@@ -14,11 +14,13 @@
 #endif
 
 #include <atomic>
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <random>
 #include <string>
+#include <stdexcept>
 #include <vector>
 
 namespace strata::kernels {
@@ -288,6 +290,61 @@ __global__ void __launch_bounds__(THREADS) gr_down_multi_kernel(GrMulti m) {
         const float4* src4 = reinterpret_cast<const float4*>(m.xn);
         float4* tile4 = reinterpret_cast<float4*>(tile);
         for (int i = t; i < T * (TILEV / 4); i += THREADS) {
+            const int k = i / (TILEV / 4), off = i - k * (TILEV / 4);
+            tile4[i] = src4[((size_t) k * D + base) / 4 + off];
+        }
+        __syncthreads();
+        if (!active) continue;
+#pragma unroll
+        for (int q = 0; q < TQ; ++q) {
+            const int j = lane + 32 * q;
+#pragma unroll
+            for (int k = 0; k < MAX_T; ++k)
+                if (k < T) acc[k] += dot8(wv[q], tile + k * TILEV + j * 8);
+        }
+    }
+    if (!active) return;
+    float s[MAX_T];
+#pragma unroll
+    for (int k = 0; k < MAX_T; ++k) s[k] = k < T ? warp_sum(acc[k]) : 0.0f;
+    // lane k writes token k (every lane holds every sum after the xor reduction)
+#pragma unroll
+    for (int k = 0; k < MAX_T; ++k) {
+        if (k >= T || lane != k) continue;
+        if (inject_block) {
+            m.a[k].inject_out[row] = s[k];
+        } else {
+            const float x = s[k] / (float) HC;
+            m.a[k].lo[row] = x / (1.0f + __expf(-x));
+        }
+    }
+}
+
+// Opt-in row-only retile; arithmetic below intentionally matches the original body.
+template <int TILEV, int MAX_T = kFusedGrMaxT>
+__global__ void __launch_bounds__(128) gr_down_retiled_multi_kernel(GrMulti m) {
+    constexpr int TQ = TILEV / 8 / 32;      // uint4 weight chunks per lane per tile
+    extern __shared__ __align__(16) float tile[];   // [T][TILEV]
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const int T = m.T;
+    const bool inject_block = blockIdx.x == LR / 4;
+    const int row = inject_block ? warp : blockIdx.x * 4 + warp;
+    const bool active = !(inject_block && (m.a[0].w_inject == nullptr || warp >= HC));
+    const uint16_t* wrow = (inject_block ? m.a[0].w_inject : m.a[0].w_down) + (size_t) (active ? row : 0) * D;
+    const uint4* w4 = reinterpret_cast<const uint4*>(wrow);
+    float acc[MAX_T];
+#pragma unroll
+    for (int k = 0; k < MAX_T; ++k) acc[k] = 0.0f;
+    for (int base = 0; base < D; base += TILEV) {
+        uint4 wv[TQ];
+        if (active) {
+#pragma unroll
+            for (int q = 0; q < TQ; ++q) wv[q] = __ldg(w4 + base / 8 + lane + 32 * q);
+        }
+        __syncthreads();                                   // the previous tile is consumed
+        const float4* src4 = reinterpret_cast<const float4*>(m.xn);
+        float4* tile4 = reinterpret_cast<float4*>(tile);
+        for (int i = t; i < T * (TILEV / 4); i += 128) {
             const int k = i / (TILEV / 4), off = i - k * (TILEV / 4);
             tile4[i] = src4[((size_t) k * D + base) / 4 + off];
         }
@@ -744,6 +801,86 @@ __global__ void __launch_bounds__(THREADS) gr_down_staged_kernel(GrMulti m) {
     }
 }
 
+__device__ __forceinline__ void stage_retiled_htile(const GrMulti& m, int T, int h, float4* buf, int t) {
+    for (int i = t; i < T * (H_TILE / 4); i += 128) {
+        const int k = i / (H_TILE / 4), s4 = i - k * (H_TILE / 4);   // s4: float4 of the tile, chunk s4/2, half s4&1
+        const float* src = m.xn + (size_t) k * D + (size_t) h * H_TILE + (size_t) s4 * 4;
+        cp_async16(buf + (size_t) k * (H_TILE / 4) + (s4 & 1) * (H_TILE / 8) + (s4 >> 1), src);
+    }
+}
+
+template <int MAX_T = kFusedGrMaxT, bool EXACT_T = false>
+__global__ void __launch_bounds__(128) gr_down_retiled_staged_kernel(GrMulti m) {
+    extern __shared__ __align__(16) float4 hbuf[];      // 2 buffers x [T][2][160] float4
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const int T = EXACT_T ? MAX_T : m.T;
+    const bool inject_block = blockIdx.x == LR / 4;
+    const int row = inject_block ? warp : blockIdx.x * 4 + warp;
+    const bool active = !(inject_block && (m.a[0].w_inject == nullptr || warp >= HC));
+    const uint16_t* wrow = (inject_block ? m.a[0].w_inject : m.a[0].w_down) + (size_t) (active ? row : 0) * D;
+    const uint4* w4 = reinterpret_cast<const uint4*>(wrow);
+    const size_t buf_f4 = (size_t) T * (H_TILE / 4);    // float4 per buffer (the second one follows the first)
+    float acc[MAX_T];
+#pragma unroll
+    for (int k = 0; k < MAX_T; ++k) acc[k] = 0.0f;
+    uint4 wv[HQ], wnext[HQ];
+    if (active) {
+#pragma unroll
+        for (int q = 0; q < HQ; ++q) wv[q] = __ldg(w4 + lane + 32 * q);
+    }
+    stage_retiled_htile(m, T, 0, hbuf, t);
+    cp_async_commit();
+    stage_retiled_htile(m, T, 1, hbuf + buf_f4, t);
+    cp_async_commit();
+#pragma unroll 1
+    for (int h = 0; h < N_HTILES; ++h) {
+        if (active && h + 1 < N_HTILES) {
+#pragma unroll
+            for (int q = 0; q < HQ; ++q) wnext[q] = __ldg(w4 + (h + 1) * (H_TILE / 8) + lane + 32 * q);
+        }
+        if (h + 1 < N_HTILES) cp_async_wait1();         // tile h has landed (h + 1 may still be on its way)
+        else cp_async_wait0();
+        __syncthreads();
+        const float4* cur = hbuf + (h & 1) * buf_f4;
+        if (active) {
+#pragma unroll
+            for (int q = 0; q < HQ; ++q) {
+                const int j = lane + 32 * q;
+                const Bf16x8 wvq = unpack8(wv[q]);
+#pragma unroll
+                for (int k = 0; k < MAX_T; ++k) {
+                    if (EXACT_T || k < T) {
+                        const float4* pk = cur + (size_t) k * (H_TILE / 4);
+                        acc[k] += dot8u(wvq, pk[j], pk[H_TILE / 8 + j]);
+                    }
+                }
+            }
+        }
+        __syncthreads();                                // every warp is done with buffer h & 1
+        if (h + 2 < N_HTILES) stage_retiled_htile(m, T, h + 2, hbuf + (h & 1) * buf_f4, t);
+        cp_async_commit();                              // an empty group at the end keeps the wait counts simple
+        if (h + 1 < N_HTILES) {
+#pragma unroll
+            for (int q = 0; q < HQ; ++q) wv[q] = wnext[q];
+        }
+    }
+    if (!active) return;
+    float s[MAX_T];
+#pragma unroll
+    for (int k = 0; k < MAX_T; ++k) s[k] = (EXACT_T || k < T) ? warp_sum(acc[k]) : 0.0f;
+    // lane k writes token k (every lane holds every sum after the xor reduction)
+#pragma unroll
+    for (int k = 0; k < MAX_T; ++k) {
+        if ((!EXACT_T && k >= T) || lane != k) continue;
+        if (inject_block) {
+            m.a[k].inject_out[row] = s[k];
+        } else {
+            const float x = s[k] / (float) HC;
+            m.a[k].lo[row] = x / (1.0f + __expf(-x));
+        }
+    }
+}
+
 // the current device is Volta (sm_70): the fast norm/up is its default
 bool cur_dev_volta() {
 #if defined(__HIPCC__)
@@ -868,7 +1005,7 @@ bool gr_down_max4() {
     return on;
 }
 
-void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long long* stamp_buf, int stamp_i0) {
+void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long long* stamp_buf, int stamp_i0, bool retiled = false) {
     const int n_tok = m.T;
 #if STRATA_GR_FAST_BUILD
     // gfx906: the latency-hidden norm/up (STRATA_GR_FAST=0: off) - the same sums in the same order as the kernels
@@ -906,7 +1043,24 @@ void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long 
         // kFusedGrMaxT - the same tile, block size, accumulation order and plain/split/staged path, so the same bits
         // (decided once per device: this runs per layer when decode is not captured)
         const bool max4 = ct <= 4 && gr_down_max4();
-        if (staged) {
+        if (retiled) {
+            if (staged) {
+                if (exact_t && ct == 1) gr_down_retiled_staged_kernel<1, true><<<81, 128, smem, st>>>(c);
+                else if (exact_t && ct == 2) gr_down_retiled_staged_kernel<2, true><<<81, 128, smem, st>>>(c);
+                else if (exact_t && ct == 3) gr_down_retiled_staged_kernel<3, true><<<81, 128, smem, st>>>(c);
+                else if (exact_t && ct == 4) gr_down_retiled_staged_kernel<4, true><<<81, 128, smem, st>>>(c);
+                else if (exact_t && ct == 5) gr_down_retiled_staged_kernel<5, true><<<81, 128, smem, st>>>(c);
+                else if (exact_t && ct == 6) gr_down_retiled_staged_kernel<6, true><<<81, 128, smem, st>>>(c);
+                else if (max4) gr_down_retiled_staged_kernel<4><<<81, 128, smem, st>>>(c);
+                else gr_down_retiled_staged_kernel<><<<81, 128, smem, st>>>(c);
+            } else if (tv == 1280) {
+                if (max4) gr_down_retiled_multi_kernel<1280, 4><<<81, 128, smem, st>>>(c);
+                else gr_down_retiled_multi_kernel<1280><<<81, 128, smem, st>>>(c);
+            } else {
+                if (max4) gr_down_retiled_multi_kernel<2560, 4><<<81, 128, smem, st>>>(c);
+                else gr_down_retiled_multi_kernel<2560><<<81, 128, smem, st>>>(c);
+            }
+        } else if (staged) {
             // #783 PR-g (stuchapin909): a launch of exactly ct <= 6 tokens is its own instantiation, the loop bounds
             // are compile-time (the same sums in the same order); STRATA_NO_MULTI_GR=1 keeps the generic kernels
             if (exact_t && ct == 1) gr_down_staged_kernel<1, true><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c);
@@ -1715,6 +1869,78 @@ unsigned long long fused_gr_persistent_launches() {
 #else
     return 0;
 #endif
+}
+
+void fused_gr_retiled_info(int n_tok, FusedGrRetileInfo* info) {
+    if (!info || n_tok < 1 || n_tok > kFusedGrMaxT)
+        throw std::invalid_argument("HC retile info requires T1..8 and nonnull output");
+    int dev = -1;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64)
+        throw std::runtime_error("HC retile cannot identify device");
+    const int variant = fused_gr_variant();
+    const bool staged = variant >= kHcStaged;
+    int tile = 2560;
+    const int chunk = down_chunk(staged, &tile);
+    // The original down_chunk configures only original kernel instantiations.
+    // Configure these separate opt-in kernels on warmup, never change defaults.
+    static bool prepared[64] = {};
+    if (!prepared[dev]) {
+        int unused = 0;
+        const int plain_chunk = down_chunk(false, &unused);
+        const int staged_chunk = down_chunk(true, &unused);
+        const auto set = [](auto kernel, int bytes) {
+            if (bytes > 48 * 1024 &&
+                cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes) != cudaSuccess)
+                throw std::runtime_error("HC retile dynamic shared-memory opt-in failed");
+        };
+        set(gr_down_retiled_multi_kernel<1280>, plain_chunk * 1280 * int(sizeof(float)));
+        set(gr_down_retiled_multi_kernel<1280, 4>, std::min(4, plain_chunk) * 1280 * int(sizeof(float)));
+        set(gr_down_retiled_multi_kernel<2560>, plain_chunk * tile * int(sizeof(float)));
+        set(gr_down_retiled_multi_kernel<2560, 4>, std::min(4, plain_chunk) * tile * int(sizeof(float)));
+        set(gr_down_retiled_staged_kernel<1, true>, 2 * H_TILE * int(sizeof(float)));
+        set(gr_down_retiled_staged_kernel<2, true>, 4 * H_TILE * int(sizeof(float)));
+        set(gr_down_retiled_staged_kernel<3, true>, 6 * H_TILE * int(sizeof(float)));
+        set(gr_down_retiled_staged_kernel<4, true>, 8 * H_TILE * int(sizeof(float)));
+        set(gr_down_retiled_staged_kernel<5, true>, 2 * std::min(5, staged_chunk) * H_TILE * int(sizeof(float)));
+        set(gr_down_retiled_staged_kernel<6, true>, 2 * std::min(6, staged_chunk) * H_TILE * int(sizeof(float)));
+        set(gr_down_retiled_staged_kernel<4>, 2 * std::min(4, staged_chunk) * H_TILE * int(sizeof(float)));
+        set(gr_down_retiled_staged_kernel<>, 2 * staged_chunk * H_TILE * int(sizeof(float)));
+        prepared[dev] = true;
+    }
+    *info = {};
+    info->variant = variant;
+    info->tile_floats = staged ? H_TILE : tile;
+    info->chunk_tokens = chunk;
+    info->dynamic_lds_bytes = uint64_t(std::min(n_tok, chunk)) *
+        uint64_t(staged ? 2 * H_TILE : tile) * sizeof(float);
+}
+
+bool fused_gr_read_multi_retiled(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream,
+                                 unsigned long long* stamp_buf, int stamp_i0) {
+    if (!a || !xn_scratch || n_tok < 1 || n_tok > kFusedGrMaxT || stamp_i0 < 0)
+        throw std::invalid_argument("HC retile requires valid BF16 T1..8 arguments");
+    GrMulti m{};
+    bool q8 = a[0].q8_cnt != nullptr;
+    for (int t = 0; t < n_tok; ++t) {
+        const auto& x = a[t];
+        if (!x.R || !x.w_norm || !x.w_down || !x.w_up || !x.lo || !x.rs || !x.mixed ||
+            (x.w_inject && !x.inject_out) || (x.apply && (!x.bo_prev || !x.inj_prev || !x.R_out)) ||
+            x.w_down != a[0].w_down || x.w_up != a[0].w_up || x.w_inject != a[0].w_inject ||
+            x.w_norm != a[0].w_norm || x.q8_down || x.q8_up || x.q8_inject)
+            throw std::invalid_argument("HC retile requires shared BF16 weights and complete token buffers");
+        m.a[t] = x;
+        q8 = q8 && x.q8_mixed != nullptr;
+    }
+    if (!q8) for (int t = 0; t < n_tok; ++t) m.a[t].q8_mixed = nullptr;
+    m.xn = xn_scratch;
+    m.T = n_tok;
+    FusedGrRetileInfo info;
+    fused_gr_retiled_info(n_tok, &info);
+    launch_multi(m, info.variant, static_cast<cudaStream_t>(stream), stamp_buf, stamp_i0, true);
+    const auto status = cudaGetLastError();
+    if (status != cudaSuccess)
+        throw std::runtime_error(std::string("HC retile launch: ") + cudaGetErrorString(status));
+    return q8;
 }
 
 bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream, unsigned long long* stamp_buf,
