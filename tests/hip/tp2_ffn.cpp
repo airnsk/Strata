@@ -49,7 +49,8 @@ enum class Exchange { Rows, ReducedHost, Reduced };
 struct Options {
     Exchange exchange = Exchange::Reduced;
     int iterations = 12, mode = 8, experts = 10, layer = 0;
-    bool graphs = true;
+    bool graphs = true, profile_stages = false;
+    std::string tp_layout = "both", order = "alternate";
     std::vector<int> tokens{1,2,4,8};
     std::vector<std::string> gguf;
 };
@@ -80,12 +81,21 @@ Options options(int argc, char** argv) {
             else if(v=="reduced")o.exchange=Exchange::Reduced;
             else throw std::invalid_argument("exchange must be rows, reduced-host or reduced");
         }
+        else if (arg == "--tp-layout") o.tp_layout = value();
+        else if (arg == "--order") o.order = value();
+        else if (arg == "--profile-stages") o.profile_stages = true;
         else if (arg == "--no-graphs") o.graphs = false;
-        else throw std::invalid_argument("usage: tp2_ffn [--iters 12] [--mode 8|7] [--experts 10] [--tokens 1..8] [--no-graphs] [--exchange reduced|reduced-host|rows] [--gguf SHARD ... --layer 0]");
+        else throw std::invalid_argument("usage: tp2_ffn [--iters 12] [--mode 8|7] [--experts 10] [--tokens 1..8] [--no-graphs] [--exchange reduced|reduced-host|rows] [--tp-layout column|row|both] [--order alternate|forward|reverse] [--profile-stages] [--gguf SHARD ... --layer 0]");
     }
     if (o.iterations < 1 || o.iterations > 10000 || o.experts < 4 || o.experts > 16 ||
         (o.mode != 7 && o.mode != 8) || o.layer < 0 || o.layer >= 48 ||
         o.tokens[0] < 1 || o.tokens[0] > 8) throw std::invalid_argument("argument out of range");
+    if (o.tp_layout != "column" && o.tp_layout != "row" && o.tp_layout != "both")
+        throw std::invalid_argument("tp-layout must be column, row or both");
+    if (o.order != "alternate" && o.order != "forward" && o.order != "reverse")
+        throw std::invalid_argument("order must be alternate, forward or reverse");
+    if (o.tp_layout != "column" && o.exchange != Exchange::Reduced)
+        throw std::invalid_argument("row/both TP requires --exchange reduced; use --tp-layout column for legacy transport controls");
     return o;
 }
 struct Fixture {
@@ -158,28 +168,40 @@ Fixture real_weights(const Options& o) {
     return f;
 }
 struct Rank {
-    int device, T, K, count, first, ff;
-    k::NativeExpertLayout L;
+    int device, T, K, count, first, ff, width, mode;
+    bool row_tp;
+    k::NativeExpertLayout L, down_L;
     cudaStream_t stream{};
-    cudaGraph_t graph{};
-    cudaGraphExec_t executable{};
+    cudaGraph_t graph{}, down_graph{};
+    cudaGraphExec_t executable{}, down_executable{};
     cudaEvent_t compute_start{},compute_end{};
     std::vector<uint8_t*> blobs;
     float *x=nullptr,*out=nullptr,*local_sum=nullptr,*route_weights=nullptr;
     uint8_t *xq=nullptr,*scratch=nullptr,*record=nullptr,*host_record=nullptr;
     size_t record_bytes=0,weights_offset=0;
+    uint8_t* down_scratch=nullptr;
     bool packed=false,static_ready=false;
     unsigned long long* pointers=nullptr;
     int32_t *starts=nullptr,*groups=nullptr,*dst=nullptr,*tok=nullptr;
     std::vector<unsigned long long> hp;
     std::vector<int32_t> hs,ht,hd,hg;
-    Rank(const Fixture& f,int dev,int tokens,int selected,int begin,int groups_n,bool tensor,bool capture,bool packed_metadata=false)
+    Rank(const Fixture& f,int dev,int tokens,int selected,int begin,int groups_n,bool tensor,bool capture,bool packed_metadata=false, bool output_rows=false, int kernel_mode=8)
       : device(dev),T(tokens),K(selected),count(groups_n),first(begin),ff(tensor?F/2:F),
+        width(output_rows?N/2:N),mode(kernel_mode),row_tp(output_rows),
         L(k::native_expert_layout(f.gu,f.down,N,ff)),packed(packed_metadata) {
         on(device);
         ck(cudaStreamCreateWithFlags(&stream,cudaStreamNonBlocking),"stream");
         ck(cudaEventCreate(&compute_start),"event"); ck(cudaEventCreate(&compute_end),"event");
-        const auto plan = tp::plan(f.gu,f.down,N,F);
+        const auto plan = tp::plan(f.gu,f.down,N,F,row_tp?tp::DownSplit::OutputRows:tp::DownSplit::Columns);
+        if(row_tp){
+            // GU retains N input and F/2 rows; down uses F input and N/2 rows.
+            // Both views address the SAME unchanged native-block shard blob.
+            L.bytes=plan.shard.bytes;
+            down_L=k::native_expert_layout(f.gu,f.down,N/2,F);
+            down_L.down_off=plan.shard.down.offset;
+            down_L.bytes=plan.shard.bytes;
+            down_scratch=alloc<uint8_t>(k::native_expert_scratch_bytes(count*T,F));
+        }
         if (count) for (const auto& original : f.blobs) {
             auto b = tensor ? tp::split(plan,original,(unsigned)device) : original;
             auto* p = alloc<uint8_t>(b.size());
@@ -214,6 +236,12 @@ struct Rank {
             compute();
             ck(cudaStreamEndCapture(stream,&graph),"capture end");
             ck(cudaGraphInstantiate(&executable,graph,nullptr,nullptr,0),"instantiate");
+            if(row_tp){
+                ck(cudaStreamBeginCapture(stream,cudaStreamCaptureModeThreadLocal),"down capture begin");
+                compute_down();
+                ck(cudaStreamEndCapture(stream,&down_graph),"down capture end");
+                ck(cudaGraphInstantiate(&down_executable,down_graph,nullptr,nullptr,0),"down instantiate");
+            }
         }
     }
     Rank(const Rank&)=delete;
@@ -222,6 +250,9 @@ struct Rank {
         if(stream) cudaStreamSynchronize(stream);
         if(executable) cudaGraphExecDestroy(executable);
         if(graph) cudaGraphDestroy(graph);
+        if(down_executable) cudaGraphExecDestroy(down_executable);
+        if(down_graph) cudaGraphDestroy(down_graph);
+        cudaFree(down_scratch);
         for(auto p:blobs) cudaFree(p);
         cudaFree(x);cudaFree(xq);cudaFree(out);cudaFree(scratch);cudaFree(local_sum);
         if(packed){cudaFree(record);cudaFreeHost(host_record);}else cudaFree(pointers);
@@ -249,23 +280,39 @@ struct Rank {
     void compute() {
         if (!count) return;
         k::quantize_q8_1_rows(x,T,N,xq,stream);
+        k::native_expert_set_mode(mode,row_tp?1:0);
         k::native_expert_grouped(L,pointers,starts,groups,dst,tok,count,count*T,xq,scratch,out,stream);
+        k::native_expert_set_mode(mode,0);
+    }
+    void compute_down() {
+        k::native_expert_set_mode(mode,2);
+        k::native_expert_grouped(down_L,pointers,starts,groups,dst,tok,count,count*T,xq,down_scratch,out,stream);
+        k::native_expert_set_mode(mode,0);
+    }
+    void launch_down() {
+        on(device);
+        if(down_executable) ck(cudaGraphLaunch(down_executable,stream),"down graph launch");
+        else compute_down();
+    }
+    uint8_t* hidden_ptr(bool full=false) {
+        const size_t bytes=(size_t)count*T*(full?F:ff)*sizeof(float);
+        return (full?down_scratch:scratch)+3*((bytes+255)&~size_t(255));
     }
     void poison() {
         on(device);
         ck(cudaMemsetAsync(out,0xff,(size_t)std::max(1,count)*T*N*sizeof(float),stream),"poison output");
         ck(cudaMemsetAsync(local_sum,0xff,(size_t)T*N*sizeof(float),stream),"poison reduced output");
     }
-    void launch(bool poison_now=true) {
+    void launch(bool poison_now=false, bool profile=false) {
         on(device);
         if(poison_now)poison();
-        ck(cudaEventRecord(compute_start,stream),"compute start");
+        if(profile) ck(cudaEventRecord(compute_start,stream),"compute start");
         if(executable) ck(cudaGraphLaunch(executable,stream),"graph launch");
         else compute();
-        ck(cudaEventRecord(compute_end,stream),"compute end");
+        if(profile) ck(cudaEventRecord(compute_end,stream),"compute end");
     }
     void reduce(float* destination,bool peer) {
-        on(device);tp2_rank_reduce(out,route_weights,destination,T,K,N,count,first,peer,stream);
+        on(device);tp2_rank_reduce(out,route_weights,destination,T,K,width,count,first,peer,stream);
     }
     void sync() { on(device);ck(cudaStreamSynchronize(stream),"rank sync"); }
     std::vector<uint8_t> hidden() {
@@ -287,14 +334,14 @@ struct Join {
     }
     ~Join(){cudaSetDevice(0);cudaFree(peer);cudaFree(weights);cudaFree(rows);cudaFree(out);
         cudaEventDestroy(transfer_start);cudaEventDestroy(transfer_end);}
-    void run(Rank& a,Rank* b,const std::vector<float>& w,bool tp) {
+    void run(Rank& a,Rank* b,const std::vector<float>& w,bool tp,bool profile=false) {
         // No device-side spin. Complete peer compute explicitly, then return its
         // compact rows on primary's stream after primary compute. Wall time counts it.
         if(b)b->sync();
         on(0);upload(weights,w,a.stream);
-        ck(cudaEventRecord(transfer_start,a.stream),"return start");
+        if(profile) ck(cudaEventRecord(transfer_start,a.stream),"return start");
         if(b && b->count) ck(cudaMemcpyPeerAsync(peer,0,b->out,1,(size_t)b->count*T*N*sizeof(float),a.stream),"return P2P");
-        ck(cudaEventRecord(transfer_end,a.stream),"return end");
+        if(profile) ck(cudaEventRecord(transfer_end,a.stream),"return end");
         tp2_ffn_join(a.out,peer,weights,rows,out,T,K,N,a.count,tp,a.stream);
         a.sync();
     }
@@ -438,39 +485,41 @@ bool peer_ready(Exchange exchange) {
     return true;
 }
 struct ExchangeEvents {
-    cudaEvent_t input_start{},input_end{},input_ready{},output_start{},output_end{},peer_ready{};
+    cudaEvent_t input_start{},input_end{},input_ready{},output_start{},output_end{},peer_ready{},hidden_ready0{},hidden_ready1{};
     ExchangeEvents(){
         on(0);ck(cudaEventCreate(&input_start),"input event");ck(cudaEventCreate(&input_end),"input event");
         ck(cudaEventCreateWithFlags(&input_ready,cudaEventDisableTiming),"input dependency");
+        ck(cudaEventCreateWithFlags(&hidden_ready0,cudaEventDisableTiming),"hidden dependency0");
         on(1);ck(cudaEventCreate(&output_start),"output event");ck(cudaEventCreate(&output_end),"output event");
         ck(cudaEventCreateWithFlags(&peer_ready,cudaEventDisableTiming),"peer dependency");
+        ck(cudaEventCreateWithFlags(&hidden_ready1,cudaEventDisableTiming),"hidden dependency1");
     }
-    ~ExchangeEvents(){cudaSetDevice(0);cudaEventDestroy(input_start);cudaEventDestroy(input_end);cudaEventDestroy(input_ready);
-        cudaSetDevice(1);cudaEventDestroy(output_start);cudaEventDestroy(output_end);cudaEventDestroy(peer_ready);}
+    ~ExchangeEvents(){cudaSetDevice(0);cudaEventDestroy(input_start);cudaEventDestroy(input_end);cudaEventDestroy(input_ready);cudaEventDestroy(hidden_ready0);
+        cudaSetDevice(1);cudaEventDestroy(output_start);cudaEventDestroy(output_end);cudaEventDestroy(peer_ready);cudaEventDestroy(hidden_ready1);}
     double input_us(){on(0);float ms=0;ck(cudaEventElapsedTime(&ms,input_start,input_end),"input elapsed");return ms*1000.;}
     double output_us(){on(1);float ms=0;ck(cudaEventElapsedTime(&ms,output_start,output_end),"reduce/push elapsed");return ms*1000.;}
 };
-void run_reduced(Rank& a,Rank& b,Join& join,const std::vector<float>& w,int epoch,Exchange exchange,ExchangeEvents& ev){
+void run_reduced(Rank& a,Rank& b,Join& join,const std::vector<float>& w,int epoch,Exchange exchange,ExchangeEvents& ev,bool profile=false){
     // Live routes and weights remain inside wall timing; only invariant tables
     // were uploaded during construction. Pinned buffers remain alive until DAG completion.
     a.metadata(epoch,&w);b.metadata(epoch,&w);
-    on(0);ck(cudaEventRecord(ev.input_start,a.stream),"input push start");
+    on(0);if(profile) ck(cudaEventRecord(ev.input_start,a.stream),"input push start");
     if(b.count)tp2_input_push(a.x,b.x,a.T*N,a.stream);
-    ck(cudaEventRecord(ev.input_end,a.stream),"input push end");
+    if(profile) ck(cudaEventRecord(ev.input_end,a.stream),"input push end");
     ck(cudaEventRecord(ev.input_ready,a.stream),"input ready");
-    a.launch(false);a.reduce(a.local_sum,false);
+    a.launch(false,profile);a.reduce(a.local_sum,false);
     on(1);ck(cudaStreamWaitEvent(b.stream,ev.input_ready,0),"peer waits input");
-    b.launch(false);
-    ck(cudaEventRecord(ev.output_start,b.stream),"reduce/push start");
+    b.launch(false,profile);
+    if(profile) ck(cudaEventRecord(ev.output_start,b.stream),"reduce/push start");
     b.reduce(exchange==Exchange::Reduced?join.peer:b.local_sum,exchange==Exchange::Reduced);
-    ck(cudaEventRecord(ev.output_end,b.stream),"reduce/push end");
-    ck(cudaEventRecord(ev.peer_ready,b.stream),"peer output ready");
+    if(profile) ck(cudaEventRecord(ev.output_end,b.stream),"reduce/push end");
+    if(exchange==Exchange::Reduced)ck(cudaEventRecord(ev.peer_ready,b.stream),"peer output ready");
     if(exchange==Exchange::ReducedHost){
         // Attribution control: reduced payload, but original host join/runtime return copy.
         b.sync();on(0);
-        ck(cudaEventRecord(join.transfer_start,a.stream),"runtime return start");
+        if(profile) ck(cudaEventRecord(join.transfer_start,a.stream),"runtime return start");
         ck(cudaMemcpyPeerAsync(join.peer,0,b.local_sum,1,(size_t)a.T*N*sizeof(float),a.stream),"reduced runtime return");
-        ck(cudaEventRecord(join.transfer_end,a.stream),"runtime return end");
+        if(profile) ck(cudaEventRecord(join.transfer_end,a.stream),"runtime return end");
     }else{
         on(0);ck(cudaStreamWaitEvent(a.stream,ev.peer_ready,0),"primary waits peer output");
     }
@@ -490,98 +539,158 @@ Results reduced_result(Rank& a,Rank& b,Join& join,bool tp){
     }
     return {std::move(rows),std::move(combined),{}};
 }
-struct Timing {double wall=0,input=0,output=0,runtime_return=0,rank0=0,rank1=0;};
+// Four dependency events, no host barrier between GU, all-gather and down.
+// Each rank pushes its own half into both full-F buffers, records readiness,
+// then waits for the other half. Final primary completion also covers the peer,
+// making all source/scratch/metadata buffers safe to reuse on the next replay.
+void run_row_tp(Rank& a,Rank& b,Join& join,const std::vector<float>& w,int epoch,
+                ExchangeEvents& ev,bool profile=false) {
+    a.metadata(epoch,&w);b.metadata(epoch,&w);
+    on(0);tp2_input_push(a.x,b.x,a.T*N,a.stream);
+    ck(cudaEventRecord(ev.input_ready,a.stream),"row input ready");
+    a.launch(false,profile);
+    tp2_hidden_push(a.hidden_ptr(),a.hidden_ptr(true),b.hidden_ptr(true),a.T*a.K,(F/2/32)*36,0,a.stream);
+    ck(cudaEventRecord(ev.hidden_ready0,a.stream),"low hidden ready");
+    on(1);ck(cudaStreamWaitEvent(b.stream,ev.input_ready,0),"row peer waits input");
+    b.launch(false,profile);
+    tp2_hidden_push(b.hidden_ptr(),b.hidden_ptr(true),a.hidden_ptr(true),b.T*b.K,(F/2/32)*36,1,b.stream);
+    ck(cudaEventRecord(ev.hidden_ready1,b.stream),"high hidden ready");
+    ck(cudaStreamWaitEvent(b.stream,ev.hidden_ready0,0),"peer waits low hidden");
+    b.launch_down();b.reduce(join.peer,true);
+    ck(cudaEventRecord(ev.peer_ready,b.stream),"row peer reduced ready");
+    on(0);ck(cudaStreamWaitEvent(a.stream,ev.hidden_ready1,0),"primary waits high hidden");
+    a.launch_down();a.reduce(a.local_sum,false);
+    ck(cudaStreamWaitEvent(a.stream,ev.peer_ready,0),"primary waits high output");
+    tp2_concat_rows(a.local_sum,join.peer,join.out,a.T,N/2,a.stream);
+    a.sync();
+}
+Results row_result(Rank& a,Rank& b,Join& join) {
+    on(0);auto low=download(a.out,(size_t)a.T*a.K*N/2);
+    auto combined=download(join.out,(size_t)a.T*N);
+    on(1);auto high=download(b.out,(size_t)a.T*a.K*N/2);
+    std::vector<float> rows((size_t)a.T*a.K*N);
+    for(int i=0;i<a.T*a.K;++i){
+        std::copy_n(low.data()+(size_t)i*N/2,N/2,rows.data()+(size_t)i*N);
+        std::copy_n(high.data()+(size_t)i*N/2,N/2,rows.data()+(size_t)i*N+N/2);
+    }
+    return {std::move(rows),std::move(combined),{}};
+}
 bool run_case(const Fixture& f,int T,const Options& o) {
     const int K=o.experts,epochs=4;
     const bool reduced=o.exchange!=Exchange::Rows;
     const char* exchange=o.exchange==Exchange::Rows?"rows":o.exchange==Exchange::ReducedHost?"reduced-host":"reduced";
-    std::printf("CASE GU=%s(%d) DOWN=%s(%d) N=%d F=%d T=%d K=%d mode=%d GU=%s DOWN=LDS graph=%d exchange=%s\n",
+    std::printf("CASE GU=%s(%d) DOWN=%s(%d) N=%d F=%d T=%d K=%d mode=%d graph=%d exchange=%s tp_layout=%s order=%s\n",
         strata::ggml_type_name(f.gu),f.gu,strata::ggml_type_name(f.down),f.down,N,F,T,K,o.mode,
-        o.mode==8?"fused-LDS-GU-SwiGLU-q8":"LDS-GU then SwiGLU/q8",(int)o.graphs,exchange);
+        (int)o.graphs,exchange,o.tp_layout.c_str(),o.order.c_str());
+    Rank oracle(f,0,T,K,0,K,false,o.graphs,reduced,false,o.mode);Join oracle_join(T,K);
     std::array<Results,4> reference;
-    {
-        Rank oracle(f,0,T,K,0,K,false,o.graphs,reduced);Join join(T,K);
-        double wall=0,compute=0;
-        for(int iteration=-epochs;iteration<o.iterations;++iteration){
-            const int epoch=(iteration+epochs)%epochs;
-            on(0);auto x=input(T,epoch);auto w=routing(T,K,epoch);
-            upload(oracle.x,x,oracle.stream);if(reduced)oracle.poison();oracle.sync();
-            const auto begin=std::chrono::steady_clock::now();
-            oracle.metadata(epoch,reduced?&w:nullptr);oracle.launch(!reduced);
-            if(reduced){oracle.reduce(join.out,false);oracle.sync();}
-            else join.run(oracle,nullptr,w,false);
-            const auto end=std::chrono::steady_clock::now();
-            if(iteration>=0){wall+=std::chrono::duration<double,std::micro>(end-begin).count();compute+=oracle.compute_us();}
-            Results result;
-            if(reduced){
-                on(0);const auto reduced_output=download(join.out,(size_t)T*N);
-                // Independent phase-1 combine remains the oracle. The timed
-                // single-GPU reduction must match it bitwise, outside timing.
-                join.run(oracle,nullptr,w,false);
-                result=join.result();
-                if(!compare(result.combined,reduced_output,"single_reduce_vs_old_join",true,iteration<0,epoch==2))return false;
-            }else result=join.result();
-            if(iteration<0){reference[epoch]=std::move(result);reference[epoch].hq=oracle.hidden();}
-            else if(!compare(reference[epoch].rows,result.rows,"oracle_replay_rows",true,false) ||
-                    !compare(reference[epoch].combined,result.combined,"oracle_replay_combine",true,false,epoch==2))return false;
-        }
-        std::printf(" TIMING single-GPU-full T=%d count=%d wall_us=%.3f compute0_us=%.3f weight_bytes=%zu input_bytes=0 return_bytes=0\n",
-            T,o.iterations,wall/o.iterations,compute/o.iterations,oracle.blobs.size()*oracle.L.bytes);
-    }
-    bool ok=true;
-    const std::vector<std::pair<std::string,int>> modes={{"EP-balanced",K/2},{"EP-primary-heavy",(3*K+2)/4},
-        {"EP-peer-heavy",K-(3*K+2)/4},{"EP-primary-only",K},{"EP-peer-only",0},{"TP2",-1}};
+    auto oracle_run=[&](int epoch,const std::vector<float>& w,bool profile=false){
+        oracle.metadata(epoch,reduced?&w:nullptr);oracle.launch(false,profile);
+        if(reduced){oracle.reduce(oracle_join.out,false);oracle.sync();}
+        else oracle_join.run(oracle,nullptr,w,false,profile);
+    };
+    auto oracle_check=[&](int epoch,bool save){
+        auto x=input(T,epoch);auto w=routing(T,K,epoch);
+        on(0);upload(oracle.x,x,oracle.stream);oracle.poison();oracle.sync();
+        oracle_run(epoch,w);
+        // Independent original ordered per-expert combine is always the oracle.
+        on(0);const auto reduced_output=download(oracle_join.out,(size_t)T*N);
+        oracle_join.run(oracle,nullptr,w,false);
+        auto result=oracle_join.result();
+        if(!compare(result.combined,reduced_output,"single_reduce_vs_old_join",true,false,epoch==2))return false;
+        if(save){reference[epoch]=std::move(result);reference[epoch].hq=oracle.hidden();return true;}
+        return compare(reference[epoch].rows,result.rows,"oracle_replay_rows",true,false) &&
+               compare(reference[epoch].combined,result.combined,"oracle_replay_combine",true,false,epoch==2);
+    };
+    for(int epoch=0;epoch<epochs;++epoch)if(!oracle_check(epoch,true))return false;
+    std::vector<std::pair<std::string,int>> modes={{"EP-balanced",K/2},{"EP-primary-heavy",(3*K+2)/4},
+        {"EP-peer-heavy",K-(3*K+2)/4},{"EP-primary-only",K},{"EP-peer-only",0}};
+    if(o.tp_layout!="row")modes.emplace_back("TP2-column",-1);
+    if(o.tp_layout!="column")modes.emplace_back("TP2-output-row",-2);
     for(const auto& [name,g0]:modes){
-        const bool tp_mode=g0<0;
-        Rank a(f,0,T,K,0,tp_mode?K:g0,tp_mode,o.graphs,reduced);
-        Rank b(f,1,T,K,tp_mode?0:g0,tp_mode?K:K-g0,tp_mode,o.graphs,reduced);
+        const bool tensor=g0<0,row_tp=g0==-2;
+        Rank a(f,0,T,K,0,tensor?K:g0,tensor,o.graphs,reduced,row_tp,o.mode);
+        Rank b(f,1,T,K,tensor?0:g0,tensor?K:K-g0,tensor,o.graphs,reduced,row_tp,o.mode);
         Join join(T,K);ExchangeEvents ev;
-        on(1);cudaEvent_t in0{},in1{};ck(cudaEventCreate(&in0),"input event");ck(cudaEventCreate(&in1),"input event");
-        Timing total;int measured=0;
-        std::printf(" MODE %s computed_experts=%d/%d local_width=%d/%d fixture_weight_bytes=%zu/%zu dynamic_record_bytes=%zu/%zu\n",name.c_str(),a.count,b.count,a.ff,b.ff,
+        std::printf(" MODE %s computed_experts=%d/%d GU_width=%d/%d down_input=%d down_output=%d fixture_weight_bytes=%zu/%zu dynamic_record_bytes=%zu/%zu\n",
+            name.c_str(),a.count,b.count,a.ff,b.ff,row_tp?F:a.ff,a.width,
             a.blobs.size()*a.L.bytes,b.blobs.size()*b.L.bytes,a.record_bytes,b.record_bytes);
+        auto candidate_run=[&](int epoch,const std::vector<float>& w,bool profile=false){
+            if(row_tp)run_row_tp(a,b,join,w,epoch,ev,profile);
+            else if(reduced)run_reduced(a,b,join,w,epoch,o.exchange,ev,profile);
+            else{
+                b.metadata(epoch);on(1);
+                if(b.count)ck(cudaMemcpyPeerAsync(b.x,1,a.x,0,(size_t)T*N*sizeof(float),b.stream),"input P2P");
+                b.launch(false,profile);a.metadata(epoch);a.launch(false,profile);
+                join.run(a,&b,w,tensor,profile);
+            }
+        };
+        auto candidate_check=[&](int epoch,bool verbose){
+            if(verbose)std::printf(" CHECK %s epoch=%d\n",name.c_str(),epoch);
+            auto x=input(T,epoch);auto w=routing(T,K,epoch);
+            on(0);upload(a.x,x,a.stream);a.poison();b.poison();
+            on(1);ck(cudaMemsetAsync(b.x,0xff,(size_t)T*N*sizeof(float),b.stream),"poison peer input");
+            if(row_tp){
+                ck(cudaMemsetAsync(b.down_scratch,0xff,k::native_expert_scratch_bytes(T*K,F),b.stream),"poison high gather");
+                on(0);ck(cudaMemsetAsync(a.down_scratch,0xff,k::native_expert_scratch_bytes(T*K,F),a.stream),"poison low gather");
+            }
+            b.sync();on(0);ck(cudaMemsetAsync(join.peer,0xff,(size_t)T*K*N*sizeof(float),a.stream),"poison peer return");a.sync();
+            candidate_run(epoch,w);
+            const auto got=row_tp?row_result(a,b,join):reduced?reduced_result(a,b,join,tensor):join.result();
+            bool ok=compare(reference[epoch].rows,got.rows,"expert_rows",!tensor||row_tp,verbose) &&
+                compare(reference[epoch].combined,got.combined,"test_FP32_combine",row_tp||(!reduced&&!tensor),verbose,epoch==2);
+            if(b.count){on(1);const auto received=download(b.x,x.size());
+                if(std::memcmp(received.data(),x.data(),x.size()*sizeof(float)))throw std::runtime_error("peer input content mismatch");}
+            if(tensor)ok=hidden_exact(reference[epoch].hq,a.hidden(),b.hidden(),T*K,verbose)&&ok;
+            if(row_tp)for(Rank* rank:{&a,&b}){
+                on(rank->device);const auto gathered=download(rank->hidden_ptr(true),reference[epoch].hq.size());
+                if(gathered!=reference[epoch].hq){std::fprintf(stderr,"full hidden gather mismatch rank=%d epoch=%d\n",rank->device,epoch);ok=false;}
+            }
+            return ok;
+        };
+        // Correctness is deliberately separate from timing. Check all four live
+        // epochs on both sides of the timed batch; do not download every replay.
+        for(int epoch=0;epoch<epochs;++epoch)if(!candidate_check(epoch,true))return false;
+        double baseline=0,candidate=0;
         for(int iteration=-epochs;iteration<o.iterations;++iteration){
             const int epoch=(iteration+epochs)%epochs;
             auto x=input(T,epoch);auto w=routing(T,K,epoch);
-            on(0);upload(a.x,x,a.stream);
-            if(reduced){
-                a.poison();b.poison();
-                on(1);ck(cudaMemsetAsync(b.x,0xff,(size_t)T*N*sizeof(float),b.stream),"poison peer input");b.sync();
-                on(0);ck(cudaMemsetAsync(join.peer,0xff,(size_t)T*N*sizeof(float),a.stream),"poison peer reduced result");
-            }
-            a.sync(); // input resident; diagnostic poison is outside measured protocol
-            const auto begin=std::chrono::steady_clock::now();
-            if(reduced)run_reduced(a,b,join,w,epoch,o.exchange,ev);
-            else{
-                b.metadata(epoch);
-                on(1);ck(cudaEventRecord(in0,b.stream),"input start");
-                if(b.count)ck(cudaMemcpyPeerAsync(b.x,1,a.x,0,(size_t)T*N*sizeof(float),b.stream),"input P2P");
-                ck(cudaEventRecord(in1,b.stream),"input end");b.launch();
-                a.metadata(epoch);a.launch();join.run(a,&b,w,tp_mode);
-            }
-            const auto end=std::chrono::steady_clock::now();
-            if(iteration>=0){
-                ++measured;total.wall+=std::chrono::duration<double,std::micro>(end-begin).count();
-                if(reduced){total.input+=ev.input_us();total.output+=ev.output_us();if(o.exchange==Exchange::ReducedHost)total.runtime_return+=join.transfer_us();}
-                else{on(1);float ms=0;ck(cudaEventElapsedTime(&ms,in0,in1),"input elapsed");total.input+=ms*1000.;total.output+=join.transfer_us();}
-                total.rank0+=a.compute_us();total.rank1+=b.compute_us();
-            }
-            // Diagnostics retain per-expert rows, but never transfer them in the timed reduced protocol.
-            const auto got=reduced?reduced_result(a,b,join,tp_mode):join.result();
-            const bool rows_ok=compare(reference[epoch].rows,got.rows,"expert_rows",!tp_mode,iteration<0);
-            const bool combined_ok=compare(reference[epoch].combined,got.combined,"test_FP32_combine",!reduced&&!tp_mode,iteration<0,epoch==2);
-            ok=rows_ok&&combined_ok&&ok;
-            if(reduced && b.count){on(1);const auto received=download(b.x,x.size());if(std::memcmp(received.data(),x.data(),x.size()*sizeof(float)))throw std::runtime_error("peer input content mismatch");}
-            if(tp_mode)ok=hidden_exact(reference[epoch].hq,a.hidden(),b.hidden(),T*K,iteration<0)&&ok;
-            if(!ok)break;
+            auto timed=[&](bool single){
+                Rank& rank=single?oracle:a;
+                on(0);upload(rank.x,x,rank.stream);rank.sync();
+                const auto begin=std::chrono::steady_clock::now();
+                if(single)oracle_run(epoch,w);else candidate_run(epoch,w);
+                const auto end=std::chrono::steady_clock::now();
+                if(iteration>=0)(single?baseline:candidate)+=std::chrono::duration<double,std::micro>(end-begin).count();
+            };
+            // Swap the order for the same live epoch in successive four-epoch
+            // cycles, so route/input differences cannot alias with pair order.
+            const int sequence=iteration+epochs;
+            const bool reverse=o.order=="reverse" ||
+                (o.order=="alternate" && ((sequence + sequence/epochs)%2));
+            timed(!reverse);timed(reverse);
         }
-        on(1);cudaEventDestroy(in0);cudaEventDestroy(in1);
-        if(measured)std::printf(" TIMING %s T=%d count=%d wall_us=%.3f input_stage_us=%.3f return_stage_us=%.3f runtime_return_copy_us=%.3f compute0_us=%.3f compute1_us=%.3f input_bytes=%zu return_bytes=%zu exchange=%s (stages are not summed; reduced-host return_stage excludes later runtime copy)\n",
-            name.c_str(),T,measured,total.wall/measured,total.input/measured,total.output/measured,total.runtime_return/measured,total.rank0/measured,total.rank1/measured,
-            b.count?(size_t)T*N*sizeof(float):0,reduced?(size_t)T*N*sizeof(float):(size_t)b.count*T*N*sizeof(float),exchange);
-        if(!ok)return false;
+        for(int epoch=0;epoch<epochs;++epoch)if(!oracle_check(epoch,false)||!candidate_check(epoch,false))return false;
+        std::printf(" CORRECTNESS %s PASS pre/post epochs=4 hidden_local=%s hidden_gather=%s rows=%s combine=%s\n",
+            name.c_str(),tensor?"byte-exact":"n/a",row_tp?"byte-exact-both-ranks":"n/a",
+            (!tensor||row_tp)?"bit-exact":"tolerance",row_tp||(!reduced&&!tensor)?"bit-exact":"tolerance");
+        std::printf(" TIMING %s T=%d pairs=%d single_wall_us=%.3f candidate_wall_us=%.3f speedup=%.5f order=%s profile_events=0 input_bytes=%zu hidden_bytes_each_way=%zu return_bytes=%zu exchange=%s\n",
+            name.c_str(),T,o.iterations,baseline/o.iterations,candidate/o.iterations,baseline/candidate,o.order.c_str(),
+            b.count?(size_t)T*N*sizeof(float):0,row_tp?(size_t)T*K*(F/2/32)*36:0,
+            row_tp?(size_t)T*(N/2)*sizeof(float):reduced?(size_t)T*N*sizeof(float):(size_t)b.count*T*N*sizeof(float),exchange);
+        if(o.profile_stages){
+            // Extra instrumentation is a separate diagnostic replay, never mixed
+            // into the wall-time batch. Row rank events measure GU only.
+            auto x=input(T,0);auto w=routing(T,K,0);on(0);upload(a.x,x,a.stream);a.sync();
+            candidate_run(0,w,true);
+            std::printf(" PROFILE %s separate_replay=1 rank_stage=%s rank0_us=%.3f rank1_us=%.3f",
+                name.c_str(),row_tp?"GU-only":"full-FFN",a.compute_us(),b.compute_us());
+            if(reduced&&!row_tp)std::printf(" input_us=%.3f reduce_push_us=%.3f",ev.input_us(),ev.output_us());
+            if(!row_tp&&o.exchange!=Exchange::Reduced)std::printf(" runtime_return_us=%.3f",join.transfer_us());
+            std::printf(" (stages are not summed; excludes uninstrumented stages)\n");
+        }
     }
-    return ok;
+    return true;
 }
 }
 int main(int argc,char** argv){
@@ -595,6 +704,7 @@ int main(int argc,char** argv){
         std::printf("tp2_ffn: routed experts only; no shared FFN, router, HC/KV/MTP or engine integration.\n");
         std::printf("Isolated P2P EP topology baseline, NOT production PeerExperts timing. Selected expert fixtures only; weights uploaded outside timing.\n");
         std::printf("EP fixtures replicate the small K-expert set on active ranks to rotate assignment; compute only assigned experts. This is not a model residency estimate.\n");
+        std::printf("Timing: paired single/candidate order control; only dependency events and final completion in reduced performance path. Correctness pre/post four epochs; --profile-stages is a separate replay.\n");
         std::printf("Routing coverage: four live route/input epochs (ordinary, concentrated, zero, signed-cancellation weights); T entries per expert, same selected set across tokens. No arbitrary sparse per-token routing/shared FFN.\n");
         std::printf("mode=%d (explicit), old_iq=0 grouped_v1=0 expert_v2=0 expert_v2k=0; iterations=%d\n",o.mode,o.iterations);
         std::printf("Predeclared gross-error guard: max_abs/max_ref<=%.3g and RMS_relative<=%.3g, floor=%.3g; componentwise atol=%.3g rtol=%.3g diagnostic only; hidden q8 blocks must be byte-exact. Deliberate zero-weight fixture must return exact zero; expert rows remain nonzero. Not quality approval.\n",max_scaled_limit,rms_relative_limit,norm_floor,component_atol,component_rtol);

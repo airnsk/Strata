@@ -2,7 +2,8 @@
 
 // CPU-only layout prototype for one native (unchanged GGUF block) expert blob.
 // Blob order is gate [F,N], up [F,N], down [N,F]. Each rank owns F/2
-// consecutive gate/up rows and the matching F/2 down columns. This is NOT the
+// consecutive gate/up rows; down is either matching F/2 columns (default)
+// or N/2 complete output rows (test-only output-row TP layout). This is NOT the
 // older packed Q2_0 expert layout with interleaved rows and separate planes.
 // No GPU/runtime dispatch, quantization, activation packing or output reduction
 // is performed here. In particular, byte-exact reassembly is not FFN parity.
@@ -43,7 +44,8 @@ struct ExpertLayout {
 };
 
 // Copy rows of raw blocks from the original blob to one compact rank blob.
-// Gate/up regions are contiguous; down regions gather half of EVERY row.
+// Gate/up regions are contiguous; down either gathers half of every row or
+// copies a contiguous half of the complete output rows.
 struct CopyRegion {
     std::size_t source_offset = 0;
     std::size_t destination_offset = 0;
@@ -54,7 +56,10 @@ struct CopyRegion {
     bool operator==(const CopyRegion&) const = default;
 };
 
+enum class DownSplit { Columns, OutputRows };
+
 struct Plan {
+    DownSplit down_split = DownSplit::Columns;
     int gu_type = 0;
     int down_type = 0;
     std::int64_t model_dim = 0;
@@ -63,7 +68,8 @@ struct Plan {
     BlockFormat down_format;
     ExpertLayout original;
     ExpertLayout shard;
-    // [rank][gate, up, down], rank 0 owns the low F/2 and rank 1 the high F/2.
+    // [rank][gate, up, down]; gate/up own low/high F/2 rows.
+    // Down owns low/high F/2 columns or low/high N/2 rows, per down_split.
     std::array<std::array<CopyRegion, 3>, 2> copies{};
     bool operator==(const Plan&) const = default;
 };
@@ -119,12 +125,17 @@ inline ExpertLayout expert(std::size_t n, std::size_t f,
 }
 }  // namespace detail
 
-// Validate the entire native blob and BOTH half-width down rows. F being even
-// alone is insufficient: F/2 must be divisible by the down block's value count.
+// Validate the native blob and its split boundaries. Column TP requires F/2
+// aligned to down blocks; output-row TP requires full F down-block alignment
+// and F/2 aligned to the 32-value q8_1 hidden activation blocks.
 // Throws invalid_argument for unsupported types/dimensions/block alignment and
 // overflow_error before any byte size or offset can wrap. Allocates no buffers.
-inline Plan plan(int gu_type, int down_type, std::int64_t N, std::int64_t F) {
+inline Plan plan(int gu_type, int down_type, std::int64_t N, std::int64_t F,
+                 DownSplit down_split = DownSplit::Columns) {
     Plan p;
+    p.down_split = down_split;
+    if (down_split != DownSplit::Columns && down_split != DownSplit::OutputRows)
+        throw std::invalid_argument("Unknown TP2 down split");
     p.gu_type = gu_type;
     p.down_type = down_type;
     p.model_dim = N;
@@ -134,10 +145,20 @@ inline Plan plan(int gu_type, int down_type, std::int64_t N, std::int64_t F) {
     const auto n = detail::dimension(N);
     const auto f = detail::dimension(F);
     if (f % 2 != 0) throw std::invalid_argument("TP2 requires an even FFN width");
-    if (n % p.gu_format.values != 0 || (f / 2) % p.down_format.values != 0)
+    if (n % p.gu_format.values != 0 ||
+        (down_split == DownSplit::Columns ? f / 2 : f) % p.down_format.values != 0)
         throw std::invalid_argument("TP2 row or split boundary cuts a quantization block");
     p.original = detail::expert(n, f, p.gu_format, p.down_format);
-    p.shard = detail::expert(n, f / 2, p.gu_format, p.down_format);
+    // Row TP preserves full down rows. Its hidden all-gather boundary must
+    // still coincide with a q8_1 activation block (32 values).
+    if (down_split == DownSplit::OutputRows && ((f / 2) % 32 != 0 || n % 2 != 0))
+        throw std::invalid_argument("TP2 output-row split requires aligned q8 halves and even N");
+    p.shard.gate = detail::matrix(f / 2, n, p.gu_format, 0);
+    p.shard.up = detail::matrix(f / 2, n, p.gu_format, p.shard.gate.bytes);
+    p.shard.down = detail::matrix(down_split == DownSplit::Columns ? n : n / 2,
+                                 down_split == DownSplit::Columns ? f / 2 : f,
+                                 p.down_format, detail::add(p.shard.up.offset, p.shard.up.bytes));
+    p.shard.bytes = detail::add(p.shard.down.offset, p.shard.down.bytes);
     for (std::size_t rank = 0; rank != 2; ++rank) {
         p.copies[rank][0] = {
             detail::add(p.original.gate.offset, rank * p.shard.gate.bytes),
@@ -148,8 +169,8 @@ inline Plan plan(int gu_type, int down_type, std::int64_t N, std::int64_t F) {
             p.shard.up.offset, f / 2, p.shard.up.row_bytes,
             p.original.up.row_bytes, p.shard.up.row_bytes};
         p.copies[rank][2] = {
-            detail::add(p.original.down.offset, rank * p.shard.down.row_bytes),
-            p.shard.down.offset, n, p.shard.down.row_bytes,
+            detail::add(p.original.down.offset, rank * (down_split == DownSplit::Columns ? p.shard.down.row_bytes : p.shard.down.bytes)),
+            p.shard.down.offset, p.shard.down.rows, p.shard.down.row_bytes,
             p.original.down.row_bytes, p.shard.down.row_bytes};
     }
     return p;
@@ -159,7 +180,7 @@ namespace detail {
 // Plan is inspectable and copyable. Reject an edited/default-constructed plan
 // before allowing its offsets to address memory.
 inline void validate(const Plan& p) {
-    if (!(p == plan(p.gu_type, p.down_type, p.model_dim, p.ffn_dim)))
+    if (!(p == plan(p.gu_type, p.down_type, p.model_dim, p.ffn_dim, p.down_split)))
         throw std::invalid_argument("TP2 plan does not match its dimensions and formats");
 }
 inline void copy(const CopyRegion& region, const std::uint8_t* source,

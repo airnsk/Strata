@@ -13,3 +13,10 @@ void tp2_rank_reduce(const float* rows, const float* weights, float* destination
                       bool peer_destination, void* stream);
 void tp2_sum_vectors(const float* rank0, const float* rank1, float* output,
                       int values, void* stream);
+// Copy each entry's raw q8 half into both full-width hidden buffers. No FP decode
+// or requantization. Both destinations receive the same low/high half placement.
+void tp2_hidden_push(const uint8_t* half, uint8_t* local, uint8_t* peer,
+                     int entries, int half_bytes, int rank, void* stream);
+// Concatenate low/high output-row shards (also used for route-reduced vectors).
+void tp2_concat_rows(const float* low, const float* high, float* out,
+                     int rows, int half_width, void* stream);

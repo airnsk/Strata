@@ -12,8 +12,8 @@ link no additional GPU kernels and allocate no TP buffers. The CPU-only
 ## Hardware build and run
 
 The reusable runner builds in a separate directory with the existing image and then
-runs the CPU and GPU gates (replace the image placeholder). The updated default uses
-rank-local reduction and event-joined peer writes:
+runs the CPU and GPU gates (replace the image placeholder). The default compares both input-column and output-row TP against paired single-GPU
+controls, using event-joined peer writes:
 
 ```sh
 bash tools/run_tp2_mi50.sh EXISTING_IMAGE --iters 2
@@ -28,8 +28,9 @@ For a manual build, use the existing gfx906/ROCm workflow in a separate director
 Build only the test targets first:
 
 ```sh
-cmake --build build-tp2 --target tp2_shard_policy tp2_ffn -j 48
+cmake --build build-tp2 --target tp2_shard_policy tp_layer_layout_test tp2_ffn -j 48
 ./build-tp2/tp2_shard_policy
+./build-tp2/tp_layer_layout_test
 HIP_VISIBLE_DEVICES=0,1 timeout 600 ./build-tp2/tp2_ffn --mode 8 --iters 2
 HIP_VISIBLE_DEVICES=0,1 timeout 1200 ./build-tp2/tp2_ffn --mode 8 --iters 12
 ```
@@ -44,8 +45,15 @@ CLI:
 
 - `--mode 8` (default): explicitly select the configured gfx906 fused GU/SwiGLU/q8
   family and LDS down family. `--mode 7` is a separate diagnostic experiment.
-- `--iters 12`: measured iterations per case/mode, after four diagnostic warmups.
-- `--exchange reduced` (new default): local weighted reduction on both EP and TP ranks;
+- `--iters 12`: measured single/candidate pairs per case/mode, after four warmup pairs.
+- `--tp-layout both` (default): run both `TP2-column` and `TP2-output-row`, plus EP controls.
+  `column` selects the earlier hidden-dimension split; `row` selects literal output-row
+  splitting. Row/both requires `--exchange reduced`; legacy exchange controls require column.
+- `--order alternate` (default): alternate single/candidate order and flip each fixture’s order on successive four-epoch cycles.
+  `forward` and `reverse` are attribution controls. Candidate modes still run in fixed order;
+  this is not randomization of every mode or of the two ranks’ host submissions.
+- `--profile-stages`: add a separate instrumented diagnostic replay, excluded from timing.
+- `--exchange reduced` (default): local weighted reduction on both EP and TP ranks;
   direct peer input/output writes with explicit system fences and cross-device event
   dependencies. Only final completion waits on the host.
 - `--exchange reduced-host`: the same local reductions, direct input push and packed
@@ -77,16 +85,23 @@ Unsupported types are refused. Source paths are not needed in published results.
 
 ## What is checked
 
-CPU test: all eight supported type pairs, additional dimensions, exact byte ownership
+The separate CPU-only `tp_layer_layout_test` validates GDN/QSA head and state ownership
+for the future full-layer executor; it does not execute an attention kernel. See
+[FULL_LAYER_TP_IMPLEMENTATION.md](FULL_LAYER_TP_IMPLEMENTATION.md).
+
+CPU shard test: all eight supported type pairs, additional dimensions, exact byte ownership
 and reassembly, block alignment, invalid types/shapes/ranks/buffer lengths and overflow.
-Gate/up rows split 320/320; down input columns split 320/320 on complete quant blocks.
+Gate/up rows split 320/320. Column TP splits down input columns 320/320 on complete
+quant blocks; output-row TP splits down output rows 1280/1280 and preserves F=640.
+Both layouts must exactly reconstruct the original bytes.
 
 GPU test: every supported synthetic type pair, signed nonzero random codes with finite
 nonzero block scales, deterministic varied inputs and normalized router weights. Four
 epochs change input values and live selected-expert pointer ordering inside captured
 graphs. Weight fixtures cover ordinary normalized weights, concentrated one-hot weights,
 all-zero weights and signed cancellation stress. Signed weights are a numerical test,
-not a claim about real router semantics. Every replay is checked, and outputs are poisoned before each launch.
+not a claim about real router semantics. All four correctness epochs are checked and poisoned before and after the timed batch.
+Performance replays are not individually downloaded or poisoned.
 All tokens use the same selected set, with T entries/expert: arbitrary sparse per-token
 routing and unused groups inside a nonempty launch are not yet covered. Empty ranks are
 covered by the 10/0 and 0/10 ownership cases.
@@ -94,8 +109,10 @@ covered by the 10/0 and 0/10 ownership cases.
 The full-width single-GPU result with the independent original ordered join remains the
 arithmetic oracle. The new timed full-width local reduction must match that old join
 bitwise on every epoch, checked outside timing. EP expert rows must match
-it bitwise. TP per-expert partials are rejoined outside timing for numerical diagnostics.
-In reduced modes, both EP and TP combine expert rows locally, then add rank0+rank1;
+it bitwise. Column-TP per-expert partials are rejoined outside timing for numerical diagnostics.
+Output-row TP instead concatenates independent output halves, and must match the full-width
+expert rows and ordered weighted combine bitwise.
+In reduced EP and column-TP modes, ranks combine expert rows locally, then add rank0+rank1;
 this changes floating-point association for EP as well as TP, so final results are
 numerical, not bitwise against the full-width oracle. The rows control retains its original
 per-expert join before weighting. The test combine is not a claim of matching either
@@ -125,7 +142,9 @@ errors, not just PASS.
 
 Compare single-GPU full width, EP balanced, primary-heavy, peer-heavy, primary-only,
 peer-only and TP2. Default K=10 produces EP counts 5/5, 8/2, 2/8, 10/0 and 0/10.
-TP2 computes ten half-width experts on each card. Existing production EP already executes
+Column TP computes ten half-width experts on each card. Output-row TP computes ten
+half-width GU projections, exchanges the q8 hidden halves, then computes ten full-width
+down projections with half the output rows. Existing production EP already executes
 whole experts concurrently; balanced EP is not expected to become another automatic 2x
 faster merely by changing to TP.
 
@@ -142,7 +161,8 @@ submissions, local reductions, return exchange/dependency, primary sum and final
 Counts, starts and token/destination indices are uploaded once because they do not change in
 this fixture. Arbitrary real routing would need any changing fields in that dynamic record.
 Input preparation, diagnostic poisoning and validation readback are outside reduced timing.
-Legacy rows mode retains its original pageable uploads and in-timing output poison.
+Legacy rows mode retains its pageable metadata uploads and host join. Diagnostic output
+poisoning is outside timing in all modes.
 
 Event-joined DAG: GPU0 input push (each writer system-fences remote writes) records input
 ready; GPU1 waits before compute, then its weighted reduction writes directly into GPU0's
@@ -151,25 +171,37 @@ GPU0 waits before adding local+peer vectors. There is no device spin or mid-prot
 Rank-local compute graphs are unchanged; cross-device operations/dependencies are outside
 capture. Inputs, outputs and per-rank metadata have separate allocations and lifetimes.
 
-`input_stage_us` times the input operation; `return_stage_us` in reduced modes includes
-local peer reduction (and direct push for event mode). In reduced-host it excludes the
-later runtime copy, separately reported as `runtime_return_copy_us`. Compute event fields
-remain expert kernels only. Event intervals may include host enqueue gaps; their sum is
-NOT critical-path latency. `wall_us` is the complete measured protocol.
+Output-row DAG: both GU projections create group-entry-ordered q8 halves. Each rank
+writes its half into the appropriate per-entry positions of both full-F scratch buffers,
+with a system fence and an event before the other rank consumes it. Two hidden-ready
+events prevent down from reading an incomplete vector. Each down graph uses F=640 and
+1280 output rows. Local ordered expert reductions produce half an output vector; the peer
+half is pushed to GPU0 and concatenated after the completion event. Hidden values are not
+dequantized or requantized during transport. Both gathered buffers must match the
+full-width oracle byte for byte. There is no host wait between GU and down.
 
-Return payload is T*N floats in both reduced EP and reduced TP, versus K*T*N partial rows
-for the original TP test. At T=8, K=10, N=2560 this is 81,920 instead of 819,200 bytes.
-This optimization belongs to both EP and TP; it is not evidence that TP has beaten balanced EP.
-The reduced protocol writes/returns a zero vector even for an empty peer rank, which is
-included in its payload/timing. Diagnostic per-expert readbacks occur only after timing.
+Performance `TIMING` lines report paired `single_wall_us`, `candidate_wall_us` and their
+ratio `speedup`. Diagnostic timing events are disabled; input/output/hidden dependency
+events and final completion remain included. Optional `PROFILE` lines come from a separate
+replay; rank events measure full FFN for EP/column and GU only for row TP. These intervals
+may include host enqueue gaps and must not be summed as critical-path latency.
+
+At T=8, K=10, N=2560, column/EP reduced return is 81,920 bytes. Row TP returns 40,960
+bytes and additionally sends 28,800 bytes of hidden q8 in each direction (360 bytes per
+entry). The original full-row column protocol returned 819,200 bytes. Payload sizes are
+not a throughput estimate; row TP also introduces a second graph launch per rank.
 
 Both directions must report peer capability and pass runtime-copy content checks. Reduced
-modes additionally verify direct writes and the cross-device event ordering with 16 distinct
-monotonic patterns per direction, more than the fixture's replay period. Every iteration
-checks received peer input and final values after deliberately poisoning buffers. System
-fences plus event dependencies are explicit, but hardware success must still be established;
-an unsupported/erroring dependency fails rather than silently falling back. No probe is
-presented as a physical link-bandwidth measurement.
+modes additionally verify direct writes and cross-device event ordering with 16 distinct
+monotonic patterns per direction. Correctness passes check received peer input, poisoned
+outputs, local hidden halves, gathered full hidden vectors and final values. Performance
+replays run separately between those checks. An unsupported/erroring dependency fails
+rather than silently falling back. No probe is a physical link-bandwidth measurement.
+
+The new row layout and uninstrumented paired timing require fresh hardware validation.
+The historical measurements below used the earlier instrumented harness; do not compare
+old and new wall times as if only the tensor layout changed. No full-engine TP path has
+been enabled by this test.
 
 ## First hardware result: phase 1, 2026-10-10
 
@@ -294,6 +326,8 @@ from this candidate.
 CPU strict-warning, optimized, Release/NDEBUG and ASan/UBSan checks passed.
 LeakSanitizer is unavailable under this executor's ptrace, so its check was disabled.
 The authoring executor has no HIP toolchain; GPU compile and runtime evidence above
-comes from the owner's hardware logs. The corrected reduced protocol passed its hardware
-gate. Real-weight/model-quality and production integration remain untested. These test
+comes from the owner's hardware logs for the earlier column-only revisions. The corrected
+column reduced protocol passed its historical hardware gate. The new output-row path and
+paired timing changes have NOT been HIP-compiled or run on GPUs in the authoring environment.
+Real-weight/model-quality and production integration remain untested. These test
 sources do not enable any production TP path.

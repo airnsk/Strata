@@ -30,10 +30,17 @@ LOG="$ROOT/tp2-$(date -u +%Y%m%dT%H%M%SZ).log"
 COMMON=(--rm --pull never --network none --read-only --cap-drop ALL
   --tmpfs /tmp:rw,exec,nosuid,size=8g -e HOME=/tmp
   --workdir /work --entrypoint /bin/bash)
+{
 echo 'Both MI50 cards must be idle. This script does not stop any service.'
+printf 'Source commit: '; git -C "$ROOT" rev-parse HEAD
+if ! git -C "$ROOT" diff --quiet HEAD --; then
+  echo 'Source contains tracked modifications; record them with the result.'
+fi
+printf 'Test arguments:'; printf ' %q' "$@"; printf '\n'
 echo "Image: $IMAGE"
 echo "Log: $LOG"
-sudo docker image inspect --format '{{.Id}}' "$IMAGE"
+} | tee "$LOG"
+sudo docker image inspect --format '{{.Id}}' "$IMAGE" | tee -a "$LOG"
 
 set +e
 sudo docker run "${COMMON[@]}" --user "$(id -u):$(id -g)" \
@@ -48,9 +55,10 @@ cmake -S /work -B /work/build-tp2 -G Ninja \
   -DCMAKE_C_COMPILER=/opt/rocm/lib/llvm/bin/clang \
   -DCMAKE_CXX_COMPILER=/opt/rocm/lib/llvm/bin/clang++ \
   -DCMAKE_HIP_COMPILER=/opt/rocm/lib/llvm/bin/clang++
-cmake --build /work/build-tp2 --target tp2_shard_policy tp2_ffn --parallel "$1"
+cmake --build /work/build-tp2 --target tp2_shard_policy tp_layer_layout_test tp2_ffn --parallel "$1"
 /work/build-tp2/tp2_shard_policy
-' build "$JOBS" 2>&1 | tee "$LOG"
+/work/build-tp2/tp_layer_layout_test
+' build "$JOBS" 2>&1 | tee -a "$LOG"
 RC=${PIPESTATUS[0]}
 set -e
 if (( RC != 0 )); then echo "Build/CPU test failed: $RC. Log: $LOG"; exit "$RC"; fi

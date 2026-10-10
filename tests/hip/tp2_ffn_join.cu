@@ -73,3 +73,38 @@ void tp2_sum_vectors(const float* a,const float* b,float* out,int n,void* stream
     sum_vectors_kernel<<<(n+255)/256,256,0,(cudaStream_t)stream>>>(a,b,out,n);
     launch_check();
 }
+
+namespace {
+__global__ void hidden_push_kernel(const uint32_t* src, uint32_t* local, uint32_t* peer,
+                                   int entries, int half_words, int rank) {
+    const int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i >= entries * half_words) return;
+    const int dst = (i / half_words) * (2 * half_words) + rank * half_words + i % half_words;
+    const uint32_t value = src[i];
+    local[dst] = value;
+    peer[dst] = value;
+    __threadfence_system();
+}
+__global__ void concat_rows_kernel(const float* low, const float* high, float* out,
+                                   int rows, int half) {
+    const int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i >= rows * 2 * half) return;
+    const int row = i / (2 * half), col = i % (2 * half);
+    out[i] = col < half ? low[row * half + col] : high[row * half + col - half];
+}
+}
+void tp2_hidden_push(const uint8_t* src, uint8_t* local, uint8_t* peer,
+                     int entries, int half_bytes, int rank, void* stream) {
+    if (entries <= 0 || half_bytes <= 0 || half_bytes % 4 || rank < 0 || rank > 1)
+        throw std::invalid_argument("hidden push shape");
+    const int words = half_bytes / 4;
+    hidden_push_kernel<<<(entries * words + 255) / 256,256,0,(cudaStream_t)stream>>>(
+        reinterpret_cast<const uint32_t*>(src), reinterpret_cast<uint32_t*>(local),
+        reinterpret_cast<uint32_t*>(peer), entries, words, rank);
+    launch_check();
+}
+void tp2_concat_rows(const float* low, const float* high, float* out,
+                     int rows, int half, void* stream) {
+    concat_rows_kernel<<<(rows * 2 * half + 255) / 256,256,0,(cudaStream_t)stream>>>(low,high,out,rows,half);
+    launch_check();
+}

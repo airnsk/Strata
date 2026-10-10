@@ -22,8 +22,9 @@ bool throws(Fn&& fn) {
 }
 
 bool check_layout(int gu_type, int down_type, std::int64_t n, std::int64_t f,
-                  std::size_t gu_block_bytes) {
-    const auto p = plan(gu_type, down_type, n, f);
+                  std::size_t gu_block_bytes, DownSplit split_kind = DownSplit::Columns) {
+    const auto p = plan(gu_type, down_type, n, f, split_kind);
+    const bool row_tp = split_kind == DownSplit::OutputRows;
     const auto N = static_cast<std::size_t>(n);
     const auto F = static_cast<std::size_t>(f);
     const auto down_block_values = down_type == 20 ? 32U : 64U;
@@ -40,7 +41,8 @@ bool check_layout(int gu_type, int down_type, std::int64_t n, std::int64_t f,
     CHECK((p.original.down == MatrixLayout{N, F, down_row, 2 * gu_bytes, down_bytes}));
     CHECK((p.shard.gate == MatrixLayout{F / 2, N, gu_row, 0, gu_bytes / 2}));
     CHECK((p.shard.up == MatrixLayout{F / 2, N, gu_row, gu_bytes / 2, gu_bytes / 2}));
-    CHECK((p.shard.down == MatrixLayout{N, F / 2, down_row / 2, gu_bytes, down_bytes / 2}));
+    CHECK((p.shard.down == MatrixLayout{row_tp ? N / 2 : N, row_tp ? F : F / 2,
+                                      row_tp ? down_row : down_row / 2, gu_bytes, down_bytes / 2}));
     CHECK(p.original.bytes == 2 * gu_bytes + down_bytes);
     CHECK(p.shard.bytes * 2 == p.original.bytes);
 
@@ -63,10 +65,10 @@ bool check_layout(int gu_type, int down_type, std::int64_t n, std::int64_t f,
             CHECK(shard[byte] == blob[rank * gu_bytes / 2 + byte]);
             CHECK(shard[gu_bytes / 2 + byte] == blob[gu_bytes + rank * gu_bytes / 2 + byte]);
         }
-        for (std::size_t row = 0; row != N; ++row) {
-            for (std::size_t byte = 0; byte != down_row / 2; ++byte) {
-                CHECK(shard[gu_bytes + row * (down_row / 2) + byte] ==
-                      blob[2 * gu_bytes + row * down_row + rank * (down_row / 2) + byte]);
+        for (std::size_t row = 0; row != (row_tp ? N / 2 : N); ++row) {
+            for (std::size_t byte = 0; byte != (row_tp ? down_row : down_row / 2); ++byte) {
+                CHECK(shard[gu_bytes + row * (row_tp ? down_row : down_row / 2) + byte] ==
+                      blob[2 * gu_bytes + row * down_row + rank * (row_tp ? down_bytes / 2 : down_row / 2) + byte]);
             }
         }
         // The source ownership covers the original exactly once, including
@@ -135,6 +137,9 @@ bool check_invalid() {
         constexpr auto F = (std::int64_t(1) << 56);
         CHECK(throws<std::overflow_error>([] { plan(23, 20, N, F); }));
     }
+    CHECK(throws<std::invalid_argument>([] { plan(18, 20, 2560, 96, DownSplit::OutputRows); }));
+    CHECK(throws<std::invalid_argument>([] { plan(18, 20, 2560, 640, static_cast<DownSplit>(99)); }));
+    CHECK(throws<std::overflow_error>([&] { plan(23, 42, huge, huge, DownSplit::OutputRows); }));
     CHECK(throws<std::invalid_argument>([] { split(Plan{}, {}, 0); }));
     return true;
 }
@@ -144,6 +149,9 @@ int main() {
     for (const auto& [gu_type, gu_block_bytes] : types) {
         for (int down_type : {20, 42}) {
             if (!check_layout(gu_type, down_type, 2560, 640, gu_block_bytes)) return 1;
+            for (auto dims : {std::pair{2560,640}, std::pair{256,192}, std::pair{512,768}})
+                if (!check_layout(gu_type, down_type, dims.first, dims.second, gu_block_bytes,
+                                  DownSplit::OutputRows)) return 1;
             // The planner is dimension-driven rather than hard-coded to 2560/640.
             if (!check_layout(gu_type, down_type, 256, down_type == 20 ? 64 : 128,
                               gu_block_bytes)) return 1;
