@@ -630,6 +630,13 @@ int gpu_main(const Options& o, int argc, char** argv) {
                 });
                 workers.run("warmup-verify", [&](int rank) { verify(ranks[rank], rank, 8, 0, 3, epoch, false); });
             }
+#ifdef STRATA_RCCL_DEBUG_WARMUP_ONLY
+            // Diagnostic build only: preserve the original T8/bank-0 sequence
+            // warmup, then stop before any capture, timing sweep, or lifecycle 2.
+            // Process exit releases resources; do not introduce a teardown case.
+            std::puts("RCCL_DEBUG_WARMUP_ONLY_COMPLETE capture_tested=0 full_suite=0");
+            std::fflush(nullptr); std::_Exit(0);
+#endif
             workers.run("capture-and-instantiate", [&](int rank) { capture(ranks[rank], rank, o); });
             std::printf("CAPTURE_PASS life=%d graphs_per_rank=%zu empty_graphs_per_rank=1\n", life, o.tokens.size() * 8);
             ++epoch;
