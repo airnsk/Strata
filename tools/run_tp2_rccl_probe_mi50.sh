@@ -14,6 +14,8 @@ Defaults: all, both, 20, 3, 32, 2, 10000, 0,1; init-timeout-ms=60000.
 Also runs separate delayed-rank and missing-rank fault checks.
 One attempt only; INFO logging covers all RCCL subsystems for diagnosis.
 Optional env: TP2_TIMEOUT=180 TP2_BUILD_TIMEOUT=180 TP2_OUTER_TIMEOUT=600 (seconds).
+TP2_RCCL_ARTIFACT may name a verified build directory relative to this checkout.
+This is opt-in: its exact artifact is checked and selected without system fallback.
 The outer bound includes discovery, compilation and all subprocesses.
 Sudo authorization is checked first, outside all operation deadlines and logs.
 No downloads, model mounts, service stops, or clock/power changes.
@@ -108,6 +110,15 @@ validate_host() {
   [[ -f "$ROOT/tests/hip/tp2_rccl_transport.cpp" && -f "$ROOT/tools/tp2_rccl_preflight.py" ]] || {
     echo 'Missing standalone RCCL probe source or dependency-discovery helper.' >&2; return 2;
   }
+  if [[ -n ${TP2_RCCL_ARTIFACT:-} ]]; then
+    [[ $TP2_RCCL_ARTIFACT =~ ^[a-zA-Z0-9_.-]+$ && $TP2_RCCL_ARTIFACT != . && $TP2_RCCL_ARTIFACT != .. ]] || {
+      echo 'TP2_RCCL_ARTIFACT must be one direct child directory name in this checkout.' >&2; return 2;
+    }
+    [[ -d $ROOT/$TP2_RCCL_ARTIFACT && ! -L $ROOT/$TP2_RCCL_ARTIFACT &&
+       -f $ROOT/$TP2_RCCL_ARTIFACT/artifact.json && -f $ROOT/tools/verify_rccl_gfx906.py ]] || {
+      echo 'Missing isolated RCCL artifact or static verifier.' >&2; return 2;
+    }
+  fi
 }
 main() {
   local deadline=${TP2_TIMEOUT:-180} build_deadline=${TP2_BUILD_TIMEOUT:-180} outer_deadline=${TP2_OUTER_TIMEOUT:-600}
@@ -136,13 +147,17 @@ main() {
   trap cleanup EXIT
   CONTAINER_STARTED=1
   printf 'RCCL_PROBE_CONTAINER_LAUNCH name=%s\n' "$CONTAINER_NAME"
+  local artifact_args=()
+  if [[ -n ${TP2_RCCL_ARTIFACT:-} ]]; then
+    artifact_args=(-e "TP2_RCCL_ARTIFACT=/work/$TP2_RCCL_ARTIFACT")
+  fi
   timeout --signal=TERM --kill-after=15s "${outer_deadline}s" "${DOCKER[@]}" run \
     --name "$CONTAINER_NAME" --rm --pull never --network none --read-only --cap-drop ALL \
     --tmpfs /tmp:rw,exec,nosuid,size=2g --shm-size=512m -e HOME=/tmp \
     --device=/dev/kfd --device=/dev/dri -e HIP_VISIBLE_DEVICES=0,1 \
     -e NCCL_DEBUG=INFO -e NCCL_DEBUG_SUBSYS=ALL -e NCCL_DEBUG_FILE=/dev/stdout \
     --mount "type=bind,src=$ROOT,dst=/work,readonly" \
-    --workdir /work --entrypoint /bin/bash -i "$IMAGE" -s -- "$deadline" "$build_deadline" "${args[@]}" <<'RCCL_CONTAINER'
+    "${artifact_args[@]}" --workdir /work --entrypoint /bin/bash -i "$IMAGE" -s -- "$deadline" "$build_deadline" "${args[@]}" <<'RCCL_CONTAINER'
 set -euo pipefail
 echo 'RCCL_PROBE_CONTAINER_ENTER'
 export PATH=/opt/venv/bin:/opt/rocm/bin:$PATH
@@ -168,7 +183,16 @@ for tool in python3 hipcc timeout ldd sha256sum; do
   command -v "$tool" >/dev/null || { echo "RCCL_PREFLIGHT_BLOCKED missing installed tool: $tool" >&2; exit 2; }
 done
 # The repo and image remain read-only; all build products disappear with /tmp.
-python3 -B /work/tools/tp2_rccl_preflight.py --output /tmp/rccl-env
+preflight_args=()
+if [[ -n ${TP2_RCCL_ARTIFACT:-} ]]; then
+  python3 -B /work/tools/verify_rccl_gfx906.py --prefix "$TP2_RCCL_ARTIFACT/install" \
+    --check-manifest "$TP2_RCCL_ARTIFACT/artifact.json" --output /tmp/rccl-artifact-reverified.json
+  artifact_hash=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["library"]["sha256"])' \
+    /tmp/rccl-artifact-reverified.json)
+  preflight_args=(--root "$TP2_RCCL_ARTIFACT/install" --expected-sha256 "$artifact_hash")
+  printf 'RCCL_PROBE_ISOLATED_ARTIFACT path=%s sha256=%s\n' "$TP2_RCCL_ARTIFACT" "$artifact_hash"
+fi
+python3 -B /work/tools/tp2_rccl_preflight.py --output /tmp/rccl-env "${preflight_args[@]}"
 source /tmp/rccl-env
 printf 'RCCL_PREFLIGHT_HIPCC path=%s\n' "$(command -v hipcc)"
 timeout --signal=TERM --kill-after=5s 20s hipcc --version

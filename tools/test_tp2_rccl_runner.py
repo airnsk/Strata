@@ -93,6 +93,29 @@ __attribute__((destructor)) static void diagnostics_after(void) {
         with self.assertRaisesRegex(RuntimeError, "No installed RCCL C API header"):
             self.discover()
 
+    def test_explicit_hash_checked_before_library_load(self):
+        self.fake_library()
+        with mock.patch.object(PREFLIGHT.subprocess, "run") as run:
+            with self.assertRaisesRegex(RuntimeError, "verified artifact hash; no fallback"):
+                PREFLIGHT.discover([self.root], "0" * 64)
+        run.assert_not_called()
+
+    def test_explicit_root_and_hash_select_exact_library(self):
+        library = self.fake_library()
+        output = self.root / "env"
+        result = subprocess.run(["python3", str(ROOT / "tools/tp2_rccl_preflight.py"),
+                                 "--root", str(self.root), "--expected-sha256", PREFLIGHT.sha256(library),
+                                 "--output", str(output)], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(str(library), output.read_text())
+
+    def test_explicit_root_requires_hash(self):
+        result = subprocess.run(["python3", str(ROOT / "tools/tp2_rccl_preflight.py"),
+                                 "--root", str(self.root), "--output", str(self.root / "env")],
+                                text=True, capture_output=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertFalse((self.root / "env").exists())
+
     def test_wrapper_header_is_not_c_api(self):
         self.header.write_text("namespace torch { void send(); }\n")
         with self.assertRaisesRegex(RuntimeError, "No installed RCCL C API header"):
@@ -293,6 +316,29 @@ elif args[0] == "ps" and os.environ.get("MOCK_CLEANUP_FAIL"):
             self.assertNotIn(forbidden, run)
         self.assertEqual(sum(call[0] == "run" for call in calls), 1)
         subprocess.run(["bash", "-n", str(self.calls) + ".container"], check=True)
+
+    def test_opt_in_artifact_is_passed_only_when_explicit(self):
+        artifact = self.repo / "build-rccl-test"
+        artifact.mkdir()
+        (artifact / "artifact.json").write_text("{}")
+        (self.repo / "tools/verify_rccl_gfx906.py").write_text("# fixture\n")
+        process, saved = self.host(TP2_RCCL_ARTIFACT=artifact.name)
+        self.assertEqual(process.returncode, 0, process.stderr + saved)
+        run = next(call for call in [json.loads(line) for line in self.calls.read_text().splitlines()] if call[0] == "run")
+        self.assertIn("TP2_RCCL_ARTIFACT=/work/build-rccl-test", run)
+        inner = Path(str(self.calls) + ".container").read_text()
+        self.assertLess(inner.index("verify_rccl_gfx906.py"), inner.index("tp2_rccl_preflight.py"))
+        self.assertIn('--expected-sha256 "$artifact_hash"', inner)
+
+    def test_invalid_artifact_does_not_authorize_or_run(self):
+        for name in ("../outside", "/absolute", ".", "..", "missing", "a,b"):
+            with self.subTest(name=name):
+                for log in self.repo.glob("tp2-rccl-probe-*.log"):
+                    log.unlink()
+                process, _ = self.host(TP2_RCCL_ARTIFACT=name)
+                self.assertEqual(process.returncode, 2)
+                self.assertFalse(self.calls.exists())
+                self.assertFalse(self.sudo_calls.exists())
 
     def test_slow_interactive_auth_precedes_deadlines_and_log_capture(self):
         started = time.monotonic()

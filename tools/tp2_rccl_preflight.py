@@ -91,7 +91,7 @@ def log_check_output(stdout, stderr):
                   f"RCCL_PREFLIGHT_CHECK_{name}_END", file=stream, flush=True)
 
 
-def discover(roots: list[Path]) -> dict[str, str | int]:
+def discover(roots: list[Path], expected_sha256: str | None = None) -> dict[str, str | int]:
     headers = unique_paths(root / name for root in roots for name in HEADER_NAMES)
     # torch/csrc/cuda/nccl.h is a C++ wrapper, not the RCCL C API header.
     headers = [header for header in headers if all(
@@ -112,6 +112,8 @@ def discover(roots: list[Path]) -> dict[str, str | int]:
     print("RCCL_PREFLIGHT_LIBRARY_CANDIDATES " + json.dumps([str(p) for p in libraries]), flush=True)
     errors = []
     for library in libraries:
+        if expected_sha256 and sha256(library) != expected_sha256:
+            raise RuntimeError("Isolated RCCL library differs from the verified artifact hash; no fallback")
         loader_dirs = unique_paths([library.parent, *directories])
         loader_path = ":".join(str(p) for p in loader_dirs)
         previous = os.environ.get("LD_LIBRARY_PATH", "")
@@ -161,6 +163,8 @@ def discover(roots: list[Path]) -> dict[str, str | int]:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--root", type=Path, help="Use only this explicit isolated installation; never fall back")
+    parser.add_argument("--expected-sha256", help="Require this exact library SHA256 for an isolated installation")
     parser.add_argument("--check-library", help=argparse.SUPPRESS)
     args = parser.parse_args()
     try:
@@ -172,7 +176,13 @@ def main() -> int:
             return 0
         if args.output is None:
             parser.error("--output is required")
-        result = discover(installed_roots())
+        if bool(args.root) != bool(args.expected_sha256):
+            parser.error("--root and --expected-sha256 must be supplied together")
+        if args.expected_sha256 and not re.fullmatch(r"[0-9a-f]{64}", args.expected_sha256):
+            parser.error("--expected-sha256 must be a lowercase SHA256")
+        result = discover([args.root.resolve(strict=True)] if args.root else installed_roots(), args.expected_sha256)
+        if args.expected_sha256 and sha256(Path(result["RCCL_LIBRARY"])) != args.expected_sha256:
+            raise RuntimeError("Isolated RCCL library differs from the verified artifact hash; no fallback")
         args.output.write_text("".join(f"export {key}={shlex.quote(str(value))}\n" for key, value in result.items()))
         return 0
     except (OSError, RuntimeError, AttributeError) as exc:

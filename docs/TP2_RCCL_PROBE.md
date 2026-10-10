@@ -6,6 +6,10 @@ no model inputs, engine link, CMake change, production dispatch change, or servi
 It is the transport admission gate before a separate whole-layer integration.
 Passing this test does not establish model correctness or a layer speedup.
 
+For a separate, pinned gfx906 source build and opt-in artifact selection, see
+[TP2_RCCL_GFX906_BUILD.md](TP2_RCCL_GFX906_BUILD.md). The build never starts this
+probe automatically; leaving `TP2_RCCL_ARTIFACT` unset preserves this default path.
+
 ## One bounded stand run
 
 From the existing stand checkout, with both MI50 cards already idle:

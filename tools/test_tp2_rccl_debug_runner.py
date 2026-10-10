@@ -6,7 +6,9 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+from types import SimpleNamespace
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNNER = ROOT / 'tools/run_tp2_rccl_debug_mi50.sh'
@@ -175,6 +177,23 @@ esac
         self.assertEqual(self.inner(MOCK_PTRACE_EXIT='1').returncode, 1)
         self.assertFalse((self.root / 'compiler.args').exists())
         self.assertFalse((self.root / 'debugger.args').exists())
+
+    def test_capture_python_marks_errors_and_keeps_collecting(self):
+        block = RUNNER.read_text().split("<<'GDB'\n", 1)[1].split('\nGDB\n', 1)[0]
+        python = block.split('\npython\n', 1)[1].split('\nend\n', 1)[0]
+        for fail in (False, True):
+            calls, output = [], []
+            def execute(command):
+                calls.append(command)
+                if fail and command == 'info registers rip rdi rsp rbp rax':
+                    raise RuntimeError('fixture register read failure')
+            gdb = SimpleNamespace(write=output.append, execute=execute,
+                                  selected_thread=lambda: SimpleNamespace(ptid=(123, 456, 0)))
+            with mock.patch.dict('sys.modules', gdb=gdb):
+                exec(compile(python, 'capture.gdb', 'exec'), {})
+            self.assertIn('thread apply all -c bt 24', calls)
+            self.assertEqual(calls[-1], 'set $capture_incomplete = ' + str(int(fail)))
+            self.assertEqual(any('CAPTURE_ERROR' in line for line in output), fail)
 
     def test_source_exit_precedes_capture_and_preserves_sequence(self):
         source = (ROOT / 'tests/hip/tp2_rccl_transport.cpp').read_text()
