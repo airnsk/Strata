@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <limits>
@@ -29,24 +30,30 @@ void ck(cudaError_t e,const char* where) {
     if(e!=cudaSuccess) throw std::runtime_error(std::string(where)+": "+cudaGetErrorString(e));
 }
 void on(int d) { ck(cudaSetDevice(d),"set device"); }
-struct Options { std::vector<std::string> shards; std::string pack; int layer=0,mode=8; };
+struct Options {
+    std::vector<std::string> shards; std::string pack,execution="runtime";
+    int layer=0,mode=8,warmup=3,trials=12; bool benchmark=false;
+};
 Options parse(int argc,char**argv) {
     Options o;
     for(int i=1;i<argc;++i) {
         const std::string a=argv[i];
+        if(a=="--benchmark"){o.benchmark=true;continue;}
         if(i+1==argc) throw std::invalid_argument("missing argument for "+a);
         const std::string v=argv[++i];
         if(a=="--gguf") o.shards.push_back(v);
         else if(a=="--pack") o.pack=v;
-        else if(a=="--layer" || a=="--mode") {
+        else if(a=="--execution")o.execution=v;
+        else if(a=="--layer" || a=="--mode" || a=="--bench-warmup" || a=="--bench-trials") {
             size_t used=0; int n=std::stoi(v,&used);
             if(used!=v.size()) throw std::invalid_argument("invalid integer");
-            if(a=="--layer") o.layer=n; else o.mode=n;
+            if(a=="--layer")o.layer=n;else if(a=="--mode")o.mode=n;else if(a=="--bench-warmup")o.warmup=n;else o.trials=n;
         } else throw std::invalid_argument("unknown option "+a);
     }
     if(o.shards.empty() || o.pack.empty() || o.layer<0 || o.layer>=48 || o.layer==1 || o.layer%4==3 ||
-       (o.mode!=7 && o.mode!=8))
-        throw std::invalid_argument("usage: tp2_gdn_layer --pack PACK --gguf SHARD [--gguf SHARD ...] [--layer non-PLE-GDN-index] [--mode 7|8]");
+       (o.mode!=7 && o.mode!=8) || o.warmup<1 || o.warmup>100 || o.trials<2 || o.trials>1000 ||
+       (o.execution!="runtime"&&o.execution!="consolidated"&&o.execution!="captured"&&o.execution!="all"))
+        throw std::invalid_argument("usage: tp2_gdn_layer --pack PACK --gguf SHARD [--gguf SHARD ...] [--layer non-PLE-GDN-index] [--mode 7|8] [--execution runtime|consolidated|captured|all] [--benchmark] [--bench-warmup 3] [--bench-trials 12]");
     return o;
 }
 template<class T> std::vector<T> read(const T* p,size_t n,int device) {
@@ -275,6 +282,64 @@ void committed(Checks& c,const tp::TpGdnLayerSnapshot& a,const tp::TpGdnLayerSna
     c.floats("commit legacy recurrence",legacy.state,b.state,gdn_gate);
     c.floats("commit legacy conv",legacy.conv,b.conv,gdn_gate);
 }
+
+const char* execution_name(tp::TpGdnExecution mode) {
+    switch(mode){case tp::TpGdnExecution::RuntimeCopies:return "runtime";case tp::TpGdnExecution::Consolidated:return "consolidated";case tp::TpGdnExecution::Captured:return "captured";}
+    throw std::invalid_argument("unknown execution mode");
+}
+std::vector<tp::TpGdnExecution> execution_modes(const Options& o) {
+    if(o.benchmark||o.execution=="all")return {tp::TpGdnExecution::RuntimeCopies,tp::TpGdnExecution::Consolidated,tp::TpGdnExecution::Captured};
+    if(o.execution=="captured")return {tp::TpGdnExecution::Captured};
+    if(o.execution=="consolidated")return {tp::TpGdnExecution::Consolidated};
+    return {tp::TpGdnExecution::RuntimeCopies};
+}
+struct LayerTime {double propose_ms=0,commit_ms=0,total_ms=0;};
+LayerTime timed_layer(tp::TpGdnLayer& layer,const std::array<const float*,2>& input,int tokens,uint64_t epoch) {
+    using Clock=std::chrono::steady_clock;
+    // Both APIs synchronize their own rank streams before return. The wall
+    // interval includes D2D input copies, host orchestration, launches, peer
+    // exchange, whole-layer compute, accepted-prefix replay and synchronization.
+    // No device-wide sync, diagnostic download, reset/upload or graph build.
+    const auto start=Clock::now();layer.propose_device(input,tokens,epoch);
+    const auto proposed=Clock::now();layer.commit(tokens);const auto end=Clock::now();
+    auto ms=[](auto a,auto b){return std::chrono::duration<double,std::milli>(b-a).count();};
+    return {ms(start,proposed),ms(proposed,end),ms(start,end)};
+}
+double quantile(std::vector<double> values,double q) {
+    std::sort(values.begin(),values.end());const double x=q*double(values.size()-1);
+    const size_t i=size_t(x),j=std::min(i+1,values.size()-1);return values[i]+(values[j]-values[i])*(x-double(i));
+}
+void benchmark(Checks& c,const Options& o,tp::TpGdnLayer& reference,tp::TpGdnLayer& parallel,
+               uint64_t& epoch,const std::vector<float>& state,const std::vector<float>& conv) {
+    std::printf("\nBENCH_SCOPE real-weight-one-GDN-layer; baseline=one-GPU-unsharded; candidate=two-GPU-TP; same-execution-mode-per-pair; not-EP-or-full-model-generation\n");
+    std::printf("BENCH_METHOD wall=propose_device+commit(T), includes D2D input/host launch/P2P/compute/commit/sync; excludes reset/H2D/weight-load/graph-preparation/snapshots; fixed initialized state, varying matched signed input; keep=T is a workload choice, not measured speculative acceptance\n");
+    std::printf("BENCH_CONTRACT both arms use speculative proposal plus explicit commit replay, including T=1; this is not optimized autoregressive self-commit or the production Verifier/EP baseline; fixed native-GR/native-BF16-shared/exact-MMVQ settings and explicit expert mode=%d\n",o.mode);
+    std::printf("BENCH_LIMIT execution modes run in separate blocks; only same-mode full/TP trials are paired, so cross-mode absolute timing differences are diagnostic and may include thermal/clock drift\n");
+    std::printf("BENCH_CONFIG warmup_pairs=%d measured_pairs=%d order=alternating per-T; parity checked after every pair outside timer; summaries conditional on all gates passing\n",o.warmup,o.trials);
+    // Prepare each graph once, then reuse across later T changes. Preparation is
+    // never part of a timing sample and has no claimed amortization horizon.
+    for(int t:{1,2,4,8}){reference.prepare_captured(t);parallel.prepare_captured(t);}
+    for(auto mode:execution_modes(o))for(int tokens:{1,2,4,8}){
+        reference.set_execution(mode);parallel.set_execution(mode);
+        Buffer<float>input0(size_t(tokens)*H*N,0),input1(size_t(tokens)*H*N,1);
+        std::vector<double>rt,pt,ratio,rp,pp,rc,pc;
+        for(int trial=-o.warmup;trial<o.trials;++trial){
+            const auto input=signed_input(size_t(tokens)*H*N,1201+tokens*97+(trial+o.warmup)*31,0.65f);
+            input0.set(input);input1.set(input);const std::array<const float*,2> inputs{input0.p,input1.p};
+            const uint64_t pair_epoch=++epoch;const bool tp_first=((trial+o.warmup)&1)!=0;
+            LayerTime a,b;
+            auto one=[&](tp::TpGdnLayer& layer){layer.reset_state(state,conv);return timed_layer(layer,inputs,tokens,pair_epoch);};
+            if(tp_first){b=one(parallel);a=one(reference);}else{a=one(reference);b=one(parallel);}
+            std::printf("BENCH_%s mode=%s T=%d trial=%d first=%s full-propose-ms=%.6f full-commit-ms=%.6f full-total-ms=%.6f tp-propose-ms=%.6f tp-commit-ms=%.6f tp-total-ms=%.6f\n",trial<0?"WARMUP":"SAMPLE",execution_name(mode),tokens,trial,tp_first?"TP":"full",a.propose_ms,a.commit_ms,a.total_ms,b.propose_ms,b.commit_ms,b.total_ms);
+            // Never interleave snapshot downloads or checks between timed arms.
+            const auto full=reference.snapshot(),split=parallel.snapshot();seams(c,full,split);seams(c,split,parallel.snapshot(1),true);
+            if(c.failures)throw std::runtime_error("benchmark parity failed; timing is not an accepted result");
+            if(trial>=0){rt.push_back(a.total_ms);pt.push_back(b.total_ms);ratio.push_back(a.total_ms/b.total_ms);rp.push_back(a.propose_ms);pp.push_back(b.propose_ms);rc.push_back(a.commit_ms);pc.push_back(b.commit_ms);}
+        }
+        std::printf("BENCH_SUMMARY mode=%s T=%d pairs=%zu full-ms-median=%.6f full-ms-p10=%.6f full-ms-p90=%.6f tp-ms-median=%.6f tp-ms-p10=%.6f tp-ms-p90=%.6f paired-ratio-median=%.6f ratio-of-total-times=%.6f full-propose-median=%.6f tp-propose-median=%.6f full-commit-median=%.6f tp-commit-median=%.6f\n",execution_name(mode),tokens,rt.size(),quantile(rt,.5),quantile(rt,.1),quantile(rt,.9),quantile(pt,.5),quantile(pt,.1),quantile(pt,.9),quantile(ratio,.5),std::accumulate(rt.begin(),rt.end(),0.0)/std::accumulate(pt.begin(),pt.end(),0.0),quantile(rp,.5),quantile(pp,.5),quantile(rc,.5),quantile(pc,.5));
+        std::fflush(stdout);
+    }
+}
 } // namespace
 int main(int argc,char** argv) {
     try {
@@ -287,12 +352,21 @@ int main(int argc,char** argv) {
         if(!rank0.load(o.shards,o.pack,g,o.layer,0,0,err))throw std::runtime_error("rank0 load: "+err);
         if(!rank1.load(o.shards,o.pack,g,o.layer,1,1,err))throw std::runtime_error("rank1 load: "+err);
         std::printf("real-weight GDN layer=%d mode=%d weight-bytes full=%llu rank0=%llu rank1=%llu\n",o.layer,o.mode,(unsigned long long)full.weight_bytes(),(unsigned long long)rank0.weight_bytes(),(unsigned long long)rank1.weight_bytes());
-        std::printf("scope=uncaptured-one-layer; full-reference shares orchestrator; independent legacy GDN/HC/shared and CPU-combine checks; no model-quality or performance claim\n");
+        std::printf("scope=one-layer; full-reference shares orchestrator; independent legacy GDN/HC/shared and CPU-combine checks; no model-quality or performance claim\n");
         Checks c;coherence(c,g,full.weights(),rank0.weights());coherence(c,g,full.weights(),rank1.weights());
         tp::TpGdnLayer reference(g,full.weights(),nullptr,8,o.mode),parallel(g,rank0.weights(),&rank1.weights(),8,o.mode);
+        const auto executions=execution_modes(o);
+        if(std::find(executions.begin(),executions.end(),tp::TpGdnExecution::Captured)!=executions.end()){
+            // New graph shapes are initialization-only, before any proposal.
+            for(int t=1;t<=8;++t)parallel.prepare_captured(t);
+            if(o.benchmark)for(int t:{1,2,4,8})reference.prepare_captured(t);
+        }
         uint64_t epoch=0;int cases=0;
         const auto state=signed_input(STATE,17,0.015f),conv=signed_input(CONV,31,0.12f);
         std::vector<int32_t> prior_routes;bool routes_changed=false,repeated_ids=false;
+        for(auto execution:executions){
+        parallel.set_execution(execution);
+        std::printf("\nCORRECTNESS_EXECUTION %s (reference=runtime)\n",execution_name(execution));
         for(int tokens=1;tokens<=8;++tokens)for(int keep=0;keep<=tokens;++keep){
             std::printf("\nCASE T=%d keep=%d epoch=%llu\n",tokens,keep,(unsigned long long)(epoch+1));std::fflush(stdout);
             const auto input=signed_input(size_t(tokens)*H*N,43+tokens*19+keep*7,0.65f);
@@ -319,9 +393,12 @@ int main(int argc,char** argv) {
             c.floats("continuation legacy mixer",continuation.mixer,nb.mixer_output,gdn_gate);
             reference.commit(2);parallel.commit(2);committed(c,reference.snapshot(),parallel.snapshot(),continuation);++cases;
         }
+        }
         c.require(routes_changed,"signed fixtures exercise changing route IDs");
         c.require(repeated_ids,"multi-token fixtures exercise repeated expert IDs");
         std::printf("\n%s whole-GDN engineering parity cases=%d continuation-cases=%d failures=%d; no full-model inference/quality/performance claim\n",c.failures?"FAIL":"PASS",cases,cases,c.failures);
-        return c.failures?1:0;
+        if(c.failures)return 1;
+        if(o.benchmark){benchmark(c,o,reference,parallel,epoch,state,conv);std::printf("BENCH_GATE PASS all measured pairs and warmups passed parity; one-layer wall times only\n");}
+        return 0;
     } catch(const std::exception& e) {std::fprintf(stderr,"tp2_gdn_layer: %s\n",e.what());return 2;}
 }

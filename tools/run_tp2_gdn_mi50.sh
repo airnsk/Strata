@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
-# Opt-in real-weight GDN-layer correctness gate. No server/config/driver changes.
+# Opt-in real-weight GDN-layer correctness and optional wall-time A/B gate.
+# No server/config/driver changes; benchmarking never skips correctness.
 set -euo pipefail
 if [[ $# -lt 2 || "$1" == --help ]]; then
   echo 'Usage: bash tools/run_tp2_gdn_mi50.sh EXISTING_IMAGE MODEL_ROOT --pack /models/PACK --gguf /models/SHARD [--gguf /models/SHARD ...] [--layer 0]'
   echo 'This checks one non-PLE GDN layer, not generation speed. Layer 1 is PLE and is refused.'
+  echo 'Optional: --execution runtime|consolidated|captured|all (default runtime)'
+  echo 'Optional: --benchmark [--bench-warmup 3] [--bench-trials 12]'
+  echo 'Benchmark first checks all three modes, then alternates matched full/TP trials at T=1,2,4,8.'
+  echo 'Wall timing includes complete propose_device + commit(T); reset/uploads/capture/snapshots are outside.'
   echo 'Optional: BUILD_JOBS=48 TP2_TIMEOUT=1200'
   echo 'MODEL_ROOT is mounted read-only as /models. Both GPUs must be idle.'
   exit 0
@@ -41,6 +46,7 @@ echo 'Both MI50 cards must be idle. This script does not stop any service.'
 printf 'Source commit: '; git -C "$ROOT" rev-parse HEAD
 if ! git -C "$ROOT" diff --quiet HEAD --; then
   echo 'Source contains tracked modifications; record them with the result.'
+  printf 'Tracked source diff SHA256: '; git -C "$ROOT" diff --binary HEAD -- | sha256sum
 fi
 printf 'Test arguments:'; printf ' %q' "$@"; printf '\n'
 echo "Image: $IMAGE"
@@ -78,7 +84,23 @@ sudo docker run "${COMMON[@]}" --device=/dev/kfd --device=/dev/dri \
   "$IMAGE" -c '
 set -euo pipefail
 deadline=$1; shift
-exec timeout --signal=TERM --kill-after=10s "${deadline}s" /work/build-tp2-gdn/tp2_gdn_layer "$@"
+# Read-only telemetry is outside the test and every timed interval. It records
+# external load/clocks rather than silently changing power/clock settings.
+telemetry() {
+  date -u +GPU_TELEMETRY_%Y-%m-%dT%H:%M:%SZ
+  if command -v rocm-smi >/dev/null 2>&1; then
+    timeout 15s rocm-smi --showproductname --showuse --showclocks --showpower --showtemp || true
+  else
+    echo "rocm-smi unavailable; no clock/power/utilization telemetry"
+  fi
+}
+telemetry
+set +e
+timeout --signal=TERM --kill-after=10s "${deadline}s" /work/build-tp2-gdn/tp2_gdn_layer "$@"
+rc=$?
+set -e
+telemetry
+exit "$rc"
 ' run "$DEADLINE" "$@" 2>&1 | tee -a "$LOG"
 RC=${PIPESTATUS[0]}
 set -e

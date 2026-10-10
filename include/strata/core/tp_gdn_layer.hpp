@@ -22,10 +22,19 @@ struct TpGdnLayerSnapshot {
     std::vector<uint8_t> routed_hidden_q8, shared_hidden_q8;
 };
 
+enum class TpGdnExecution {
+    RuntimeCopies, // validated baseline: individual runtime P2P copies
+    Consolidated,  // one system-fenced peer push per exchange/rank
+    Captured       // rank-local compute/push graphs; event edges stay outside
+};
+
 // One non-PLE GDN layer, one in-flight proposal, T <= 8. Owns all session,
 // stream, exchange and commit storage; immutable weight owners must outlive it.
-// This is an uncaptured layer component, not a full-model generation adapter.
+// This is a layer component, not a full-model generation adapter.
+// Calls must be serialized on one host thread; methods complete before return.
 // rank=-1 is the unsharded direct-layer reference; two ranks must be 0,1.
+// The direct reference aliases complete local outputs/hidden storage in every
+// mode, avoiding TP-only self copies. Captured reference uses one proposal graph.
 class TpGdnLayer {
 public:
     TpGdnLayer(const ModelGeometry&, const TpGdnRankWeights& rank0,
@@ -35,6 +44,15 @@ public:
     TpGdnLayer(const TpGdnLayer&) = delete;
     TpGdnLayer& operator=(const TpGdnLayer&) = delete;
 
+    // Explicit startup-only preparation, before the first proposal. Warms the
+    // kernels without committing state, then captures both physical state banks.
+    // Allocations and graph instantiation happen here, never in propose/commit.
+    // Prepare each token count that Captured mode will use. Failure is fatal to
+    // this instance, with no silent fallback to another execution mode.
+    void prepare_captured(int tokens);
+    void set_execution(TpGdnExecution mode);
+    TpGdnExecution execution() const;
+
     // Initialization/checkpoint adapter, outside token execution. Canonical
     // recurrence [128,48,128], conv [10240,3]. Clears any outstanding proposal.
     void reset_state(const std::vector<float>& state, const std::vector<float>& conv);
@@ -43,7 +61,8 @@ public:
     // R[T,4,2560] to both ranks. No device allocation occurs in this method.
     void propose(const std::vector<float>& residual, int tokens, uint64_t epoch);
     // Device-input production entry: each source pointer belongs to its rank.
-    // Copies to owned residuals before executing. Epochs must strictly increase.
+    // Caller must finish input writes before calling; no producer stream is
+    // implicitly joined. Copies to owned residuals. Epochs must strictly increase.
     void propose_device(const std::array<const float*, 2>& residual, int tokens, uint64_t epoch);
     // Accept 0..T. Both ranks first compute into private candidate state; only
     // after both complete are candidates published. Any device failure poisons

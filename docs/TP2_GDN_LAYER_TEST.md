@@ -35,12 +35,26 @@ both ranks before host pointer publication. A failed execution poisons the
 component, requiring reconstruction; it cannot report a successful partial
 commit. Only one window is in flight. Epochs increase between proposals.
 
-This first implementation is an **uncaptured correctness schedule**. Copy
-streams use explicit producer/arrival events and runtime P2P copies, including
-small strided-entry copies. It is not the final low-launch-overhead exchange
-implementation. Proposals finish synchronously; this is not a full-model GPU
-persistent scheduler. Do not benchmark these host-submitted copies as proof of
-the eventual TP architecture's speed limit.
+Three explicit execution modes retain the same arithmetic:
+
+- `runtime` (default): the validated schedule with individual runtime copies.
+- `consolidated`: one bit-preserving peer-push kernel per exchange/rank. The
+  routed and shared hidden-Q8 transfers share a launch. Every writing thread
+  system-fences its own writes; both consumers wait for both producer events.
+- `captured`: cached rank-local compute/push graphs, with inter-device event
+  dependencies outside graph capture. The one-GPU reference captures its entire
+  proposal in one graph; TP uses five segments per rank. State-sensitive graphs are keyed by the
+  physical state bank, so commit pointer swaps cannot replay stale addresses.
+
+Graph preparation and first-use warmup are startup-only, before the first
+proposal. There is no silent fallback if graph preparation or execution fails.
+Both rank streams complete before the synchronous proposal/commit API returns.
+The one-GPU reference aliases its complete output/hidden buffers instead of
+copying them back to itself, in all modes. This removes avoidable baseline
+transport overhead; the next gate also rechecks that reference change.
+These are single-layer components, not a full-model GPU-persistent scheduler.
+The new peer-push and graph modes still require their own hardware parity gate;
+previous runtime-copy success does not establish their visibility/capture safety.
 
 ## Build and run
 
@@ -68,6 +82,32 @@ compiler concurrency is 48, overridable with `BUILD_JOBS`; runtime timeout is
 1200 seconds, overridable with `TP2_TIMEOUT`. A timeout/error is not a pass.
 The script does not stop other services or change card power settings.
 
+## Complete-layer timing
+
+Add `--benchmark` to the command above. It first runs the full correctness suite
+in runtime, consolidated and captured modes: 132 prefix cases and 132
+continuations. Then it alternates one-GPU full-layer and two-GPU TP calls at
+T=1,2,4,8, with three warmup pairs and twelve measured pairs per execution mode.
+`--bench-warmup` and `--bench-trials` override these counts. Every pair has
+matched signed input and committed initial state; parity checks run after both
+arms and outside their timers. `--execution all` runs the three correctness
+modes without timing; the default remains runtime-only.
+
+Reported host wall time includes device-input staging, graph/kernel launches,
+peer exchange, layer compute, plan-status checking, explicit accepted-prefix
+commit replay and completion. Weight loading, graph preparation, host uploads,
+state reset and diagnostic snapshots are outside the timer. Proposal and
+commit times are also reported separately. Both arms use proposal+commit even
+at T=1, unlike an optimized autoregressive self-commit path in the production
+Verifier. This is not a production EP or whole-model generation comparison.
+
+Full/TP pairs are alternated within each mode; execution-mode blocks are
+sequential. Thus full/TP ratios within a mode are paired measurements, while
+runtime-vs-captured differences remain diagnostic and can reflect drift.
+The runner records read-only ROCm telemetry outside the test, the source
+revision and any tracked-diff hash. It does not set clocks or power caps.
+No timing result is accepted if its parity gate fails.
+
 ## Gates and reference independence
 
 CPU-only tests validate both expert layouts, GDN/QSA ownership, native row
@@ -91,11 +131,25 @@ Passing this gate still does not prove logits, model quality or MTP acceptance.
 
 ## Validation status
 
-At authoring time: strict CPU Release tests, declaration-only host C++ syntax
-checks and source review are available. No HIP compiler/GPU exists in the
-authoring environment. HIP compilation, actual artifact loading, runtime P2P
-events, memory fit and all GPU parity gates await the stand. Previous routed
-FFN hardware success at `05695a9` does not validate this new whole-layer code.
+Hardware gate passed on 2026-10-10 at `67a423a89305077772589f625a2087d65f256f31`:
+2 x MI50 32 GB, layer 0, mode 8, native artifact and canonical pack loaded.
+The supplied stand log `tp2-gdn-20261010T014713Z.txt` reports **44 proposal/prefix
+cases and 44 continuation cases, failures=0**. HIP compilation, actual weight
+loading, runtime P2P exchange and GPU state/activation/routing gates therefore
+passed for that revision and selected layer. This is not full-model inference,
+quality approval, a generation-speed measurement, or proof for other layers.
+Source log SHA-256:
+`9f1210b1b4d0f3531af5b8e51ec90623e1e857a90d2daf7e9e2714dc68d8d9d6`.
+It is not bundled in the repository because it includes local stand paths.
+All 88 main/continuation comparisons at each TP/full numerical seam reported
+zero maximum and RMS differences; router IDs, weights and hidden Q8 bytes also
+matched exactly. Independent legacy/CPU checks had small nonzero differences
+within their predeclared tolerances. Thus not every reference comparison was
+bit-exact.
+
+The authoring environment still has no HIP compiler/GPU. New changes after
+that revision require a new hardware gate; CPU tests and declaration-only
+host syntax checks cannot substitute for it.
 
 The remaining integration includes QSA/KV/indexer commit, PLE, full-model rank
 residency, output head, prompt ingestion, MTP binding, graph capture and the

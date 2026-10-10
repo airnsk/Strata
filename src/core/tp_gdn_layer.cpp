@@ -7,6 +7,7 @@
 #include "strata/kernels/native_moe.hpp"
 #include "strata/kernels/native_router.hpp"
 #include "strata/kernels/shared_expert.hpp"
+#include "strata/kernels/tp_gdn_exchange.hpp"
 #include "strata/kernels/verify_kernels.hpp"
 #include <cuda_runtime.h>
 #include <algorithm>
@@ -24,12 +25,18 @@ void check(cudaError_t e, const char* what) {
     if(e!=cudaSuccess) throw std::runtime_error(std::string("TP GDN ")+what+": "+cudaGetErrorString(e));
 }
 void select(int device) { check(cudaSetDevice(device),"select device"); }
+struct CapturedNode { cudaGraph_t graph{}; cudaGraphExec_t executable{}; };
+struct CapturedWindow {
+    CapturedNode mixer[2], middle[4], commit[2];
+};
 struct Rank {
     TpGdnRankWeights w;
     int capacity, hk, hv, channels, value, ff, width;
     cudaStream_t compute{},copy{};
     cudaEvent_t ready{},arrival{};
     std::vector<void*> owned;
+    std::array<CapturedWindow,9> captured{};
+    int state_bank=0;
     float *R{},*mixed{},*attn_input{},*ffn_input{},*mixer_output{},*lo{},*rs{},*xn{},*inj[2]{},*bo{},*local_out{};
     float *state{},*conv{},*candidate_state{},*candidate_conv{},*qkv{},*h{},*gate{},*beta{},*z{},*y{},*full_y{};
     float *logits{},*weights{},*sg{},*su{},*scalar{},*shared{},*parts{};
@@ -50,17 +57,19 @@ struct Rank {
             R=alloc<float>(cap*HC*N); mixed=alloc<float>(cap*N); attn_input=alloc<float>(cap*N); ffn_input=alloc<float>(cap*N); mixer_output=alloc<float>(cap*N);
             lo=alloc<float>(cap*320);rs=alloc<float>(cap*HC);xn=alloc<float>(cap*HC*N);
             for(auto& p:inj)p=alloc<float>(cap*HC);
-            bo=alloc<float>(cap*N);local_out=alloc<float>(cap*width);
+            bo=alloc<float>(cap*N);local_out=w.rank<0?bo:alloc<float>(cap*width);
             state=alloc<float>(128*hv*128);conv=alloc<float>(3*channels);
             candidate_state=alloc<float>(128*hv*128);candidate_conv=alloc<float>(3*channels);
             qkv=alloc<float>(cap*channels);h=alloc<float>(cap*channels);gate=alloc<float>(cap*hv);beta=alloc<float>(cap*hv);
-            z=alloc<float>(cap*value);y=alloc<float>(cap*value);full_y=alloc<float>(cap*V);
+            z=alloc<float>(cap*value);y=alloc<float>(cap*value);full_y=w.rank<0?y:alloc<float>(cap*V);
             logits=alloc<float>(cap*NE);weights=alloc<float>(cap*K);ids=alloc<int32_t>(cap*K);
             sg=alloc<float>(cap*ff);su=alloc<float>(cap*ff);scalar=alloc<float>(cap);shared=alloc<float>(cap*width);
             parts=alloc<float>(cap*K*width);xq=alloc<uint8_t>(cap*(V/32)*36);
-            shared_local_q=alloc<uint8_t>(cap*(ff/32)*36);shared_full_q=alloc<uint8_t>(cap*(F/32)*36);
+            shared_local_q=alloc<uint8_t>(cap*(ff/32)*36);shared_full_q=w.rank<0?shared_local_q:alloc<uint8_t>(cap*(F/32)*36);
             gu_scratch=alloc<uint8_t>(k::native_expert_scratch_bytes(cap_entries,ff));
-            down_scratch=alloc<uint8_t>(k::native_expert_scratch_bytes(cap_entries,F));
+            // The direct single-rank reference consumes the same full hidden
+            // buffer in GU/down. Only TP needs a distinct full-width gather.
+            down_scratch=w.rank<0?gu_scratch:alloc<uint8_t>(k::native_expert_scratch_bytes(cap_entries,F));
             res=alloc<int32_t>(NE);offsets=alloc<unsigned long long>(NE);keep=alloc<int32_t>(1);plan_error=alloc<uint32_t>(1);
             ptr_offset=((4+(cap_entries+1)+2*cap_entries)+1)&~1;
             plan=alloc<int32_t>(ptr_offset+4*cap_entries+(cap_entries+1)+1);
@@ -81,6 +90,18 @@ struct Rank {
         cudaSetDevice(w.device);
         if(compute)cudaStreamSynchronize(compute);
         if(copy)cudaStreamSynchronize(copy);
+        // Graph nodes borrow weight/state/scratch pointers: destroy after drain,
+        // on their owning device, BEFORE freeing any referenced allocations.
+        auto destroy=[](CapturedNode& node){
+            if(node.executable)cudaGraphExecDestroy(node.executable);
+            if(node.graph)cudaGraphDestroy(node.graph);
+            node={};
+        };
+        for(auto& window:captured){
+            for(auto& node:window.mixer)destroy(node);
+            for(auto& node:window.middle)destroy(node);
+            for(auto& node:window.commit)destroy(node);
+        }
         for(void* p:owned)cudaFree(p);
         owned.clear();
         if(ready)cudaEventDestroy(ready);
@@ -139,6 +160,32 @@ struct Rank {
         grouped(t,mode,k::NativeExpertPhase::Down,w.down_layout,down_scratch);
         k::native_moe_combine_multi_hits_gated(parts,weights,shared,scalar,local_out,width,K,t,compute);
     }
+    void swap_state_bank() {
+        std::swap(state,candidate_state);std::swap(conv,candidate_conv);state_bank^=1;
+    }
+    void stage_commit(int t) {
+        select(w.device);
+        check(cudaMemcpyAsync(candidate_state,state,128*hv*128*sizeof(float),cudaMemcpyDeviceToDevice,compute),"stage state");
+        check(cudaMemcpyAsync(candidate_conv,conv,3*channels*sizeof(float),cudaMemcpyDeviceToDevice,compute),"stage conv");
+        k::gdn_conv_commit(candidate_conv,qkv,channels,keep,compute);
+        k::gdn_step_norm_multi(candidate_state,h,channels,gate,beta,z,w.norm,eps,y,hk,hv,t,keep,compute,t);
+    }
+    template<class Launch> void capture(CapturedNode& node,Launch launch) {
+        select(w.device);
+        check(cudaStreamBeginCapture(compute,cudaStreamCaptureModeThreadLocal),"begin rank-local capture");
+        try { launch(); }
+        catch(...) {
+            cudaGraph_t abandoned{};
+            cudaStreamEndCapture(compute,&abandoned);
+            if(abandoned)cudaGraphDestroy(abandoned);
+            throw;
+        }
+        check(cudaStreamEndCapture(compute,&node.graph),"end rank-local capture");
+        check(cudaGraphInstantiate(&node.executable,node.graph,nullptr,nullptr,0),"instantiate rank-local graph");
+    }
+    void launch(const CapturedNode& node) {
+        select(w.device);check(cudaGraphLaunch(node.executable,compute),"launch rank-local graph");
+    }
     void finish(int t) {
         select(w.device);k::gr_write_multi(R,bo,inj[1],{N,HC,320},R,t,compute);
     }
@@ -151,6 +198,8 @@ struct TpGdnLayer::Impl {
     int count,capacity,mode,tokens=0;
     uint64_t epoch=0;
     bool seen_epoch=false,pending=false,poisoned=false;
+    TpGdnExecution execution=TpGdnExecution::RuntimeCopies;
+    std::array<bool,9> prepared{};
     Impl(const ModelGeometry& g,const TpGdnRankWeights& a,const TpGdnRankWeights* b,int cap,int m):
         geometry(g),count(b?2:1),capacity(cap),mode(m) {
         (void)gdn_rank_layout(g,0);
@@ -206,29 +255,85 @@ struct TpGdnLayer::Impl {
         else check(cudaMemcpyPeerAsync(to,dst.w.device,from,src.w.device,n,dst.copy),"peer gather");
     }
     void gather_y() {
+        if(count==1)return; // full_y aliases y in the direct reference
         exchange([&](Rank& d,Rank& s){
-            if(count==1){bytes(d,d.full_y,s,s.y,tokens*V*sizeof(float));return;}
             // Mapped V heads are three runs of eight 128-element heads.
             for(int t=0;t<tokens;++t)for(int b=0;b<3;++b)
                 bytes(d,d.full_y+t*V+(b*16+s.w.rank*8)*128,s,s.y+t*(V/2)+b*8*128,8*128*sizeof(float));
         });
     }
     void gather_output() {
+        if(count==1)return; // local_out aliases bo
         exchange([&](Rank& d,Rank& s){for(int t=0;t<tokens;++t)
             bytes(d,d.bo+t*N+(count==1?0:s.w.rank*N/2),s,s.local_out+t*s.width,s.width*sizeof(float));});
     }
     void gather_hidden() {
+        if(count==1)return; // full hidden pointers alias their GU producers
         exchange([&](Rank& d,Rank& s){const size_t local=(s.ff/32)*36,full=(F/32)*36,off=count==1?0:s.w.rank*local;
             for(int e=0;e<tokens*K;++e)bytes(d,d.hidden(true,tokens)+e*full+off,s,s.hidden(false,tokens)+e*local,local);
             for(int t=0;t<tokens;++t)bytes(d,d.shared_full_q+t*full+off,s,s.shared_local_q+t*local,local);
         });
     }
-    void run() {
+    void push_y(Rank& a) {
+        if(count==1)return;
+        k::tp_gdn_push_y(a.y,a.full_y,r[1-a.w.rank]->full_y,tokens,a.w.rank,a.compute);
+    }
+    void push_output(Rank& a) {
+        if(count==1)return;
+        k::tp_gdn_push_output(a.local_out,a.bo,r[1-a.w.rank]->bo,tokens,a.w.rank,a.compute);
+    }
+    void push_hidden(Rank& a) {
+        if(count==1)return;
+        auto& peer=*r[1-a.w.rank];
+        k::tp_gdn_push_hidden(a.hidden(false,tokens),a.hidden(true,tokens),peer.hidden(true,tokens),
+            a.shared_local_q,a.shared_full_q,peer.shared_full_q,tokens,a.w.rank,a.compute);
+    }
+    void phase(Rank& a,int phase_index) {
+        select(a.w.device);
+        switch(phase_index){
+        case 0:a.mixer(tokens);push_y(a);break;
+        case 1:a.output_projection(tokens);push_output(a);break;
+        case 2:
+            check(cudaMemcpyAsync(a.mixer_output,a.bo,tokens*N*sizeof(float),cudaMemcpyDeviceToDevice,a.compute),"mixer seam");
+            a.ffn_gu(tokens,mode);push_hidden(a);break;
+        case 3:a.ffn_down(tokens,mode);push_output(a);break;
+        case 4:a.finish(tokens);break;
+        default:throw std::logic_error("TP GDN invalid compute phase");
+        }
+    }
+    void phase_barrier() {
+        if(count==1)return; // same-device ordered stream already establishes this
+        // Record BOTH producers before submitting any consumer wait. Peer pushes
+        // system-fence every writer. Both consumers wait both completed pushes,
+        // including remote consumption before the next phase reuses buffers.
+        for(int i=0;i<count;++i){auto& a=*r[i];select(a.w.device);check(cudaEventRecord(a.ready,a.compute),"phase producer ready");}
+        for(int i=0;i<count;++i){auto& a=*r[i];select(a.w.device);
+            for(int j=0;j<count;++j)check(cudaStreamWaitEvent(a.compute,r[j]->ready,0),"phase consumer wait");}
+    }
+    void run_segmented(bool graphs) {
+        if(graphs&&count==1){
+            // A single GPU needs no inter-rank seams: use one complete proposal
+            // graph, rather than burdening the reference with TP segmentation.
+            auto& a=*r[0];a.launch(a.captured[tokens].mixer[a.state_bank]);return;
+        }
+        for(int ph=0;ph<5;++ph){
+            for(int i=0;i<count;++i){auto& a=*r[i];
+                if(graphs){auto& c=a.captured[tokens];a.launch(ph==0?c.mixer[a.state_bank]:c.middle[ph-1]);}
+                else phase(a,ph);
+            }
+            if(ph<4)phase_barrier();
+        }
+    }
+    void run_runtime_copies() {
         for(int i=0;i<count;++i)r[i]->mixer(tokens);
         gather_y();for(int i=0;i<count;++i)r[i]->output_projection(tokens);
         gather_output();for(int i=0;i<count;++i){auto& a=*r[i];select(a.w.device);check(cudaMemcpyAsync(a.mixer_output,a.bo,tokens*N*sizeof(float),cudaMemcpyDeviceToDevice,a.compute),"mixer seam");a.ffn_gu(tokens,mode);}
         gather_hidden();for(int i=0;i<count;++i)r[i]->ffn_down(tokens,mode);
         gather_output();for(int i=0;i<count;++i)r[i]->finish(tokens);
+    }
+    void run() {
+        if(execution==TpGdnExecution::RuntimeCopies)run_runtime_copies();
+        else run_segmented(execution==TpGdnExecution::Captured);
         sync();
         for(int i=0;i<count;++i){uint32_t error=0;select(r[i]->w.device);check(cudaMemcpy(&error,r[i]->plan_error,sizeof(error),cudaMemcpyDeviceToHost),"plan status");
             if(error)throw std::runtime_error("TP GDN static expert plan rejected a route");}
@@ -238,12 +343,55 @@ struct TpGdnLayer::Impl {
         healthy();if(pending)throw std::logic_error("TP GDN proposal requires commit(keep), including rollback with keep=0");
         if(t<1||t>capacity)throw std::invalid_argument("TP GDN token count exceeds capacity");
         if(seen_epoch&&e<=epoch)throw std::invalid_argument("TP GDN epoch must increase");
+        if(execution==TpGdnExecution::Captured&&!prepared[t])throw std::logic_error("TP GDN token count was not captured during startup");
         tokens=t;epoch=e;seen_epoch=true;
     }
 };
 
 TpGdnLayer::TpGdnLayer(const ModelGeometry& g,const TpGdnRankWeights& a,const TpGdnRankWeights* b,int cap,int mode):impl_(std::make_unique<Impl>(g,a,b,cap,mode)){}
 TpGdnLayer::~TpGdnLayer()=default;
+void TpGdnLayer::prepare_captured(int tokens) {
+    auto& p=*impl_;p.healthy();
+    if(tokens<1||tokens>p.capacity)throw std::invalid_argument("TP GDN capture token count exceeds capacity");
+    if(p.prepared[tokens])return;
+    if(p.seen_epoch||p.pending)throw std::logic_error("TP GDN capture preparation is startup-only, before the first proposal");
+    const auto old_execution=p.execution;const int old_tokens=p.tokens;
+    try {
+        p.sync();p.tokens=tokens;p.execution=TpGdnExecution::Consolidated;
+        // Resolve kernel/environment dispatch and first-use tables outside
+        // capture. Verification never writes recurrence/conv. Candidate commit
+        // warmup uses keep=0 and is never published.
+        p.run();p.pending=false;
+        const int zero=0;
+        for(int i=0;i<p.count;++i){auto& a=*p.r[i];select(a.w.device);
+            check(cudaMemcpyAsync(a.keep,&zero,sizeof(zero),cudaMemcpyHostToDevice,a.compute),"capture warmup keep");a.stage_commit(tokens);}
+        p.sync();
+        for(int i=0;i<p.count;++i){auto& a=*p.r[i];auto& window=a.captured[tokens];
+            const int original_bank=a.state_bank;
+            try{
+                for(int bank=0;bank<2;++bank){
+                    if(a.state_bank!=bank)a.swap_state_bank();
+                    a.capture(window.mixer[bank],[&]{
+                        if(p.count==1)for(int ph=0;ph<5;++ph)p.phase(a,ph);
+                        else p.phase(a,0);
+                    });
+                    a.capture(window.commit[bank],[&]{a.stage_commit(tokens);});
+                }
+                if(a.state_bank!=original_bank)a.swap_state_bank();
+                if(p.count==2)for(int ph=1;ph<5;++ph)a.capture(window.middle[ph-1],[&]{p.phase(a,ph);});
+            }catch(...){if(a.state_bank!=original_bank)a.swap_state_bank();throw;}
+        }
+        p.prepared[tokens]=true;p.execution=old_execution;p.tokens=old_tokens;
+    }catch(...){p.execution=old_execution;p.tokens=old_tokens;p.pending=false;p.poisoned=true;throw;}
+}
+void TpGdnLayer::set_execution(TpGdnExecution mode) {
+    auto& p=*impl_;p.healthy();
+    if(p.pending)throw std::logic_error("TP GDN execution mode cannot change during an outstanding proposal");
+    if(mode!=TpGdnExecution::RuntimeCopies&&mode!=TpGdnExecution::Consolidated&&mode!=TpGdnExecution::Captured)
+        throw std::invalid_argument("TP GDN invalid execution mode");
+    p.execution=mode;
+}
+TpGdnExecution TpGdnLayer::execution() const {return impl_->execution;}
 void TpGdnLayer::reset_state(const std::vector<float>& state,const std::vector<float>& conv) {
     auto& p=*impl_;p.healthy();
     if(state.size()!=128u*48u*128u||conv.size()!=3u*C)throw std::invalid_argument("TP GDN canonical state shape mismatch");
@@ -274,14 +422,13 @@ void TpGdnLayer::commit(int keep) {
     auto& p=*impl_;p.healthy();if(!p.pending||keep<0||keep>p.tokens)throw std::invalid_argument("TP GDN commit requires an outstanding window and keep in 0..T");
     if(keep==0){p.pending=false;return;}
     try{for(int i=0;i<p.count;++i){auto& r=*p.r[i];select(r.w.device);
-        check(cudaMemcpyAsync(r.candidate_state,r.state,128*r.hv*128*sizeof(float),cudaMemcpyDeviceToDevice,r.compute),"stage state");
-        check(cudaMemcpyAsync(r.candidate_conv,r.conv,3*r.channels*sizeof(float),cudaMemcpyDeviceToDevice,r.compute),"stage conv");
         check(cudaMemcpyAsync(r.keep,&keep,sizeof(keep),cudaMemcpyHostToDevice,r.compute),"commit count");
-        k::gdn_conv_commit(r.candidate_conv,r.qkv,r.channels,r.keep,r.compute);
-        k::gdn_step_norm_multi(r.candidate_state,r.h,r.channels,r.gate,r.beta,r.z,r.w.norm,eps,r.y,r.hk,r.hv,p.tokens,r.keep,r.compute,p.tokens);
+        if(p.execution==TpGdnExecution::Captured)r.launch(r.captured[p.tokens].commit[r.state_bank]);
+        else r.stage_commit(p.tokens);
     }p.sync();
     // Pointer publication is all-host, after both successful device completions.
-    for(int i=0;i<p.count;++i){std::swap(p.r[i]->state,p.r[i]->candidate_state);std::swap(p.r[i]->conv,p.r[i]->candidate_conv);}p.pending=false;
+    for(int i=0;i<p.count;++i)p.r[i]->swap_state_bank();
+    p.pending=false;
     }catch(...){p.poisoned=true;throw;}
 }
 const float* TpGdnLayer::residual(int rank) const {impl_->healthy();if(rank<0||rank>=impl_->count)throw std::out_of_range("TP GDN rank");return impl_->r[rank]->R;}
