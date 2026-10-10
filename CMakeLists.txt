@@ -65,6 +65,10 @@ option(STRATA_HIP_GFX906 "Build the CUDA targets for AMD gfx906 through HIP (wav
 # Keep experimental device code out of default EAGER-loading builds: even an unused
 # kernel can otherwise change the VRAM budget and expert-cache residency.
 option(STRATA_HC_PERSIST_BUILD "Build the experimental Castagna-inspired gfx906 HC/router kernel" OFF)
+option(STRATA_TP2_BUILD "Build isolated experimental gfx906 two-GPU routed-FFN tests (no engine integration)" OFF)
+if(STRATA_TP2_BUILD AND NOT STRATA_HIP_GFX906)
+  message(FATAL_ERROR "STRATA_TP2_BUILD requires STRATA_HIP_GFX906=ON")
+endif()
 if(STRATA_HC_PERSIST_BUILD)
   if(NOT STRATA_HIP_GFX906)
     message(FATAL_ERROR "STRATA_HC_PERSIST_BUILD requires STRATA_HIP_GFX906=ON")
@@ -244,6 +248,13 @@ add_executable(strata-dequant src/artifact/dequant.cpp)
 target_link_libraries(strata-dequant PRIVATE strata_artifact)
 # this file is now nothing but the CLI entry point, and its inherited guard spells that as a "selftest"
 target_compile_definitions(strata-dequant PRIVATE STRATA_DEQUANT_SELFTEST)
+if(STRATA_BUILD_TESTS OR STRATA_TP2_BUILD)
+  add_executable(tp2_shard_policy tests/hip/tp2_shard_policy.cpp)
+  target_link_libraries(tp2_shard_policy PRIVATE strata_artifact)
+  if(STRATA_BUILD_TESTS)
+    add_test(NAME tp2_shard_policy COMMAND tp2_shard_policy)
+  endif()
+endif()
 if(STRATA_BUILD_TESTS)
   # No GPU dependency: reject unsupported persistent-HC dispatches before launch.
   add_executable(hc_persistent_policy tests/hip/hc_persistent_policy.cpp)
@@ -366,6 +377,17 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/ngram/ple_reader.cpp
                           src/platform/direct_file.cpp)
   target_link_libraries(strata_kernels PUBLIC strata_core strata_artifact)
+  # Test-only TP2 subgraph. No production target links this device code.
+  if(STRATA_TP2_BUILD)
+    add_executable(tp2_ffn tests/hip/tp2_ffn.cpp tests/hip/tp2_ffn_join.cu)
+    set_source_files_properties(tests/hip/tp2_ffn_join.cu PROPERTIES LANGUAGE HIP)
+    target_include_directories(tp2_ffn PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(tp2_ffn PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    if(STRATA_BUILD_TESTS)
+      add_test(NAME tp2_ffn COMMAND tp2_ffn --iters 2)
+      set_tests_properties(tp2_ffn PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+    endif()
+  endif()
   # Model-free acceptance gate for the opt-in Castagna-inspired persistent HC path.
   # Available in opt-in gfx906 builds, including published source without tests/CMakeLists.txt.
   if(STRATA_HC_PERSIST_BUILD)

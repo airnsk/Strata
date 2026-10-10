@@ -1,14 +1,38 @@
 # Two MI50s: tensor-parallel feasibility and first-layer plan
 
-Draft decision document, 2026-10-09. Source review: Strata `6c32b09` and Castagna Veloce
-`3483d462715d61f21ed5877836be35a724446359`. No TP implementation or hardware result is
-claimed here. The exact running configuration and per-layer weight metadata are still needed.
+Decision document, updated 2026-10-10. Initial source review: Strata `6c32b09` and
+Castagna Veloce `3483d462715d61f21ed5877836be35a724446359`. The running configuration,
+manifest and GGUF header metadata have now been supplied. A build-off, routed-expert-only
+TP2 test prototype is implemented; GPU compilation/results remain pending. No production
+TP integration or whole-decode speedup is claimed. See [TP2_FFN_TEST.md](TP2_FFN_TEST.md).
 
 Target hardware reported by the owner: two MI50 32 GB, gfx906, 60 CUs/card, 150 W/card;
 EPYC 7K62, 512 GB RAM; measured PCIe P2P 27.84 GB/s one-way, about 55 GB/s aggregate.
 Those bandwidth figures do not establish the latency of a graph-captured small exchange.
 
-## Decision before coding
+## Verified model and current prototype status
+
+The supplied metadata confirms 48 layers, 512 experts/layer, N=2560 and F=640. Gate/up
+layer counts are 17 IQ3_XXS, 10 IQ3_S, 20 IQ2_S and one IQ4_XS; down counts are 39 IQ4_NL
+and nine Q2_0. There is no IQ1_M gate/up in this artifact. Every actual down format permits
+a 320-column split on complete blocks. Manifest and GGUF totals agree: 50,292,326,400 raw
+expert bytes, 46.83837890625 GiB total, or 23.419189453125 GiB/rank before allocation
+alignment. The illustrative uniform-format table below is not this mixed model's total.
+
+The reported production run already holds all 24,576 experts across two cards. Its hot
+profile biases ownership toward the primary; hit counts are not timing measurements.
+Rebalancing expert bytes could free primary space, but a working TP runtime still needs
+an allocation budget for dense weights, shared FFN, KV, MTP, graphs and scratch. The supplied
+startup log shows very little primary free memory after graph creation. Test fixture
+allocations are small and do not prove full-model fit.
+
+Implemented first gate: unchanged raw expert block splitting, CPU reconstruction tests,
+and an isolated two-card routed-expert FFN harness against full-width and whole-expert EP
+microbenchmarks. It includes optional selected real-weight GGUF reads. Shared FFN remains
+outside this prototype: its geometry/formats are not assumed from routed F=640. Production
+weight ownership, dense/attention TP and inference graph integration remain unimplemented.
+
+## Decision before production coding
 
 Prototype a complete routed-plus-shared FFN split, then a complete GDN layer. Do not
 start with an isolated output-head optimization or copy the donor's persistent FFN
@@ -91,7 +115,9 @@ can inform an implementation while retaining Strata's validated IQ decoding.
 
 ## Ownership, build gate and capture
 
-Proposed files, not implemented:
+The bounded prototype implements `include/strata/core/tp2_shard.hpp`,
+`tests/hip/tp2_shard_policy.cpp`, `tests/hip/tp2_ffn.cpp` and test-only join kernels.
+The following production ownership/exchange files remain proposed, not implemented:
 
 - `include/strata/core/tp2_weights.hpp`, `src/core/tp2_weights.cpp`: block-aligned shard
   plans, per-rank ownership, expert pointer tables, exact device-memory budget.
@@ -99,7 +125,8 @@ Proposed files, not implemented:
   transfer, output join, device/stream/event lifetimes.
 - Later `include/strata/kernels/tp2_exchange.hpp`, `src/kernels/cuda/tp2_exchange.cu`:
   graph-safe exchange/reduction if separate-graph measurements justify it.
-- `tests/hip/tp2_ffn.cpp`: model-free full-FFN parity, replay and timing gate.
+- `tests/hip/tp2_ffn.cpp` now provides routed-expert FFN parity/replay/timing only; a complete
+  routed-plus-shared FFN gate is still future work.
 - Eventual integration: `verify.hpp/cpp`, `expert_source.cpp`, `generate.cpp`; explicit
   separate shard ownership rather than overloading ordinary full ExpertCache blobs.
 
@@ -183,12 +210,14 @@ both cards is not the proposed design.
    report per-card balance and accepted tokens/window. Expand to whole-layer integration
    only if the measured critical-path saving justifies the remaining engineering cost.
 
-Stop implementation planning at this document until the configuration, manifest and
-runtime memory evidence below arrive. No GPU compiler/device was available for this review.
+Configuration, manifest, header and startup memory evidence have arrived; the bounded
+routed-expert test is now implemented. Stop before production integration until GPU build,
+phase parity and transfer-inclusive results justify it, and the complete memory budget is
+checked. No GPU compiler/device was available in the authoring executor.
 
-## Minimum metadata to unblock the decision
+## Read-only metadata recipe for reproducing the decision
 
-Send the sanitized running configuration/launch command, relevant STRATA_* environment
+For another artifact, collect the sanitized running configuration/launch command, relevant STRATA_* environment
 variables, exact model/shard and pack identity, MTP path/format, context/KV settings,
 resident-KV limit, prefill size, cache limits/reserves and spec settings. Remove credentials
 and unrelated private values. Also send an existing startup log and decode timing/profile
