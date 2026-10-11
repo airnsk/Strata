@@ -178,3 +178,61 @@ status instead of returning `tee`'s success. A logging failure is itself an erro
 Implementation and host-only checks do not establish HIP compilation, two-GPU
 correctness, or a measured performance result. This probe still needs its one
 bounded run on the stand before any of its phase data can be treated as measured.
+
+## Staged whole-layer baseline (separate opt-in)
+
+Use the same reviewed model-root alias validation and installed image for one
+matched whole-layer baseline, without adding a kernel or changing the test binary:
+
+```bash
+cd /home/alex/Strata-hc-persist
+BUILD_JOBS=48 TP2_TIMEOUT=1200 bash tools/run_tp2_model_probe_mi50.sh \
+  --sustained-baseline /mnt/nvme/models \
+  --pack /models/pack-iq3_s \
+  --gguf /models/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf \
+  --gguf /models/Qwen3.8-Flash-Next-GSQ-RCO-Q8_0-PLE-00002-of-00002.gguf
+```
+
+This leading wrapper option runs the existing `--execution hybrid --benchmark`
+path, not `--model-probe`. Settings are fixed: layer 0, mode 8, production HC
+startup check, three warmup crossovers, four measured crossovers, 16 calls per
+sustained block and four block crossovers. It compares single-GPU captured versus
+hybrid and row-captured versus hybrid at T=1,2,4,5,8. Optional explicit layer,
+mode and dispatch arguments must match those fixed values; benchmark/execution
+flags are rejected. Baseline-only environment bounds are BUILD_JOBS=1..128 and
+TP2_TIMEOUT=1..1800 seconds. The existing incremental build is retained, with
+RCCL build explicitly OFF for this mode. Compilation is outside the runtime
+limit; existing container lifecycle and image-discovery mechanics are unchanged.
+
+Both cards must already be idle. Sudo authorization happens before Docker and
+outside captured/timed operations; subsequent Docker calls are noninteractive.
+No service or security settings are changed. A timeout/kill is a failed run:
+inspect GPU state before any manual retry. The wrapper never retries a GPU run.
+
+Files use `tp2-staged-baseline-...log`, with distinct `BASELINE_*` records and
+`TP2_STAGED_BASELINE_EXIT`. Admission requires both cards actually selecting
+variant 3 (staged); a valid fallback selection is insufficient for this baseline.
+The source HEAD, source hashes, built-executable hash, raw HC environment and
+expected F32/BF16 source shape/type coverage are recorded and checked. Hashes
+identify this run, not a reproducible-build or model-payload identity proof.
+
+The unchanged numerical gates cover 44 prefix cases and their continuations per
+execution mode, 88 of each in total. Admission checks both named studies, every
+shape, all eight measured samples per shape/study in both burst and sustained
+modes, ten summaries per mode, valid timing fields, final BENCH_GATE and inner
+exit zero. Saved logs also contain the admission result and outer exit. Missing,
+duplicate, reordered or malformed required records cannot become an accepted run.
+A nonzero outer exit invalidates the result even if an earlier marker says PASS.
+
+Stage profiles are generated automatically, separately from the authoritative
+unprofiled timing, at T1..8. They are instrumented single-call diagnostics, not
+sustained critical-path attribution. They include host/event arrival effects;
+do not sum GPU times, subtract their HC spans from sustained wall or treat them
+as the cost of a new join. T3 has diagnostic coverage but no sustained timing in
+this unchanged executable. Neither study measures full-model generation,
+emitted tokens, acceptance or a new HC implementation. Normal model-probe mode,
+its flags and its existing gates remain unchanged.
+
+CPU-only wrapper regression check:
+`python tools/test_tp2_staged_baseline_runner.py`. Docker and GPU output are
+mocked; passing it is not GPU correctness or performance evidence.
