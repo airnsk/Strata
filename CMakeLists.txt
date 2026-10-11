@@ -67,6 +67,10 @@ option(STRATA_HIP_GFX906 "Build the CUDA targets for AMD gfx906 through HIP (wav
 option(STRATA_HC_PERSIST_BUILD "Build the experimental Castagna-inspired gfx906 HC/router kernel" OFF)
 option(STRATA_TP2_BUILD "Build isolated experimental gfx906 two-GPU routed-FFN tests (no engine integration)" OFF)
 option(STRATA_TP2_GDN_BUILD "Build opt-in gfx906 TP GDN-layer correctness gate (no generation integration)" OFF)
+option(STRATA_TP2_VRAM_PROBE_BUILD "Build model-free gfx906 VRAM rendezvous admission probe only (no engine integration)" OFF)
+if(STRATA_TP2_VRAM_PROBE_BUILD AND NOT STRATA_HIP_GFX906)
+  message(FATAL_ERROR "STRATA_TP2_VRAM_PROBE_BUILD requires STRATA_HIP_GFX906=ON")
+endif()
 option(STRATA_TP2_GDN_RCCL_BUILD "Enable isolated captured RCCL hybrid GDN experiment (no generation integration)" OFF)
 if(STRATA_TP2_GDN_RCCL_BUILD AND (NOT STRATA_TP2_GDN_BUILD OR NOT STRATA_HIP_GFX906))
   message(FATAL_ERROR "STRATA_TP2_GDN_RCCL_BUILD requires STRATA_TP2_GDN_BUILD=ON and STRATA_HIP_GFX906=ON")
@@ -216,6 +220,22 @@ elseif(STRATA_ENABLE_HIP)
   set(_strata_gpu_runtime_target strata_hip_runtime)
   set(_strata_gpu_blas_target ${STRATA_HIP_BLAS_TARGETS})
   set(_strata_gpu_include_directories ${STRATA_HIP_COMPAT_INCLUDE_DIR})
+endif()
+
+# The opt-in transport probe links only HIP and host threads. Its experimental
+# device code is never linked into strata_kernels or an engine target.
+if(STRATA_TP2_VRAM_PROBE_BUILD)
+  find_package(Threads REQUIRED)
+  add_executable(tp2_vram_rendezvous tests/hip/tp2_vram_rendezvous.cpp
+                 src/kernels/cuda/tp_vram_rendezvous.cu)
+  set_source_files_properties(tests/hip/tp2_vram_rendezvous.cpp
+                             src/kernels/cuda/tp_vram_rendezvous.cu PROPERTIES LANGUAGE HIP)
+  set_target_properties(tp2_vram_rendezvous PROPERTIES HIP_STANDARD 17 HIP_STANDARD_REQUIRED ON)
+  target_include_directories(tp2_vram_rendezvous PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_compile_options(tp2_vram_rendezvous PRIVATE -fno-fast-math -ffp-contract=off)
+  target_link_libraries(tp2_vram_rendezvous PRIVATE hip::host Threads::Threads)
+  # Intentionally not an automatic ctest: both physical GPUs must be verified
+  # idle, and the wrapper owns bounded isolated faults and daemon-side cleanup.
 endif()
 
 # Warnings live on an INTERFACE target the project's own code links, NOT in add_compile_options: applied
