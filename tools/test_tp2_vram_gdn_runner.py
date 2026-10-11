@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -25,6 +26,17 @@ CPP = (ROOT / 'tests/hip/tp2_gdn_layer.cpp').read_text()
 SOURCE = RUNNER.read_text()
 INNER = SOURCE.split("<<'VRAM_GDN_CONTAINER'\n", 1)[1].split('\nVRAM_GDN_CONTAINER\n', 1)[0]
 SUITE = 'VRAM_GDN_SUITE_PASS'
+
+# Small synthetic compiler transcript with the real warning/source shape. No
+# hardware identities, model locations or private stand transcript are stored.
+CLANG_WARNING = [
+    "/synthetic/kernel.cu:962:9: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]",
+    '  962 |         cudaGetLastError();      // drop any error the attempt left behind',
+    '      |         ^~~~~~~~~~~~~~~~~~',
+    "/synthetic/compat.h:82:26: note: expanded from macro 'cudaGetLastError'",
+    '   82 | #define cudaGetLastError hipGetLastError',
+    '      |                          ^',
+]
 
 
 def cpp_format(prefix, *args):
@@ -126,7 +138,8 @@ def normal():
 
 def container_log(source_sha='a'*64):
     lines = ['VRAM_GDN_CONTAINER_ENTER', 'VRAM_GDN_CONTAINER_SOURCE_SHA256 ' + source_sha,
-             'VRAM_GDN_IDLE_PASS stage=before-build cards=2 utilization=0 kfd_processes=0']
+             'VRAM_GDN_IDLE_PASS stage=before-build cards=2 utilization=0 kfd_processes=0',
+             'VRAM_GDN_BUILD_CONFIG directory=/build-cache/synthetic jobs=48 mode=clean']
     lines += ['VRAM_GDN_HOST_GATE_PASS target=' + target for target in admission.HOST_GATES]
     lines += ['VRAM_GDN_BINARY_SHA256 ' + 'b'*64, 'VRAM_GDN_BUILD_GATE PASS']
     for scenario in admission.SCENARIOS:
@@ -250,6 +263,119 @@ class AdmissionTests(unittest.TestCase):
                         with self.assertRaises(admission.AdmissionError): admission.validate_host(lines, 'test-container')
         for bad in ('VRAM_GDN_SETUP_FAILURE bad', 'BENCH_GATE PASS', 'VRAM_LAYER_LIFECYCLE_PASS life=0 orders=2 tokens=1,8 banks=2'):
             with self.assertRaises(admission.AdmissionError): admission.validate_host(self.host+[bad], 'test-container')
+
+    def compiler_host(self, excerpt=CLANG_WARNING):
+        i = next(i for i, line in enumerate(self.host) if line.startswith('VRAM_GDN_HOST_GATE_PASS'))
+        return self.host[:i] + list(excerpt) + self.host[i:]
+
+    def test_build_source_comment_is_contextual_not_literal_or_global_allowlist(self):
+        for excerpt in (CLANG_WARNING,
+                        [line.replace('the attempt left', 'the attempts left') for line in CLANG_WARNING],
+                        [line.replace('cudaGetLastError();', 'hipGetLastError();').replace('drop any error the attempt left behind',
+                         'clear the prior error state') for line in CLANG_WARNING]):
+            with self.subTest(excerpt=excerpt):
+                admitted = admission.validate_host(self.compiler_host(excerpt), 'test-container')
+                self.assertEqual(len(admitted), 1)
+        # Normal admission keeps its existing strict behavior everywhere else.
+        with self.assertRaises(admission.AdmissionError): admission.forbidden(CLANG_WARNING[1])
+        self.reject(self.valid[:-1] + CLANG_WARNING + self.valid[-1:])
+
+    def test_compiler_context_cannot_escape_verified_compile_phase(self):
+        prefixes = ('VRAM_GDN_AUTH_EXIT', 'VRAM_GDN_IDLE_PASS stage=before-build', 'VRAM_GDN_BUILD_CONFIG',
+                    'VRAM_GDN_BINARY_SHA256', 'VRAM_GDN_BUILD_GATE', 'VRAM_GDN_CONTAINER_COMPLETE',
+                    'VRAM_GDN_CONTAINER_CLEANUP', 'VRAM_GDN_PROCESS_BEGIN', 'VRAM_GDN_PROCESS_EXIT')
+        for i, line in enumerate(self.host):
+            if line.startswith(prefixes):
+                # Insertion before config/build or inside/between any process is
+                # never compiler context. Test both sides of every process end.
+                for offset in ((0, 1) if line.startswith('VRAM_GDN_PROCESS_') else (0,)):
+                    pos = i + offset
+                    with self.subTest(line=line, offset=offset):
+                        with self.assertRaises(admission.AdmissionError):
+                            admission.validate_host(self.host[:pos] + CLANG_WARNING + self.host[pos:], 'test-container')
+        i = next(i for i, line in enumerate(self.host) if line.startswith('VRAM_GDN_HOST_GATE_PASS'))
+        with self.assertRaises(admission.AdmissionError):
+            admission.validate_host(self.host[:i+1] + CLANG_WARNING + self.host[i+1:], 'test-container')
+
+    def test_compiler_source_shape_and_phase_markers_fail_closed(self):
+        mutations = [CLANG_WARNING[1:], CLANG_WARNING[:2],
+                     [CLANG_WARNING[0].replace(':962:', ':961:'), *CLANG_WARNING[1:]],
+                     [CLANG_WARNING[0].replace('warning:', 'error:'), *CLANG_WARNING[1:]],
+                     [CLANG_WARNING[0].replace('warning:', 'fatal error:'), *CLANG_WARNING[1:]],
+                     [CLANG_WARNING[0].replace('kernel.cu:', 'compiler:'), *CLANG_WARNING[1:]],
+                     [CLANG_WARNING[0], 'compiler output interrupted this diagnostic', *CLANG_WARNING[1:]],
+                     [CLANG_WARNING[0], CLANG_WARNING[1], 'not a caret'],
+                     [CLANG_WARNING[0], CLANG_WARNING[1].replace('cudaGetLastError();', 'HIP error: invalid device'), *CLANG_WARNING[2:]],
+                     [CLANG_WARNING[0], CLANG_WARNING[1].replace('cudaGetLastError();', 'puts("https://error: failure");'), *CLANG_WARNING[2:]],
+                     [CLANG_WARNING[0], CLANG_WARNING[1].replace('drop any error', 'ERROR'), *CLANG_WARNING[2:]]]
+        for excerpt in mutations:
+            with self.subTest(excerpt=excerpt):
+                with self.assertRaises(admission.AdmissionError): admission.validate_host(self.compiler_host(excerpt), 'test-container')
+        valid = self.compiler_host()
+        for i, line in enumerate(valid):
+            if line.startswith(('VRAM_GDN_BUILD_CONFIG', 'VRAM_GDN_HOST_GATE_PASS', 'VRAM_GDN_BUILD_GATE')):
+                for changed in (valid[:i] + valid[i+1:], valid[:i] + [line] + valid[i:],
+                                valid[:i] + [line + ' extra'] + valid[i+1:]):
+                    with self.subTest(line=line):
+                        with self.assertRaises(admission.AdmissionError): admission.validate_host(changed, 'test-container')
+        config = next(line for line in valid if line.startswith('VRAM_GDN_BUILD_CONFIG'))
+        changed = [config] + [line for line in valid if line != config]
+        with self.assertRaises(admission.AdmissionError): admission.validate_host(changed, 'test-container')
+        for prefix in ('VRAM_GDN_CONTAINER_ENTER', 'VRAM_GDN_CONTAINER_SOURCE_SHA256', 'VRAM_GDN_BINARY_SHA256'):
+            line = next(line for line in valid if line.startswith(prefix))
+            for changed in ([line] + [value for value in valid if value != line], [value for value in valid if value != line] + [line]):
+                with self.subTest(moved=prefix):
+                    with self.assertRaises(admission.AdmissionError): admission.validate_host(changed, 'test-container')
+
+    def test_real_errors_nonzero_and_skips_fail_in_every_scope(self):
+        valid = self.compiler_host()
+        positions = [0, next(i for i, line in enumerate(valid) if line.startswith('VRAM_GDN_HOST_GATE_PASS')),
+                     next(i for i, line in enumerate(valid) if line.startswith('VRAM_GDN_BUILD_GATE')),
+                     *[i + 1 for i, line in enumerate(valid) if line.startswith('VRAM_GDN_PROCESS_BEGIN')], len(valid)]
+        for bad in ('/synthetic/kernel.cu:1:1: error: invalid expression', 'clang++: fatal error: compile stopped',
+                    'FAILED: object.o', 'ninja: build stopped: subcommand failed.', 'SKIPPED no device', 'VRAM_LAYER_WATCHDOG code=70', 'HIP error: invalid device',
+                    'tp2_gdn_layer: invalid state', 'Traceback (most recent call last):'):
+            for pos in positions:
+                with self.subTest(bad=bad, pos=pos):
+                    with self.assertRaises(admission.AdmissionError): admission.validate_host(valid[:pos] + [bad] + valid[pos:], 'test-container')
+        for i, line in enumerate(valid):
+            if line.startswith('VRAM_GDN_PROCESS_EXIT'):
+                for code in (1, 4, 70, 77, 124, 137):
+                    changed = valid[:i] + [line.replace('code=0', f'code={code}')] + valid[i+1:]
+                    with self.assertRaises(admission.AdmissionError): admission.validate_host(changed, 'test-container')
+
+    def test_offline_revalidation_preserves_exact_historical_failure(self):
+        trailer = ['VRAM_GDN_ADMISSION_FAIL error output', 'TP2_VRAM_GDN_EXIT=4 LOG=/synthetic/original.log']
+        valid = self.compiler_host() + trailer
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)/'historical.log'
+            raw = ('\n'.join(valid) + '\n').encode(); path.write_bytes(raw)
+            report = admission.revalidate_host(path, 'test-container')
+            self.assertEqual(path.read_bytes(), raw)
+            self.assertEqual(report['original_log_sha256'], hashlib.sha256(raw).hexdigest())
+            self.assertEqual(report['validator_sha256'], hashlib.sha256(ADMISSION.read_bytes()).hexdigest())
+            self.assertEqual(report['original_exit'], 4)
+            self.assertEqual(report['result'], 'VRAM_GDN_HOST_REVALIDATION_PASS')
+            self.assertEqual(len(report['compiler_source_comment_lines']), 1)
+            with self.assertRaises(admission.AdmissionError): admission.validate_host(valid, 'test-container')
+            result = subprocess.run([sys.executable, str(ADMISSION), 'host-revalidate', str(path), 'test-container'], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout), report)
+            self.assertNotIn('VRAM_GDN_SUITE_PASS', result.stdout)
+            rejected = [valid[:-1], valid + ['extra'], self.host + trailer,
+                        valid[:-2] + [trailer[0].replace('error output', 'failure/skip/watchdog output'), trailer[1]],
+                        valid[:-1] + [trailer[1].replace('EXIT=4', 'EXIT=0')],
+                        valid[:-3] + trailer, valid[:-3] + [trailer[0]] + valid[-3:],
+                        ['ERROR GPU reset'] + valid,
+                        valid[:-3] + ['VRAM_GDN_SUITE_PASS historical'] + valid[-3:],
+                        valid[:-3] + ['TP2_VRAM_GDN_EXIT=4 LOG=/synthetic/earlier.log'] + valid[-3:]]
+            for changed in rejected:
+                with self.subTest(tail=changed[-4:]):
+                    path.write_text('\n'.join(changed) + '\n')
+                    with self.assertRaises(admission.AdmissionError): admission.revalidate_host(path, 'test-container')
+            for suffix in (b'', b'\r\n', b'\0\n'):
+                path.write_bytes(raw[:-1] + suffix)
+                with self.assertRaises(admission.AdmissionError): admission.revalidate_host(path, 'test-container')
 
     def test_line_endings_and_idle_telemetry(self):
         with tempfile.TemporaryDirectory() as tmp:

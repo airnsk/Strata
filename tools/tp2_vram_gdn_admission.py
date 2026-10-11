@@ -51,7 +51,10 @@ def require(ok, reason):
 
 
 def read_log(path):
-    raw = Path(path).read_bytes()
+    return decode_log(Path(path).read_bytes())
+
+
+def decode_log(raw):
     require(raw.endswith(b'\n') and b'\r' not in raw and b'\0' not in raw, 'partial/invalid log encoding')
     return raw.decode('utf-8', errors='strict').splitlines()
 
@@ -102,6 +105,7 @@ def forbidden(line):
     require(not line.startswith(('tp2_gdn_layer:', 'Traceback', 'terminate called',
                                  'Segmentation fault', 'Aborted', 'hipError', 'CUDA error')),
             'runtime error output')
+    require(not line.lstrip().startswith('ninja: build stopped:'), 'failed build output')
     require(not re.search(r'(?i)(?:^|[ _])(?:error|fatal|exception)(?:[: ]|$)', line), 'error output')
     require(not token.startswith(('PROBE_', 'CAL_', 'PROFILE_', 'CAPTURE_PROFILE', 'RCCL_')),
             'unrelated/instrumented output')
@@ -431,9 +435,26 @@ def source_manifest(root, verbose=False):
     return inputs_digest(inputs)
 
 
+def compiler_source_comments(lines, begin, end):
+    """Recognize only bounded Clang warning/note source displays, not output.
+
+    A numbered source line must immediately follow a located diagnostic with
+    the same line number, and immediately precede its caret. Only a trailing
+    C++ line comment can contain otherwise forbidden lowercase prose. Quoted
+    code is deliberately excluded: a // inside a literal is not a comment.
+    Diagnostic headers, executable code and failure/skip tokens stay strict.
+    """
+    result = {}
+    for i in range(begin + 2, end - 1):
+        diagnostic = re.fullmatch(r'[^\s:][^\n]*\.(?:cu|cuh|cpp|cc|c|hpp|h):([1-9][0-9]*):[1-9][0-9]*: (?:warning|note): .+', lines[i - 1])
+        source = re.fullmatch(r'\s*([1-9][0-9]*) \| (?P<code>[^\'\"]*?)//.*', lines[i])
+        caret = re.fullmatch(r'\s*\|\s+\^[~^ ]*', lines[i + 1])
+        if diagnostic and source and caret and diagnostic[1] == source[1] and source['code'].strip():
+            result[i] = source['code'].strip()
+    return result
+
+
 def validate_host(lines, container):
-    for line in lines:
-        forbidden(line)
     def prefix(kind):
         found = [(i, x) for i, x in enumerate(lines) if x.startswith(kind)]
         require(len(found) == 1, 'missing/duplicate ' + kind)
@@ -445,16 +466,37 @@ def validate_host(lines, container):
     require(len(records(lines, 'VRAM_GDN_HOST_GATE_PASS')) == len(HOST_GATES), 'duplicate/malformed host gate')
     one(lines, 'VRAM_GDN_RESOLVED_IMAGE ' + IMAGE)
     build = one(lines, 'VRAM_GDN_BUILD_GATE PASS')
+    config, config_line = prefix('VRAM_GDN_BUILD_CONFIG')
+    require(re.fullmatch(r'VRAM_GDN_BUILD_CONFIG directory=/[^\s]+ jobs=(?:[1-9]|[1-3][0-9]|4[0-8]) mode=(?:clean|incremental)', config_line) is not None,
+            'malformed build configuration')
+    host_gates = []
     for name in HOST_GATES:
-        require(one(lines, 'VRAM_GDN_HOST_GATE_PASS target=' + name) < build, 'late host gate')
+        host_gates.append(one(lines, 'VRAM_GDN_HOST_GATE_PASS target=' + name))
+        require(config < host_gates[-1] < build, 'host gate outside build phase')
     before = one(lines, 'VRAM_GDN_IDLE_PASS stage=before-build cards=2 utilization=0 kfd_processes=0')
-    require(before < build, 'build before idle admission')
-    _, host_sha = prefix('VRAM_GDN_HOST_SOURCE_SHA256')
-    _, child_sha = prefix('VRAM_GDN_CONTAINER_SOURCE_SHA256')
+    require(before < config < build, 'build before idle admission')
+    enter, enter_line = prefix('VRAM_GDN_CONTAINER_ENTER')
+    host_source, host_sha = prefix('VRAM_GDN_HOST_SOURCE_SHA256')
+    child_source, child_sha = prefix('VRAM_GDN_CONTAINER_SOURCE_SHA256')
+    require(enter_line == 'VRAM_GDN_CONTAINER_ENTER' and host_source < enter < child_source < before,
+            'build before container/source admission')
     require(re.fullmatch(r'VRAM_GDN_HOST_SOURCE_SHA256 [0-9a-f]{64}', host_sha) is not None and
             child_sha == host_sha.replace('HOST_SOURCE', 'CONTAINER_SOURCE'), 'source identity mismatch')
-    _, binary = prefix('VRAM_GDN_BINARY_SHA256')
+    binary_pos, binary = prefix('VRAM_GDN_BINARY_SHA256')
     require(re.fullmatch(r'VRAM_GDN_BINARY_SHA256 [0-9a-f]{64}', binary) is not None, 'missing built binary identity')
+    require(max(host_gates) < binary_pos < build, 'built binary outside build phase')
+    # Compile context ends before the first host test, not at the later build
+    # gate. Never give subprocess output (or the gaps around it) this exception.
+    context = compiler_source_comments(lines, config, min(host_gates))
+    admitted_comments = []
+    for i, line in enumerate(lines):
+        try:
+            forbidden(line)
+        except AdmissionError as error:
+            if str(error) != 'error output' or i not in context:
+                raise
+            forbidden(context[i])
+            admitted_comments.append(i + 1)
     previous, included = build, set()
     for scenario in SCENARIOS:
         begin, begin_line = prefix('VRAM_GDN_PROCESS_BEGIN scenario=' + scenario)
@@ -483,6 +525,32 @@ def validate_host(lines, container):
     require(len(records(lines, 'VRAM_GDN_CONTAINER_COMPLETE')) == 1 and len(records(lines, 'VRAM_GDN_CONTAINER_CLEANUP')) == 1,
             'conflicting completion/cleanup')
     require(previous < complete < cleanup, 'completion/cleanup order')
+    return admitted_comments
+
+
+def revalidate_host(path, container):
+    """Audit one known terminal validator false positive without changing it."""
+    raw = Path(path).read_bytes()
+    lines = decode_log(raw)
+    original_failure = 'VRAM_GDN_ADMISSION_FAIL error output'
+    require(len(lines) >= 3 and lines[-2] == original_failure and
+            re.fullmatch(r'TP2_VRAM_GDN_EXIT=4 LOG=\S.*', lines[-1]) is not None,
+            'not the known terminal host-validator failure')
+    require(lines[-3] == 'VRAM_GDN_CONTAINER_CLEANUP verified_absent=' + container,
+            'terminal failure did not immediately follow verified cleanup')
+    # Strip exactly the two verified terminal records in memory. Every earlier
+    # byte remains covered, including any earlier failure or duplicate trailer.
+    body = lines[:-2]
+    require(not any(line.startswith(('VRAM_GDN_SUITE_PASS', 'TP2_VRAM_GDN_EXIT=')) for line in body),
+            'conflicting historical result')
+    admitted = validate_host(body, container)
+    require(admitted, 'no compiler-source false positive to revalidate')
+    return {'result': 'VRAM_GDN_HOST_REVALIDATION_PASS',
+            'original_admission': original_failure, 'original_exit': 4,
+            'original_log_sha256': hashlib.sha256(raw).hexdigest(),
+            'validator_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+            'compiler_source_comment_lines': admitted,
+            'scope': 'offline host transcript only; no GPU rerun; original result unchanged'}
 
 
 def private_directory(path):
@@ -569,10 +637,10 @@ def cache_commit(build, root, expected):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='command', required=True)
-    for mode in ('normal', 'host'):
+    for mode in ('normal', 'host', 'host-revalidate'):
         p = sub.add_parser(mode)
         p.add_argument('log')
-        if mode == 'host': p.add_argument('container')
+        if mode != 'normal': p.add_argument('container')
     p = sub.add_parser('fault'); p.add_argument('log'); p.add_argument('scenario'); p.add_argument('first', type=int)
     p = sub.add_parser('idle'); p.add_argument('json'); p.add_argument('kfd_root')
     for mode in ('cache-prepare', 'cache-commit'):
@@ -590,6 +658,7 @@ def main(argv=None):
         elif args.command == 'idle': validate_idle(args.json, args.kfd_root)
         elif args.command == 'normal': validate_normal(read_log(args.log))
         elif args.command == 'fault': validate_fault(read_log(args.log), args.scenario, args.first)
+        elif args.command == 'host-revalidate': print(json.dumps(revalidate_host(args.log, args.container), sort_keys=True))
         else: validate_host(read_log(args.log), args.container)
     except (OSError, ValueError, TypeError, KeyError, IndexError) as error:
         print('VRAM_GDN_ADMISSION_FAIL ' + str(error), file=sys.stderr)

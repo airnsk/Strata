@@ -8,7 +8,8 @@ remain the comparison contract. It is default-off and has no serving adapter.
 First run the [standalone protocol admission](TP2_VRAM_RENDEZVOUS.md#target-runtime-protocol-admission)
 on the target pair and runtime. Its pass does not establish this integrated
 layer's correctness or speed.
-The whole-layer measurements described here have not yet run on hardware.
+Hardware measurements require the complete transcript admission below; CPU
+tests alone establish no hardware result.
 
 ## Run on a prepared two-GPU system
 
@@ -127,5 +128,44 @@ python3 tools/test_tp2_vram_gdn_runner.py
 
 Runner tests use CPU mocks and synthetic transcripts. Declaration-only C++
 syntax checks do not compile device code or prove HIP graph behavior. The actual
-HIP build, GPUs, real model, parity gates and speed measurement still require the
-stand command above.
+HIP build, GPUs, real model, parity gates and speed measurement require a hardware
+run. An offline audit reuses an existing run's evidence and does not rerun it.
+
+## Offline audit of the compiler-comment false positive
+
+The host validator keeps build output separate from model-process output. A
+Clang warning/note can display a numbered source line containing a trailing C++
+comment such as `// drop any error the attempt left behind`. The lowercase word
+`error` in that comment is not a runtime diagnostic. This exception requires an
+immediately preceding source-location diagnostic with the same line number, an
+immediately following caret, and a source line between the build configuration
+record and the first host-test pass. Quoted code is excluded. Diagnostic headers,
+code before the comment, and failure/skip/watchdog tokens remain checked. All
+build, process, numerical, timing and cleanup gates must still pass.
+
+An older validator could reject an otherwise complete transcript with exactly
+these final records, immediately after verified container cleanup:
+
+```text
+VRAM_GDN_ADMISSION_FAIL error output
+TP2_VRAM_GDN_EXIT=4 LOG=...
+```
+
+Keep that raw log unchanged and private. Set `LOG` to its local path and
+`CONTAINER` to the exact name in its verified-cleanup record, then run:
+
+```sh
+python3 tools/tp2_vram_gdn_admission.py host-revalidate "$LOG" "$CONTAINER" > revalidation.json
+```
+
+This CPU-only command reads the original bytes once. It accepts only that exact
+two-record failure trailer, checks every preceding record, and requires at least
+one recognized compiler-comment false positive. Earlier failures, missing gates,
+nonzero model-process exits, conflicting success records, or extra trailer text
+are rejected. It never rewrites the log or emits a historical suite pass.
+
+The separate JSON result retains `original_exit=4` and the original failure,
+records the raw-log and validator SHA-256 hashes, and lists the admitted source
+comment line numbers. `VRAM_GDN_HOST_REVALIDATION_PASS` means the revised host
+policy admitted that original transcript offline. It does not change the
+original wrapper result, run a GPU workload, or establish generation throughput.
