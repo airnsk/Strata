@@ -79,9 +79,14 @@ struct TpGdnFineCalibrationSample : TpGdnCalibrationSample {
 // mode, avoiding TP-only self copies. Captured reference uses one proposal graph.
 class TpGdnLayer {
 public:
+    // Startup-only inverse_down_plan is an isolated CUDA/HIP optimization for
+    // column-FFN owners. It changes no transport/join or reduction arithmetic.
+    // A full owner uses it only for the fine calibration fused-down control;
+    // its ordinary full-layer grouped Down stays unchanged. Defaults keep the
+    // original planner/down path and allocate no inverse buffers.
     TpGdnLayer(const ModelGeometry&, const TpGdnRankWeights& rank0,
                const TpGdnRankWeights* rank1 = nullptr, int capacity = 8,
-               int expert_mode = -1);
+               int expert_mode = -1, bool inverse_down_plan = false);
     ~TpGdnLayer();
     TpGdnLayer(const TpGdnLayer&) = delete;
     TpGdnLayer& operator=(const TpGdnLayer&) = delete;

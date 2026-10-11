@@ -14,6 +14,8 @@
 // Everything that varies per window (token ids, `n_keep`) is read from DEVICE memory so the kernels can be captured.
 #pragma once
 
+#include "strata/kernels/native_down_plan.hpp"
+
 #include <cstdint>
 
 namespace strata::kernels {
@@ -58,6 +60,14 @@ void copy_rows_strided(float* dst, const float* src, int64_t rows, int64_t w, in
 void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_layer, int n_expert,
                    const uint8_t* cache_base, const unsigned long long* slot_off, long long blob, int32_t* plan,
                    long long capx, uint32_t* skip, uint32_t ring, void* stream, uint32_t* plan_err = nullptr);
+/// Opt-in all-resident K10/T1..8 variant. Builds the ordinary plan and its
+/// validated inverse in one block/launch. skip must be null; plan_err is required.
+/// capx remains the allocated ordinary-plan capacity, while inverse live entries
+/// are n_entries. Invalid residency empties both plans and sets both error bits.
+void resident_plan_with_inverse(const int32_t* ids, int n_entries, int k, const int32_t* res_layer,
+                   int n_expert, const uint8_t* cache_base, const unsigned long long* slot_off,
+                   long long blob, int32_t* plan, long long capx, uint32_t* skip, uint32_t ring,
+                   void* stream, uint32_t* plan_err, NativeDownRoutePlan inverse);
 /// wait_flag_ge that also returns when *skip == value (device memory).
 void wait_flag_ge_or(const uint32_t* flag, uint32_t value, const uint32_t* skip, void* stream);
 /// copy_i32_from_mapped unless *skip == value.

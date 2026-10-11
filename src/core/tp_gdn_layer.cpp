@@ -72,8 +72,9 @@ struct Rank {
     int32_t *ids{},*res{},*plan{},*keep{};
     unsigned long long* offsets{};
     uint32_t* plan_error{};
+    k::NativeDownRoutePlan inverse_plan{}; // allocated only for the explicit opt-in
     int cap_entries, ptr_offset;
-    explicit Rank(const TpGdnRankWeights& weights_in,int cap):w(weights_in),capacity(cap),
+    explicit Rank(const TpGdnRankWeights& weights_in,int cap,bool inverse_down_plan):w(weights_in),capacity(cap),
         hk(w.rank<0?16:8),hv(w.rank<0?48:24),channels(w.rank<0?C:C/2),
         value(w.rank<0?V:V/2),ff(w.rank<0?F:F/2),width(tp_gdn_partition_geometry(w.partition,w.rank).ffn_output),cap_entries(cap*K) {
         select(w.device);
@@ -103,6 +104,11 @@ struct Rank {
             res=alloc<int32_t>(NE);offsets=alloc<unsigned long long>(NE);keep=alloc<int32_t>(1);plan_error=alloc<uint32_t>(1);
             ptr_offset=((4+(cap_entries+1)+2*cap_entries)+1)&~1;
             plan=alloc<int32_t>(ptr_offset+4*cap_entries+(cap_entries+1)+1);
+            if(inverse_down_plan){
+                inverse_plan.entry=alloc<int32_t>(cap_entries);
+                inverse_plan.blob=alloc<unsigned long long>(cap_entries);
+                inverse_plan.token_error=alloc<uint32_t>(cap);
+            }
             std::vector<int32_t> hr(NE);std::vector<unsigned long long> ho(NE);
             for(int i=0;i<NE;++i){hr[i]=i;ho[i]=static_cast<unsigned long long>(i)*w.expert_bytes;}
             check(cudaMemcpy(res,hr.data(),NE*sizeof(int32_t),cudaMemcpyHostToDevice),"resident table");
@@ -178,13 +184,32 @@ struct Rank {
         // Never use the FFN width as the attention source token stride.
         select(w.device);k::native_quantize_q8_1(full_y,xq,w.out.input,t,compute);matrix(w.out,xq,local_out,t);stamp(9);
     }
+    void build_plan(int t) {
+        if(inverse_plan.entry)
+            k::resident_plan_with_inverse(ids,t*K,K,res,NE,w.expert_arena,offsets,
+                static_cast<long long>(w.expert_bytes),plan,cap_entries,nullptr,0,compute,plan_error,inverse_plan);
+        else
+            k::resident_plan(ids,t*K,K,res,NE,w.expert_arena,offsets,
+                static_cast<long long>(w.expert_bytes),plan,cap_entries,nullptr,0,compute,plan_error);
+    }
+    void fused_down(int t,float* peer_output=nullptr) {
+        if(inverse_plan.entry)
+            k::native_expert_down_combine_preplanned(w.down_layout,inverse_plan,t*K,
+                hidden(false,t),weights,shared,scalar,local_out,plan_error,t,compute,peer_output);
+        else {
+            const int32_t* starts=plan+4;const int32_t* dst=starts+cap_entries+1;
+            const auto* ptr=reinterpret_cast<const unsigned long long*>(plan+ptr_offset);
+            k::native_expert_down_combine(w.down_layout,ptr,starts,plan,dst,t*K,t*K,
+                hidden(false,t),weights,shared,scalar,local_out,plan_error,t,compute,peer_output);
+        }
+    }
     void ffn_gu(int t,int mode,bool hc_ready=false) {
         select(w.device);if(!hc_ready)hc(1,t,true);stamp(13);
         check(cudaMemcpyAsync(ffn_input,mixed,t*N*sizeof(float),cudaMemcpyDeviceToDevice,compute),"FFN seam");
         k::bf16_gemv_fp32_mmvf_multi(mixed,N,w.router,logits,NE,N,NE,t,compute);
         k::native_router_top10_multi(logits,ids,weights,t,compute);stamp(14);
         check(cudaMemsetAsync(plan_error,0,sizeof(uint32_t),compute),"plan error reset");
-        k::resident_plan(ids,t*K,K,res,NE,w.expert_arena,offsets,static_cast<long long>(w.expert_bytes),plan,cap_entries,nullptr,0,compute,plan_error);
+        build_plan(t);
         k::native_quantize_q8_1(mixed,xq,N,t,compute);
         matrix(w.shared_gate,xq,sg,t);matrix(w.shared_up,xq,su,t);
         k::native_swiglu_quantize_q8_1(sg,su,shared_local_q,ff,t,compute);
@@ -202,10 +227,7 @@ struct Rank {
     void ffn_down(int t,int mode,float* peer_output=nullptr) {
         select(w.device);matrix(w.shared_down,shared_full_q,shared,t);stamp(20);
         if(ffn_columns()){
-            const int32_t* starts=plan+4;const int32_t* dst=starts+cap_entries+1;
-            const auto* ptr=reinterpret_cast<const unsigned long long*>(plan+ptr_offset);
-            k::native_expert_down_combine(w.down_layout,ptr,starts,plan,dst,t*K,t*K,
-                hidden(false,t),weights,shared,scalar,local_out,plan_error,t,compute,peer_output);stamp(21);stamp(22);
+            fused_down(t,peer_output);stamp(21);stamp(22);
         }else{
             grouped(t,mode,k::NativeExpertPhase::Down,w.down_layout,down_scratch);stamp(21);
             k::native_moe_combine_multi_hits_gated(parts,weights,shared,scalar,local_out,width,K,t,compute);stamp(22);
@@ -305,7 +327,7 @@ struct TpGdnLayer::Impl {
         if(host_control){host_control->~TpGdnProtocolControl();hipHostFree(host_control);}
 #endif
     }
-    Impl(const ModelGeometry& g,const TpGdnRankWeights& a,const TpGdnRankWeights* b,int cap,int m):
+    Impl(const ModelGeometry& g,const TpGdnRankWeights& a,const TpGdnRankWeights* b,int cap,int m,bool inverse_down_plan):
         geometry(g),count(b?2:1),capacity(cap),mode(m) {
         (void)gdn_rank_layout(g,0);
         if(cap<1||cap>8)throw std::invalid_argument("TP GDN capacity must be 1..8");
@@ -340,10 +362,12 @@ struct TpGdnLayer::Impl {
                 throw std::invalid_argument("TP GDN expert byte-span mismatch");
         };
         validate(a);if(b)validate(*b);
+        if(inverse_down_plan && b && !tp_gdn_partition_geometry(a.partition,a.rank).ffn_columns)
+            throw std::invalid_argument("TP GDN inverse down plan requires column-FFN owners or full diagnostic reference");
         if(b)for(int i=0;i<2;++i){const int src=i?b->device:a.device,dst=i?a.device:b->device;int yes=0;
             check(cudaDeviceCanAccessPeer(&yes,src,dst),"P2P query");if(!yes)throw std::runtime_error("TP GDN requires bidirectional direct P2P");
             select(src);auto e=cudaDeviceEnablePeerAccess(dst,0);if(e==cudaErrorPeerAccessAlreadyEnabled)cudaGetLastError();else check(e,"enable P2P");}
-        r[0]=std::make_unique<Rank>(a,cap);if(b)r[1]=std::make_unique<Rank>(*b,cap);
+        r[0]=std::make_unique<Rank>(a,cap,inverse_down_plan);if(b)r[1]=std::make_unique<Rank>(*b,cap,inverse_down_plan);
         if(hybrid())execution=TpGdnExecution::HybridCaptured;
         else if(projection_columns())execution=TpGdnExecution::ColumnCaptured;
     }
@@ -679,7 +703,7 @@ struct TpGdnLayer::Impl {
     }
 };
 
-TpGdnLayer::TpGdnLayer(const ModelGeometry& g,const TpGdnRankWeights& a,const TpGdnRankWeights* b,int cap,int mode):impl_(std::make_unique<Impl>(g,a,b,cap,mode)){}
+TpGdnLayer::TpGdnLayer(const ModelGeometry& g,const TpGdnRankWeights& a,const TpGdnRankWeights* b,int cap,int mode,bool inverse_down_plan):impl_(std::make_unique<Impl>(g,a,b,cap,mode,inverse_down_plan)){}
 TpGdnLayer::~TpGdnLayer()=default;
 void TpGdnLayer::prepare_captured(int tokens,bool profile) {
     auto& p=*impl_;p.healthy();
@@ -721,7 +745,9 @@ void TpGdnLayer::prepare_captured(int tokens,bool profile) {
     }catch(...){p.execution=old_execution;p.tokens=old_tokens;p.profile_enabled=old_profile;p.pending=false;p.poisoned=true;throw;}
 }
 void TpGdnLayer::prepare_rccl(int tokens,const TpGdnRcclOptions& options) {
-    auto& p=*impl_;p.healthy();
+    auto& p=*impl_;
+    if(p.r[0]->inverse_plan.entry)throw std::invalid_argument("inverse down plan is isolated from RCCL/flat experiments");
+    p.healthy();
     if(!p.hybrid()||tokens<1||tokens>p.capacity||p.seen_epoch||p.pending||p.profile_enabled)
         throw std::invalid_argument("TP GDN RCCL preparation requires idle startup hybrid owners and T within capacity");
     if(options.library.empty()||options.library.front()!='/'||options.timeout_ms<100||options.timeout_ms>120000||
@@ -934,6 +960,8 @@ std::vector<TpGdnFineCalibrationSample> TpGdnLayer::calibrate_fine_frozen(
         f1.r[0]->w.device != hp.r[1]->w.device ||
         f0.r[0]->w.layer != hp.r[0]->w.layer || f1.r[0]->w.layer != hp.r[0]->w.layer ||
         f0.mode != hp.mode || f1.mode != hp.mode ||
+        bool(f0.r[0]->inverse_plan.entry) != bool(hp.r[0]->inverse_plan.entry) ||
+        bool(f1.r[0]->inverse_plan.entry) != bool(hp.r[0]->inverse_plan.entry) ||
         (tokens != 1 && tokens != 8) || residual.size() != size_t(tokens)*HC*N ||
         warmup < 1 || warmup > 16 || trials < 2 || trials > 64)
         throw std::invalid_argument("fine calibration requires matching full0/full1/hybrid, T1/8, warmup1..16, trials2..64");
@@ -1193,8 +1221,7 @@ std::vector<TpGdnFineCalibrationSample> TpGdnLayer::calibrate_fine_frozen(
                     k::bf16_gemv_fp32_mmvf_multi(rank.mixed,N,rank.w.router,rank.logits,NE,N,NE,tokens,rank.compute);
                     k::native_router_top10_multi(rank.logits,rank.ids,rank.weights,tokens,rank.compute);
                     check(cudaMemsetAsync(rank.plan_error,0,sizeof(uint32_t),rank.compute), "fine calibration plan reset");
-                    k::resident_plan(rank.ids,tokens*K,K,rank.res,NE,rank.w.expert_arena,rank.offsets,
-                        static_cast<long long>(rank.w.expert_bytes),rank.plan,rank.cap_entries,nullptr,0,rank.compute,rank.plan_error);
+                    rank.build_plan(tokens);
                     k::native_quantize_q8_1(rank.mixed,rank.xq,N,tokens,rank.compute);
                 } else if (phase == 3) {
                     rank.matrix(rank.w.shared_gate,rank.xq,rank.sg,tokens);
@@ -1206,12 +1233,7 @@ std::vector<TpGdnFineCalibrationSample> TpGdnLayer::calibrate_fine_frozen(
                 } else if (phase == 5) {
                     rank.matrix(rank.w.shared_down,rank.shared_full_q,rank.shared,tokens);
                 } else if (rank.ffn_columns() || phase == 7) {
-                    const int32_t* starts = rank.plan+4;
-                    const int32_t* dst = starts+rank.cap_entries+1;
-                    const auto* ptr = reinterpret_cast<const unsigned long long*>(rank.plan+rank.ptr_offset);
-                    k::native_expert_down_combine(rank.w.down_layout,ptr,starts,rank.plan,dst,tokens*K,tokens*K,
-                        rank.hidden(false,tokens),rank.weights,rank.shared,rank.scalar,rank.local_out,
-                        rank.plan_error,tokens,rank.compute);
+                    rank.fused_down(tokens);
                 } else {
                     rank.grouped(tokens,hp.mode,k::NativeExpertPhase::Down,rank.w.down_layout,rank.down_scratch);
                     k::native_moe_combine_multi_hits_gated(rank.parts,rank.weights,rank.shared,rank.scalar,
@@ -1464,7 +1486,9 @@ std::vector<TpGdnFineCalibrationSample> TpGdnLayer::calibrate_fine_frozen(
 }
 
 void TpGdnLayer::prepare_flat(int tokens,bool shard_hc,bool profile,uint64_t timeout_us) {
-    auto& p=*impl_;p.healthy();
+    auto& p=*impl_;
+    if(p.r[0]->inverse_plan.entry)throw std::invalid_argument("inverse down plan is isolated from RCCL/flat experiments");
+    p.healthy();
     if(p.ffn_columns())throw std::invalid_argument("TP GDN column partition does not use the flat protocol");
     if(tokens<1||tokens>p.capacity||timeout_us<1||timeout_us>10000000)
         throw std::invalid_argument("TP GDN flat preparation requires T within capacity and timeout 1us..10s");

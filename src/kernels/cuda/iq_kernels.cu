@@ -11,6 +11,7 @@
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include "native_down_plan.cuh"
 
 #define GGML_COMMON_DECL_CUDA
 #define GGML_COMMON_IMPL_CUDA
@@ -3681,14 +3682,15 @@ void native_expert_grouped_explicit(const NativeExpertLayout& L, const unsigned 
 // Local column-owned FFN: ordinary independent output tiles, no grid barrier.
 // Each 256-thread block owns one token and 16 output rows. Hidden staging is
 // 10*F/32 q8_1 blocks: 3600 bytes at F320, 7200 at F640, independent of T.
-template<int TD>
+template<int TD, bool Preplanned = false>
 __global__ void __launch_bounds__(256) native_down_combine_kernel(
     NativeExpertLayout L, const unsigned long long* __restrict__ grp_ptr,
     const int32_t* __restrict__ grp_start, const int32_t* __restrict__ n_groups,
     const int32_t* __restrict__ ent_dst, int cap_groups, int cap_entries,
     const block_q8_1* __restrict__ hidden, const float* __restrict__ weights,
     const float* __restrict__ shared, const float* __restrict__ shared_gate,
-    float* __restrict__ out, uint32_t* __restrict__ error, float* __restrict__ peer_output) {
+    float* __restrict__ out, uint32_t* __restrict__ error, float* __restrict__ peer_output,
+    NativeDownRoutePlan inverse) {
     constexpr int K = 10;
     __shared__ int entry[K], bad, ng;
     __shared__ unsigned long long blob[K];
@@ -3697,30 +3699,41 @@ __global__ void __launch_bounds__(256) native_down_combine_kernel(
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int token = blockIdx.y, row0 = blockIdx.x * 16 + warp, row1 = row0 + 8;
     const int hb = static_cast<int>(L.n_ff / 32), width = static_cast<int>(L.n_embd);
-    if (tid < K) { entry[tid] = -1; blob[tid] = 0; route[tid] = weights[token * K + tid]; }
-    if (tid == 0) {
-        ng = *n_groups;
-        bad = ng <= 0 || ng > cap_groups;
-        if (!bad) bad = grp_start[0] != 0 || grp_start[ng] != cap_entries;
-    }
-    __syncthreads();
-    if (ng > 0 && ng <= cap_groups && tid < ng) {
-        const int begin = grp_start[tid], end = grp_start[tid + 1];
-        const unsigned long long ptr = grp_ptr[tid];
-        if (begin < 0 || end <= begin || end > cap_entries || ptr == 0) atomicOr(&bad, 1);
-        else for (int e = begin; e < end; ++e) {
-            const int dst = ent_dst[e];
-            if (dst < 0 || dst >= cap_entries) { atomicOr(&bad, 1); continue; }
-            if (dst / K == token) {
-                const int slot = dst % K;
-                if (atomicCAS(&entry[slot], -1, e) != -1) atomicOr(&bad, 1);
-                else blob[slot] = ptr;
+    if constexpr (Preplanned) {
+        if (tid < K) {
+            const int d = token * K + tid;
+            entry[tid] = inverse.entry[d];
+            blob[tid] = inverse.blob[d];
+            route[tid] = weights[d];
+        }
+        if (tid == 0) bad = inverse.token_error[token] != 0;
+        __syncthreads();
+    } else {
+        if (tid < K) { entry[tid] = -1; blob[tid] = 0; route[tid] = weights[token * K + tid]; }
+        if (tid == 0) {
+            ng = *n_groups;
+            bad = ng <= 0 || ng > cap_groups;
+            if (!bad) bad = grp_start[0] != 0 || grp_start[ng] != cap_entries;
+        }
+        __syncthreads();
+        if (ng > 0 && ng <= cap_groups && tid < ng) {
+            const int begin = grp_start[tid], end = grp_start[tid + 1];
+            const unsigned long long ptr = grp_ptr[tid];
+            if (begin < 0 || end <= begin || end > cap_entries || ptr == 0) atomicOr(&bad, 1);
+            else for (int e = begin; e < end; ++e) {
+                const int dst = ent_dst[e];
+                if (dst < 0 || dst >= cap_entries) { atomicOr(&bad, 1); continue; }
+                if (dst / K == token) {
+                    const int slot = dst % K;
+                    if (atomicCAS(&entry[slot], -1, e) != -1) atomicOr(&bad, 1);
+                    else blob[slot] = ptr;
+                }
             }
         }
+        __syncthreads();
+        if (tid < K && entry[tid] < 0) atomicOr(&bad, 1);
+        __syncthreads();
     }
-    __syncthreads();
-    if (tid < K && entry[tid] < 0) atomicOr(&bad, 1);
-    __syncthreads();
     if (bad) {
         if (tid == 0) atomicOr(error, kNativeDownCombinePlanError);
         if (tid < 16) {
@@ -3817,12 +3830,76 @@ void native_expert_down_combine(const NativeExpertLayout& L, const unsigned long
     if (L.d_type == 20)
         native_down_combine_kernel<20><<<grid, 256, lds, s>>>(L, grp_ptr, grp_start, n_groups, ent_dst,
             static_cast<int>(cap_groups), static_cast<int>(cap_entries), hidden, route_weights,
-            shared_partial, shared_gate, out, error, peer_output);
+            shared_partial, shared_gate, out, error, peer_output, {});
     else
         native_down_combine_kernel<42><<<grid, 256, lds, s>>>(L, grp_ptr, grp_start, n_groups, ent_dst,
             static_cast<int>(cap_groups), static_cast<int>(cap_entries), hidden, route_weights,
-            shared_partial, shared_gate, out, error, peer_output);
+            shared_partial, shared_gate, out, error, peer_output, {});
     check("native_expert_down_combine");
+}
+
+__global__ void native_down_plan_kernel(const unsigned long long* ptr, const int32_t* start,
+    const int32_t* n_groups, const int32_t* dst, int cap_groups, int cap_entries,
+    NativeDownRoutePlan plan, uint32_t* error) {
+    __shared__ int global_bad;
+    detail::native_down_plan_build_block(ptr,start,n_groups,dst,cap_groups,cap_entries,plan,error,&global_bad);
+}
+
+void native_expert_down_plan(const unsigned long long* grp_ptr,
+                            const int32_t* grp_start, const int32_t* n_groups,
+                            const int32_t* ent_dst, int64_t cap_groups, int64_t cap_entries,
+                            NativeDownRoutePlan plan, uint32_t* error, int n_tokens, void* stream) {
+    if (n_tokens<1 || n_tokens>8 || cap_entries!=int64_t(n_tokens)*10 || cap_groups<1 || cap_groups>cap_entries)
+        throw std::invalid_argument("native down plan requires T1..8/K10 and valid group capacity");
+    const detail::NativeDownPlanSpan spans[] = {
+        {grp_ptr,size_t(cap_groups)*sizeof(*grp_ptr),alignof(unsigned long long)},
+        {grp_start,size_t(cap_groups+1)*sizeof(*grp_start),alignof(int32_t)},
+        {n_groups,sizeof(*n_groups),alignof(int32_t)},
+        {ent_dst,size_t(cap_entries)*sizeof(*ent_dst),alignof(int32_t)},
+        {plan.entry,size_t(cap_entries)*sizeof(int32_t),alignof(int32_t)},
+        {plan.blob,size_t(cap_entries)*sizeof(unsigned long long),alignof(unsigned long long)},
+        {plan.token_error,size_t(n_tokens)*sizeof(uint32_t),alignof(uint32_t)},
+        {error,sizeof(*error),alignof(uint32_t)}
+    };
+    detail::native_down_plan_validate_spans(spans,8,4);
+    native_down_plan_kernel<<<1,128,0,static_cast<cudaStream_t>(stream)>>>(
+        grp_ptr,grp_start,n_groups,ent_dst,int(cap_groups),int(cap_entries),plan,error);
+    check("native_expert_down_plan");
+}
+
+void native_expert_down_combine_preplanned(const NativeExpertLayout& L, NativeDownRoutePlan plan,
+                                          int64_t cap_entries, const void* hidden_q8,
+                                          const float* route_weights, const float* shared_partial,
+                                          const float* shared_gate, float* out, uint32_t* error,
+                                          int n_tokens, void* stream, float* peer_output) {
+    if (n_tokens < 1 || n_tokens > 8 || cap_entries != int64_t(n_tokens) * 10 || L.n_embd != 2560 ||
+        (L.n_ff != 320 && L.n_ff != 640) || (L.d_type != 20 && L.d_type != 42) ||
+        L.d_row != iq_row_bytes(L.d_type, L.n_ff) || !L.d_row || L.down_off > L.bytes ||
+        size_t(L.n_embd) > (L.bytes - L.down_off) / L.d_row)
+        throw std::invalid_argument("native preplanned down-combine requires N2560/F320-or-640/T1..8/K10 IQ4_NL or Q2_0");
+    const size_t output_bytes = size_t(n_tokens)*size_t(L.n_embd)*sizeof(float);
+    const detail::NativeDownPlanSpan spans[] = {
+        {plan.entry,size_t(cap_entries)*sizeof(int32_t),alignof(int32_t)},
+        {plan.blob,size_t(cap_entries)*sizeof(unsigned long long),alignof(unsigned long long)},
+        {plan.token_error,size_t(n_tokens)*sizeof(uint32_t),alignof(uint32_t)},
+        {hidden_q8,size_t(cap_entries)*size_t(L.n_ff/32)*sizeof(block_q8_1),alignof(block_q8_1)},
+        {route_weights,size_t(cap_entries)*sizeof(float),alignof(float)},
+        {shared_partial,output_bytes,alignof(float)}, {shared_gate,size_t(n_tokens)*sizeof(float),alignof(float)},
+        {out,output_bytes,alignof(float)}, {error,sizeof(*error),alignof(uint32_t)},
+        {peer_output,output_bytes,alignof(float)}
+    };
+    detail::native_down_plan_validate_spans(spans,peer_output?10:9,7);
+    const dim3 grid(2560/16,static_cast<unsigned>(n_tokens));
+    const size_t lds = 10*size_t(L.n_ff/32)*sizeof(block_q8_1);
+    const auto* hidden=static_cast<const block_q8_1*>(hidden_q8);
+    const auto s=static_cast<cudaStream_t>(stream);
+    if (L.d_type == 20)
+        native_down_combine_kernel<20,true><<<grid,256,lds,s>>>(L,nullptr,nullptr,nullptr,nullptr,
+            0,int(cap_entries),hidden,route_weights,shared_partial,shared_gate,out,error,peer_output,plan);
+    else
+        native_down_combine_kernel<42,true><<<grid,256,lds,s>>>(L,nullptr,nullptr,nullptr,nullptr,
+            0,int(cap_entries),hidden,route_weights,shared_partial,shared_gate,out,error,peer_output,plan);
+    check("native_expert_down_combine_preplanned");
 }
 
 }  // namespace strata::kernels

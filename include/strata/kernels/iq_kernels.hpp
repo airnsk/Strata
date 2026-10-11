@@ -7,6 +7,8 @@
 // means in llama.cpp.  Activations are q8_1 (32 values, fp16 scale and fp16 sum), the llama.cpp CUDA contract.
 #pragma once
 
+#include "strata/kernels/native_down_plan.hpp"
+
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -130,12 +132,21 @@ void native_expert_grouped_explicit(const NativeExpertLayout& L, const unsigned 
 /// from writable outputs. Shape/layout and visible pointer spans are checked on host.
 /// Optional peer_output is a distinct full-sized peer inbox. Every writer publishes
 /// its local and peer stores with a system fence; consumers require a stream event join.
-constexpr uint32_t kNativeDownCombinePlanError = uint32_t{1} << 30;
 void native_expert_down_combine(const NativeExpertLayout& L, const unsigned long long* grp_ptr,
                                 const int32_t* grp_start, const int32_t* n_groups, const int32_t* ent_dst,
                                 int64_t cap_groups, int64_t cap_entries, const void* hidden_q8,
                                 const float* route_weights, const float* shared_partial, const float* shared_gate,
                                 float* out, uint32_t* error, int n_tokens, void* stream, float* peer_output = nullptr);
+
+/// Same dot/reduction/shared/peer arithmetic as native_expert_down_combine,
+/// consuming a validated current-proposal inverse instead of rebuilding it in
+/// each output tile. Only plans from the builders above are supported; preserve
+/// their live arrays until this stream has finished. No host routing is used.
+void native_expert_down_combine_preplanned(const NativeExpertLayout& L, NativeDownRoutePlan plan,
+                                          int64_t cap_entries, const void* hidden_q8,
+                                          const float* route_weights, const float* shared_partial,
+                                          const float* shared_gate, float* out, uint32_t* error,
+                                          int n_tokens, void* stream, float* peer_output = nullptr);
 
 /// true: `native_expert_grouped`'s launches before the group stride (STRATA_GROUPED_V1=1 at startup) - a block row
 /// per possible group, SwiGLU and the q8_1 quantization as two kernels over all cap_entries.  Bitwise the same results

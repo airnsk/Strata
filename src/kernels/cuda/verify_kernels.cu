@@ -10,6 +10,7 @@
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include "native_down_plan.cuh"
 
 #include <algorithm>
 #include <atomic>
@@ -981,10 +982,11 @@ static_assert(kVerifyMaxT * 10 <= kResidentPlanMax, "resident_plan: one thread p
 // the parallel scan keeps one partial sum per warp in s_wsum[4] and packs (entries << 16 | groups) in an int
 static_assert(kResidentPlanMax <= 128 && kResidentPlanMax % 32 == 0, "resident_plan: at most 4 warps");
 static_assert(kResidentPlanMax < 32768, "resident_plan: the packed entry count must stay below 2^15");
+template<bool Inverse = false>
 __global__ void __launch_bounds__(kResidentPlanMax) resident_plan_kernel(const int32_t* __restrict__ ids, int n, int k, const int32_t* __restrict__ res,
                                      int n_expert, const uint8_t* cache_base, const unsigned long long* slot_off,
                                      long long blob, int32_t* __restrict__ pl, long long capx, uint32_t* skip,
-                                     uint32_t ring, volatile uint32_t* plan_err) {
+                                     uint32_t ring, volatile uint32_t* plan_err, NativeDownRoutePlan inverse) {
     __shared__ int32_t s_ids[kResidentPlanMax];
     __shared__ int32_t s_excl[kResidentPlanMax];
     __shared__ int32_t s_wsum[4];
@@ -1006,7 +1008,11 @@ __global__ void __launch_bounds__(kResidentPlanMax) resident_plan_kernel(const i
         if (tid == 0 && skip != nullptr) *skip = 0;
         if (tid == 0 && skip == nullptr) {   // #871: the all-resident graph has no host plan to fall back on
             pl[0] = 0; pl[1] = 0; pl[2] = 0;   // an empty plan: no expert runs on a stale pointer
-            if (plan_err != nullptr) { *plan_err = 1; __threadfence_system(); }
+            if (plan_err != nullptr) { *plan_err = 1 | (Inverse ? kNativeDownCombinePlanError : 0); __threadfence_system(); }
+        }
+        if constexpr (Inverse) {
+            if (tid < n) { inverse.entry[tid] = -1; inverse.blob[tid] = 0; }
+            if (tid < n / k) inverse.token_error[tid] = kNativeDownCombinePlanError;
         }
         return;
     }
@@ -1081,6 +1087,13 @@ __global__ void __launch_bounds__(kResidentPlanMax) resident_plan_kernel(const i
             __threadfence();
             *skip = ring;
         }
+    }
+    if constexpr (Inverse) {
+        // All grouped metadata is now produced. One block validates exactly the
+        // same inverse as old down tiles, before any stream-ordered consumer.
+        __syncthreads();
+        detail::native_down_plan_build_block(ptr,start,counts,dst,n,n,inverse,
+            const_cast<uint32_t*>(plan_err),&s_bad);
     }
 }
 // The same plan in one block of 128 threads (n <= 128): thread i owns entry i. Groups are the distinct experts in
@@ -1169,10 +1182,38 @@ __global__ void copy_or_zero_kernel(float4* __restrict__ dst, const volatile flo
 void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_layer, int n_expert,
                    const uint8_t* cache_base, const unsigned long long* slot_off, long long blob, int32_t* plan,
                    long long capx, uint32_t* skip, uint32_t ring, void* stream, uint32_t* plan_err) {
-    resident_plan_kernel<<<1, kResidentPlanMax, 0, (cudaStream_t) stream>>>(ids, n_entries, k, res_layer, n_expert, cache_base, slot_off,
-                                                              blob, plan, capx, skip, ring, plan_err);
+    resident_plan_kernel<false><<<1, kResidentPlanMax, 0, (cudaStream_t) stream>>>(ids, n_entries, k, res_layer, n_expert, cache_base, slot_off,
+                                                              blob, plan, capx, skip, ring, plan_err, {});
     check("resident_plan");
 }
+void resident_plan_with_inverse(const int32_t* ids, int n_entries, int k, const int32_t* res_layer,
+                   int n_expert, const uint8_t* cache_base, const unsigned long long* slot_off,
+                   long long blob, int32_t* plan, long long capx, uint32_t* skip, uint32_t ring,
+                   void* stream, uint32_t* plan_err, NativeDownRoutePlan inverse) {
+    if (k != 10 || n_entries < 10 || n_entries > 80 || n_entries % 10 ||
+        capx < n_entries || capx > 80 || n_expert <= 0 || blob <= 0 || skip)
+        throw std::invalid_argument("resident inverse plan requires all-resident K10/T1..8 and capacity <=80");
+    const size_t count = static_cast<size_t>(n_entries);
+    const size_t ptr_offset = ((4 + (size_t(capx) + 1) + 2 * size_t(capx)) + 1) & ~size_t(1);
+    const detail::NativeDownPlanSpan spans[] = {
+        {ids,count*sizeof(int32_t),alignof(int32_t)},
+        {res_layer,size_t(n_expert)*sizeof(int32_t),alignof(int32_t)},
+        {cache_base,1,1},
+        {slot_off ? static_cast<const void*>(slot_off) : static_cast<const void*>(cache_base),
+         slot_off ? size_t(n_expert)*sizeof(unsigned long long) : size_t(1),
+         slot_off ? alignof(unsigned long long) : size_t(1)},
+        {plan,(ptr_offset+4*size_t(capx)+size_t(capx)+2)*sizeof(int32_t),alignof(unsigned long long)},
+        {inverse.entry,count*sizeof(int32_t),alignof(int32_t)},
+        {inverse.blob,count*sizeof(unsigned long long),alignof(unsigned long long)},
+        {inverse.token_error,(count/10)*sizeof(uint32_t),alignof(uint32_t)},
+        {plan_err,sizeof(uint32_t),alignof(uint32_t)}
+    };
+    detail::native_down_plan_validate_spans(spans,9,4);
+    resident_plan_kernel<true><<<1,kResidentPlanMax,0,static_cast<cudaStream_t>(stream)>>>(
+        ids,n_entries,k,res_layer,n_expert,cache_base,slot_off,blob,plan,capx,skip,ring,plan_err,inverse);
+    check("resident_plan_with_inverse");
+}
+
 void wait_flag_ge_or(const uint32_t* flag, uint32_t value, const uint32_t* skip, void* stream) {
     wait_flag_ge_or_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, value, skip);
     check("wait_flag_ge_or");
