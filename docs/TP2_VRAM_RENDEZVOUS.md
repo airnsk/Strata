@@ -104,8 +104,9 @@ metadata alone is not evidence that peer ordering works.
 The probe exercises single-span packets only. The API's two-span gather form has
 host descriptor-validation coverage, but has no GPU admission from this matrix.
 The same is true of other architectures, arbitrary stream concurrency, arbitrary
-packet schedules, long-duration soak, and full model execution. Those require
-separate tests before any engine integration or performance comparison.
+packet schedules, long-duration soak, and full model execution. These cases need
+separate admission. The isolated whole-layer experiment below uses only the
+same one-span gather and sum operations after target-runtime admission.
 
 Development validation in the CPU-only workspace:
 
@@ -125,8 +126,15 @@ The CPU oracle checks 811008 words, mutation detection, and FP32 tie/signed-zero
 behavior. Runner tests use mocked commands and transcripts; they are not GPU or
 Docker evidence. The host contract test checks invalid descriptors and the
 unsupported-backend path. No real HIP compilation, MI50 execution, or throughput
-measurement was available in this workspace. A successful real stand log is still
-required before calling the protocol admitted.
+measurement was available in that development workspace.
+
+### Target-runtime protocol admission
+
+Before using the separate whole-layer experiment, run this model-free probe on
+its target GPU pair and runtime. Preserve the source and binary identities and
+complete log with the experiment's private evidence. A pass admits only the
+bounded protocol matrix; it contains no throughput measurements and does not
+establish whole-layer correctness or model quality.
 
 An optional repository CMake target is available with
 `-DSTRATA_HIP_GFX906=ON -DSTRATA_TP2_VRAM_PROBE_BUILD=ON`, then build
@@ -134,3 +142,8 @@ An optional repository CMake target is available with
 The normal repository configuration can still require its usual dependencies;
 the standalone runner above avoids those requirements. GPU cases are not added
 to automatic ctest because the idle and isolated-fault requirements matter.
+
+The next separate opt-in step is the
+[whole-GDN VRAM comparison](TP2_VRAM_GDN_LAYER.md). It must pass its own real-weight
+prefix, continuation, state-bank and fault gates before matched end-to-end
+wall timing can support a one-layer speed claim.

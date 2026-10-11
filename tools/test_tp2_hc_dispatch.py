@@ -25,15 +25,17 @@ class DispatchTests(unittest.TestCase):
         root = Path(cls.temp.name)
         source = SOURCE.read_text()
         # Compile the production harness functions, not copies of their logic.
-        functions = source[source.index("struct Options {"):source.index("void hc_source_metadata(")]
+        functions = source[source.index("struct Options {"):source.index("void vram_device_metadata(")]
         mocks = r'''
 #include <cstdio>
+#include <cstdint>
 #include <cstdlib>
 #include <string>
 #include <vector>
 #include <stdexcept>
 namespace tp {
 struct TpGdnRcclOptions { std::string library; int timeout_ms=1000,init_timeout_ms=1000; };
+struct TpGdnVramOptions { uint64_t timeout_us=100000; int watchdog_ms=10000; };
 }
 int device=7, calls[2]={0,0};
 int cudaGetDevice(int* d) { *d=device; return 0; }
@@ -46,6 +48,7 @@ void fused_gr_check() {
 }
 int fused_gr_variant() {
     if(std::getenv("MOCK_BAD_VARIANT"))return 4;
+    if(std::getenv("MOCK_BOTH_STAGED")&&calls[device])return 3;
     if(calls[device])return device==0?3:1; // The selector may fall back per GPU.
     const char* value=std::getenv("STRATA_HC_SPLIT");
     return value&&value[0]=='1'?2:value&&value[0]=='2'?3:1;
@@ -69,11 +72,14 @@ int main(int argc,char** argv) {
         cls.binary = root / "dispatch"
         subprocess.run([compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror", str(path), "-o", str(cls.binary)], check=True)
 
-    def run_dispatch(self, args=(), **values):
+        cls.vram_binary = root / "dispatch-vram"
+        subprocess.run([compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror", "-DSTRATA_TP2_GDN_VRAM", str(path), "-o", str(cls.vram_binary)], check=True)
+
+    def run_dispatch(self, args=(), vram_build=False, **values):
         env = {key: value for key, value in os.environ.items()
                if not key.startswith(("STRATA_", "MOCK_"))}
         env.update(values)
-        return subprocess.run([str(self.binary), "--pack", "fixture", "--gguf", "fixture", *args],
+        return subprocess.run([str(self.vram_binary if vram_build else self.binary), "--pack", "fixture", "--gguf", "fixture", *args],
                               env=env, text=True, capture_output=True, timeout=5)
 
     def test_default_and_explicit_legacy_keep_unchecked_selection(self):
@@ -130,10 +136,47 @@ int main(int argc,char** argv) {
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("execution=hybrid model-probe=1", result.stdout)
 
+    def test_vram_requires_opt_in_and_exact_staged_selection(self):
+        args = ["--execution", "hybrid-vram", "--hc-dispatch", "production-check"]
+        result = self.run_dispatch(args, MOCK_BOTH_STAGED="1")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("STRATA_TP2_GDN_VRAM_BUILD=ON", result.stderr)
+        self.assertNotIn("MOCK_CAPTURE", result.stdout)
+        result = self.run_dispatch(args, vram_build=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("requires staged HC on both GPUs", result.stderr)
+        self.assertNotIn("HC_DISPATCH_INIT_PASS", result.stdout)
+        self.assertNotIn("MOCK_CAPTURE", result.stdout)
+        result = self.run_dispatch(args, vram_build=True, MOCK_BOTH_STAGED="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("MOCK_CAPTURE current-device=7 checks=1,1", result.stdout)
+
+    def test_vram_parser_rejects_unsafe_or_mixed_scopes(self):
+        args = ["--execution", "hybrid-vram", "--hc-dispatch", "production-check"]
+        bad = [["--profile-stages"], ["--model-probe"], ["--calibrate"],
+               ["--hc-dispatch", "legacy"], ["--vram-timeout-us", "999"],
+               ["--vram-timeout-us", "10000000", "--vram-watchdog-ms", "1000"],
+               ["--vram-watchdog-ms", "120001"], ["--vram-timeout-us", "-1"],
+               ["--vram-launch-first", "2"], ["--vram-delay-ms", "0"],
+               ["--vram-scenario", "other"],
+               ["--vram-scenario", "delayed-rank", "--vram-delay-ms", "100"],
+               ["--vram-scenario", "missing-rank", "--benchmark"]]
+        for extra in bad:
+            with self.subTest(extra=extra):
+                result = self.run_dispatch(args+extra, vram_build=True, MOCK_BOTH_STAGED="1")
+                self.assertEqual(result.returncode, 2, result.stdout+result.stderr)
+                self.assertNotIn("MOCK_CHECK", result.stdout)
+        for scenario in ("normal", "missing-rank", "delayed-rank"):
+            result = self.run_dispatch(args+["--vram-scenario", scenario], vram_build=True, MOCK_BOTH_STAGED="1")
+            self.assertEqual(result.returncode, 0, result.stderr)
+        result = self.run_dispatch(["--vram-launch-first", "0"], vram_build=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("VRAM options require", result.stderr)
+
     def test_real_main_initializes_before_all_capture_capable_branches(self):
         main = SOURCE.read_text().split("int main(int argc,char** argv) {", 1)[1]
         startup = main.index("hc_dispatch_startup(o);")
-        for action in ("model_probe(o)", "rccl_fault_gate(o)", "flat_protocol_preflight(preflight)",
+        for action in ("model_probe(o)", "rccl_fault_gate(o)", "vram_fault_gate(o)", "flat_protocol_preflight(preflight)",
                        "full.load(", "tp::TpGdnLayer reference(", "prepare_captured("):
             self.assertLess(startup, main.index(action), action)
 

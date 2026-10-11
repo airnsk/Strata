@@ -1,6 +1,7 @@
 #pragma once
 
-// Private, host-only scheduling component of the opt-in RCCL layer experiment.
+// Private host-only scheduling shared by the opt-in RCCL and VRAM experiments.
+// Historical class name only: this header has no HIP/RCCL dependency.
 // Derived from the persistent rank owners in tests/hip/tp2_rccl_transport.cpp.
 #include <array>
 #include <atomic>
@@ -20,7 +21,7 @@ namespace strata::core::tp2::detail {
 
 class RcclWorkers {
 public:
-    RcclWorkers() {
+    explicit RcclWorkers(const char* component = "tp_gdn_rccl") : component_(component) {
         try {
             for (int rank = 0; rank < 2; ++rank)
                 threads_[rank] = std::thread([this, rank] { loop(rank); });
@@ -67,10 +68,10 @@ public:
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
         changed_.notify_all();
         if (!done_.wait_until(lock, deadline, [&] { return completed_ == 2; })) {
-            std::fprintf(stderr, "WATCHDOG_TIMEOUT component=tp_gdn_rccl stage=%s exit=70 "
+            std::fprintf(stderr, "WATCHDOG_TIMEOUT component=%s stage=%s exit=70 "
                                  "teardown=process_exit_without_buffer_release "
                                  "budget_ms=%d completed_ranks=%d\n",
-                         stage_.c_str(), timeout_ms, completed_);
+                         component_.c_str(), stage_.c_str(), timeout_ms, completed_);
             std::fflush(nullptr);
             std::_Exit(70);
         }
@@ -117,11 +118,11 @@ private:
                 failed_.store(true, std::memory_order_release);
                 try { std::rethrow_exception(error); }
                 catch (const std::exception& e) {
-                    std::fprintf(stderr, "WORKER_ERROR component=tp_gdn_rccl stage=%s rank=%d reason=%s\n",
-                                 stage_.c_str(), rank, e.what());
+                    std::fprintf(stderr, "WORKER_ERROR component=%s stage=%s rank=%d reason=%s\n",
+                                 component_.c_str(), stage_.c_str(), rank, e.what());
                 } catch (...) {
-                    std::fprintf(stderr, "WORKER_ERROR component=tp_gdn_rccl stage=%s rank=%d reason=unknown_exception\n",
-                                 stage_.c_str(), rank);
+                    std::fprintf(stderr, "WORKER_ERROR component=%s stage=%s rank=%d reason=unknown_exception\n",
+                                 component_.c_str(), stage_.c_str(), rank);
                 }
             }
             { std::lock_guard<std::mutex> lock(mutex_); ++completed_; }
@@ -131,6 +132,7 @@ private:
 
     inline static thread_local const RcclWorkers* owner_ = nullptr;
     inline static thread_local int rank_ = -1;
+    std::string component_;
     std::array<std::thread, 2> threads_;
     std::atomic<bool> failed_{false}, active_{false};
     std::mutex mutex_;

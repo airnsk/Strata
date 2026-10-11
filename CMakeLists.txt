@@ -72,6 +72,10 @@ if(STRATA_TP2_VRAM_PROBE_BUILD AND NOT STRATA_HIP_GFX906)
   message(FATAL_ERROR "STRATA_TP2_VRAM_PROBE_BUILD requires STRATA_HIP_GFX906=ON")
 endif()
 option(STRATA_TP2_GDN_RCCL_BUILD "Enable isolated captured RCCL hybrid GDN experiment (no generation integration)" OFF)
+option(STRATA_TP2_GDN_VRAM_BUILD "Enable isolated captured local-VRAM hybrid GDN experiment (no generation integration)" OFF)
+if(STRATA_TP2_GDN_VRAM_BUILD AND (NOT STRATA_TP2_GDN_BUILD OR NOT STRATA_HIP_GFX906))
+  message(FATAL_ERROR "STRATA_TP2_GDN_VRAM_BUILD requires STRATA_TP2_GDN_BUILD=ON and STRATA_HIP_GFX906=ON")
+endif()
 if(STRATA_TP2_GDN_RCCL_BUILD AND (NOT STRATA_TP2_GDN_BUILD OR NOT STRATA_HIP_GFX906))
   message(FATAL_ERROR "STRATA_TP2_GDN_RCCL_BUILD requires STRATA_TP2_GDN_BUILD=ON and STRATA_HIP_GFX906=ON")
 endif()
@@ -566,6 +570,17 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       src/core/tp_gdn_layer.cpp src/core/tp_gdn_weights.cpp)
     target_include_directories(tp2_gdn_layer PRIVATE ${_strata_gpu_include_directories})
     target_link_libraries(tp2_gdn_layer PRIVATE strata_engine)
+    if(STRATA_TP2_GDN_VRAM_BUILD)
+      find_package(Threads REQUIRED)
+      # Keep experimental device code on this diagnostic executable only. No
+      # engine/default target links it, and no RCCL library/header is required.
+      target_sources(tp2_gdn_layer PRIVATE src/core/tp_gdn_vram.cpp src/kernels/cuda/tp_vram_rendezvous.cu)
+      set_source_files_properties(src/kernels/cuda/tp_vram_rendezvous.cu PROPERTIES
+        LANGUAGE HIP COMPILE_OPTIONS "-fno-fast-math;-ffp-contract=off")
+      set_target_properties(tp2_gdn_layer PROPERTIES HIP_STANDARD 17 HIP_STANDARD_REQUIRED ON)
+      target_compile_definitions(tp2_gdn_layer PRIVATE STRATA_TP2_GDN_VRAM=1)
+      target_link_libraries(tp2_gdn_layer PRIVATE Threads::Threads)
+    endif()
     if(STRATA_TP2_GDN_RCCL_BUILD)
       # An explicit, preverified existing artifact is mandatory. Do not discover
       # a different library or attach RCCL to strata_engine/default executables.

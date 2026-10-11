@@ -34,12 +34,18 @@ enum class TpGdnExecution {
     FlatCaptured,  // one graph/rank, bounded device protocol, original HC
     FlatHcCaptured,// same graph/protocol, exact HC row-sharded compute
     HybridCaptured, // row attention / column FFN, three joins, no FFN hidden gather
-    HybridRcclCaptured // opt-in test build: same arithmetic, one RCCL proposal graph/rank
+    HybridRcclCaptured, // opt-in test build: same arithmetic, one RCCL proposal graph/rank
+    HybridVramCaptured // opt-in test build: fused local-VRAM rendezvous, one graph/rank
 };
 
 struct TpGdnRcclOptions {
     std::string library; // required canonical identity, checked against the loaded DSO
     int timeout_ms = 10000, init_timeout_ms = 60000;
+};
+
+struct TpGdnVramOptions {
+    uint64_t timeout_us = 100000; // each GPU rendezvous, 1us..10s
+    int watchdog_ms = 10000;     // every paired host command, 100ms..120s
 };
 
 struct TpGdnLayerProfile {
@@ -112,6 +118,24 @@ public:
     // rank injection applies to the next proposal only and requires a subprocess.
     void set_rccl_launch_for_test(int first, int missing_rank = -1,
                                  int delayed_rank = -1, uint64_t delay_us = 0);
+    // Isolated gfx906/HIP 7.2 experiment, admitted only after the model-free
+    // transport probe passes on this GPU/runtime pair. HybridRowsColumns only.
+    // One complete unprofiled graph/rank, all three seams use GPU-live epochs
+    // and fixed double-buffered uncached local-VRAM controls/inboxes. No RCCL.
+    // Both banks are captured at startup. No protocol reset on state reset,
+    // token-count changes or replay. All rank stamps/failure fields must pass
+    // after BOTH streams drain before any output/commit is admitted. Failures
+    // permanently poison this layer; a new layer owns a fresh control pair.
+    // The host watchdog exits this diagnostic subprocess without releasing
+    // buffers if a blocked API/failed drain prevents safe paired teardown.
+    void prepare_vram(int tokens, const TpGdnVramOptions& options = {});
+    // Host admission order, not guaranteed driver issue order; fault injection
+    // affects the next proposal only and must run in an isolated subprocess.
+    void set_vram_launch_for_test(int first, int missing_rank = -1,
+                                 int delayed_rank = -1, uint64_t delay_us = 0);
+    // Final GPU witnesses copied after paired completion; diagnostic only.
+    // Requires a successful VRAM proposal, never an additional device read.
+    std::array<uint64_t,3> vram_wait_polls_for_test(int rank = 0) const;
     // Flat modes require the model-free protocol preflight on the target runtime.
     // They are incompatible with InputColumns/HybridRowsColumns owners.
     // A separate profiled graph is explicit: timestamp overhead is not benchmark

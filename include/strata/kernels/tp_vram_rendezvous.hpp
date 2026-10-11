@@ -6,7 +6,8 @@
 
 namespace strata::kernels {
 
-// MODEL-FREE EXPERIMENT ONLY. This is not an admitted engine transport.
+// EXPERIMENT ONLY: model-free probe and opt-in isolated hybrid-layer owner.
+// Requires the model-free admission on the target pair; not an engine transport.
 // One CTA per rank combines peer push, publication, local polling and consumption.
 // The conservative two-slot ring includes a consumed acknowledgement; its extra
 // peer stores are intentional and are not a claim of optimal performance.
@@ -73,7 +74,7 @@ bool tp_vram_rendezvous_supported() noexcept;
 // span with run_words == half_words; dst has rows*half_words float words and
 // always computes exactly rank0 + rank1, irrespective of the executing rank.
 //
-// Allocation/lifecycle contract, verified by the model-free owner:
+// Allocation/lifecycle contract, enforced by each diagnostic owner:
 // - BOTH controls and BOTH complete inbox rings MUST be independent
 //   hipExtMallocWithFlags(..., hipDeviceMallocUncached) VRAM allocations on their
 //   owning devices. Mapped host memory and ordinary coarse VRAM are unsupported.

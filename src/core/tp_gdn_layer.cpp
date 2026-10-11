@@ -10,6 +10,10 @@
 #include "strata/kernels/tp_gdn_exchange.hpp"
 #include "strata/kernels/tp_hc.hpp"
 #include "strata/kernels/verify_kernels.hpp"
+#if defined(STRATA_TP2_GDN_VRAM)
+#include "strata/kernels/tp_vram_rendezvous.hpp"
+#include "tp_gdn_vram.hpp"
+#endif
 #if defined(STRATA_TP2_GDN_RCCL)
 #include "tp_gdn_rccl.hpp"
 #endif
@@ -41,7 +45,17 @@ struct CapturedWindow {
     CapturedNode mixer[2], middle[4], commit[2];
     CapturedNode flat[2][2][2]; // HC split, instrumentation, physical state bank
     CapturedNode rccl[2]; // whole unprofiled hybrid proposal, physical state bank
+#if defined(STRATA_TP2_GDN_VRAM)
+    CapturedNode vram[2]; // whole unprofiled hybrid proposal, physical state bank
+#endif
 };
+#if defined(STRATA_TP2_GDN_VRAM)
+struct VramCompletion {
+    k::TpVramRendezvousControl control;
+    k::TpVramRendezvousStamp stamps[3];
+    uint32_t plan_error=0;
+};
+#endif
 struct Rank {
     TpGdnRankWeights w;
     int capacity, hk, hv, channels, value, ff, width;
@@ -66,6 +80,13 @@ struct Rank {
     float *R{},*mixed{},*attn_input{},*ffn_input{},*mixer_output{},*lo{},*rs{},*xn{},*inj[2]{},*bo{},*local_out{};
     float* peer_partial[2]{}; // distinct attention/FFN receive payloads
     float* rccl_attention_receive{}; // packed Y, then packed output; allocated only on opt-in
+#if defined(STRATA_TP2_GDN_VRAM)
+    VramCompletion* vram_completion{};
+    k::TpVramRendezvousControl* vram_control{};
+    k::TpVramRendezvousStamp* vram_stamps{}; // one final witness per seam
+    uint32_t* vram_inbox{}; // fixed two-slot ring, shared by the three ordered seams
+    uint64_t vram_timeout_ticks=0;
+#endif
     float *state{},*conv{},*candidate_state{},*candidate_conv{},*qkv{},*h{},*gate{},*beta{},*z{},*y{},*full_y{};
     float *logits{},*weights{},*sg{},*su{},*scalar{},*shared{},*parts{};
     uint8_t *xq{},*shared_local_q{},*shared_full_q{},*gu_scratch{},*down_scratch{};
@@ -134,6 +155,9 @@ struct Rank {
             for(auto& node:window.commit)destroy(node);
             for(auto& hc:window.flat)for(auto& profile:hc)for(auto& node:profile)destroy(node);
             for(auto& node:window.rccl)destroy(node);
+#if defined(STRATA_TP2_GDN_VRAM)
+            for(auto& node:window.vram)destroy(node);
+#endif
         }
     }
     void release(bool checked = false) {
@@ -297,6 +321,16 @@ struct TpGdnLayer::Impl {
     uint64_t delay_us=0;
     bool flat_mode() const {return execution==TpGdnExecution::FlatCaptured||execution==TpGdnExecution::FlatHcCaptured;}
     bool rccl_mode() const {return execution==TpGdnExecution::HybridRcclCaptured;}
+    bool vram_mode() const {return execution==TpGdnExecution::HybridVramCaptured;}
+    std::array<bool,9> vram_prepared{};
+    TpGdnVramOptions vram_options;
+    int vram_first=0;
+    bool vram_proposed=false;
+    std::array<std::array<uint64_t,3>,2> vram_polls{};
+#if defined(STRATA_TP2_GDN_VRAM)
+    std::unique_ptr<detail::VramSession> vram;
+    uint64_t vram_epoch=0; // expected witness only; never copied to GPU controls
+#endif
     std::array<bool,9> rccl_prepared{};
     TpGdnRcclOptions rccl_options;
     int rccl_first=0;
@@ -308,6 +342,9 @@ struct TpGdnLayer::Impl {
     }
     void poison_and_drain() noexcept {
         abort_flat();poisoned=true;
+#if defined(STRATA_TP2_GDN_VRAM)
+        if(vram){pending=false;vram->drain();return;}
+#endif
 #if defined(STRATA_TP2_GDN_RCCL)
         if(rccl)rccl->fail("layer device failure; no output or commit is valid");
 #endif
@@ -315,6 +352,13 @@ struct TpGdnLayer::Impl {
     }
     ~Impl(){
         abort_flat(); // release any bounded waits before owning streams drain
+#if defined(STRATA_TP2_GDN_VRAM)
+        if(vram){
+            vram->shutdown([&](int rank){select(r[rank]->w.device);r[rank]->destroy_graphs(true);},
+                           [&](int rank){r[rank]->release(true);});
+            vram.reset();
+        }
+#endif
 #if defined(STRATA_TP2_GDN_RCCL)
         if(rccl){
             rccl->shutdown([&](int rank){select(r[rank]->w.device);r[rank]->destroy_graphs(true);},
@@ -399,8 +443,127 @@ struct TpGdnLayer::Impl {
         throw std::runtime_error("TP GDN flat protocol requires the gfx906 HIP build");
 #endif
     }
+#if defined(STRATA_TP2_GDN_VRAM)
+    void setup_vram(const TpGdnVramOptions& options) {
+        if(vram)return;
+        if(!k::tp_vram_rendezvous_supported())
+            throw std::runtime_error("TP GDN VRAM primitives unavailable; requires gfx906 HIP 7.2");
+        vram=std::make_unique<detail::VramSession>(
+            std::array<int,2>{r[0]->w.device,r[1]->w.device},
+            std::array<void*,2>{r[0]->compute,r[1]->compute},
+            std::array<void*,2>{r[0]->copy,r[1]->copy},options.watchdog_ms);
+        vram_options=options;
+        vram->paired("allocate-local-vram",[&](int rank){
+            auto& a=*r[rank];select(a.w.device);
+            int wall=0;check(hipDeviceGetAttribute(&wall,hipDeviceAttributeWallClockRate,a.w.device),"VRAM wall clock frequency");
+            if(wall<=0)throw std::runtime_error("TP GDN VRAM invalid wall clock frequency");
+            a.vram_timeout_ticks=options.timeout_us*uint64_t(wall)/1000;
+            if(!a.vram_timeout_ticks||a.vram_timeout_ticks>uint64_t(std::numeric_limits<int64_t>::max()))
+                throw std::invalid_argument("TP GDN VRAM invalid wall clock timeout");
+            auto uncached=[&](size_t bytes){
+                void* ptr=nullptr;check(hipExtMallocWithFlags(&ptr,bytes,hipDeviceMallocUncached),"uncached VRAM allocation");
+                a.owned.push_back(ptr);a.owned_bytes.push_back(bytes);
+                check(cudaMemsetAsync(ptr,0,bytes,a.compute),"initialize local VRAM");
+                return ptr;
+            };
+            a.vram_completion=static_cast<VramCompletion*>(uncached(sizeof(VramCompletion)));
+            a.vram_control=&a.vram_completion->control;
+            a.vram_stamps=a.vram_completion->stamps;
+            a.vram_inbox=static_cast<uint32_t*>(uncached(k::kTpVramRendezvousSlots*size_t(k::kTpVramRendezvousMaxWords)*sizeof(uint32_t)));
+            check(cudaDeviceSynchronize(),"VRAM initialization fence");
+        });
+        // The paired boundary above completes BOTH initializations before any
+        // graph is allowed to publish through its peer's pointers.
+    }
+    void vram_exchange(Rank& a,int seam) {
+        auto& peer=*r[1-a.w.rank];
+        k::TpVramRendezvousPacket packet;
+        packet.count=1;packet.own_inbox=a.vram_inbox;packet.peer_inbox=peer.vram_inbox;
+        if(seam==0)packet.spans[0]={a.y,a.full_y,tokens,V/2,1024};
+        else if(seam==1)packet.spans[0]={a.local_out,a.bo,tokens,N/2,N/2};
+        else if(seam==2){
+            packet.spans[0]={a.local_out,a.bo,tokens,N,N};
+            packet.mode=k::TpVramRendezvousMode::SumF32;
+        }else throw std::logic_error("TP GDN VRAM invalid seam");
+        packet.inbox_words=size_t(tokens)*packet.spans[0].half_words;
+        k::tp_vram_rendezvous(packet,a.vram_control,peer.vram_control,
+                             a.vram_stamps+seam,a.w.rank,a.vram_timeout_ticks,a.compute);
+    }
+    void vram_graph(Rank& a) {
+        a.mixer(tokens);vram_exchange(a,0);
+        a.output_projection(tokens);vram_exchange(a,1);
+        check(cudaMemcpyAsync(a.mixer_output,a.bo,tokens*N*sizeof(float),cudaMemcpyDeviceToDevice,a.compute),"VRAM mixer seam");
+        a.ffn_gu(tokens,mode);
+        // Baseline Down already fuses a peer write. Disable it here: the fused
+        // rendezvous owns the only FFN push and rereads this local partial.
+        a.ffn_down(tokens,mode,nullptr);vram_exchange(a,2);a.finish(tokens);
+        // Preserve the baseline planner pointer and graph. This four-byte
+        // diagnostic epilogue is captured and INCLUDED in whole-layer timing.
+        check(cudaMemcpyAsync(&a.vram_completion->plan_error,a.plan_error,sizeof(uint32_t),cudaMemcpyDeviceToDevice,a.compute),"VRAM plan witness");
+    }
+    void read_vram_completion(int rank,std::atomic<int>& completed,VramCompletion& result) {
+        // Even an omitted rank completes its idle stream and joins this host
+        // boundary. No control is copied before the peer's LAST failure store.
+        vram->complete(rank);
+        completed.fetch_add(1,std::memory_order_acq_rel);
+        while(completed.load(std::memory_order_acquire)!=2){vram->check_peer();std::this_thread::yield();}
+        check(cudaMemcpy(&result,r[rank]->vram_completion,sizeof(result),cudaMemcpyDeviceToHost),"VRAM final witness");
+    }
+    void check_vram(const std::array<VramCompletion,2>& completion) {
+        if(vram_epoch>std::numeric_limits<uint64_t>::max()-3)
+            throw std::overflow_error("TP GDN VRAM epoch exhausted");
+        const uint64_t expected=vram_epoch+3;
+        for(int rank=0;rank<2;++rank){
+            const auto& c=completion[rank].control;
+            const auto& stamps=completion[rank].stamps;
+            bool valid=c.epoch.value==expected&&!c.local_failure.value&&!c.peer_failure.value;
+            for(int seam=0;seam<3;++seam)
+                valid=valid&&stamps[seam].epoch==vram_epoch+uint64_t(seam)+1&&
+                      stamps[seam].status==uint64_t(k::TpVramRendezvousStatus::Ready);
+            for(int slot=0;slot<k::kTpVramRendezvousSlots;++slot){
+                const uint64_t latest=((expected-1)%k::kTpVramRendezvousSlots==uint64_t(slot))?expected:expected-1;
+                valid=valid&&c.ready[slot].value==latest&&c.consumed[slot].value==latest;
+            }
+            if(!valid)throw std::runtime_error("TP GDN VRAM protocol aborted/timed out or invalid epoch; session poisoned, no output or commit is valid");
+        }
+        if(completion[0].plan_error||completion[1].plan_error)throw std::runtime_error("TP GDN VRAM static expert plan rejected a route");
+        for(int rank=0;rank<2;++rank)for(int seam=0;seam<3;++seam)
+            vram_polls[rank][seam]=completion[rank].stamps[seam].polls;
+        vram_epoch=expected;
+    }
+    template<class Input> void run_vram(Input input) {
+        if(!vram)throw std::logic_error("TP GDN VRAM session was not prepared");
+        if(vram_epoch>std::numeric_limits<uint64_t>::max()-3)
+            throw std::overflow_error("TP GDN VRAM epoch exhausted");
+        const int omit=missing_rank,delay_rank=delayed_rank,first=vram_first;
+        const uint64_t delay=delay_us;
+        missing_rank=delayed_rank=-1;delay_us=0;
+        std::atomic<int> admission{0},completed{0};
+        std::array<VramCompletion,2> completion{};
+        auto command=[&](int rank){
+            auto& a=*r[rank];select(a.w.device);
+            if(rank==omit){read_vram_completion(rank,completed,completion[rank]);return;}
+            if(rank==delay_rank&&delay)std::this_thread::sleep_for(std::chrono::microseconds(delay));
+            input(a);
+            if(omit<0){
+                const int turn=rank==first?0:1;
+                while(admission.load(std::memory_order_acquire)!=turn){vram->check_peer();std::this_thread::yield();}
+                // Publish admission before HIP: the first graph submission may
+                // block until the other host owner enters its graph launch.
+                admission.fetch_add(1,std::memory_order_release);
+            }
+            a.launch(a.captured[tokens].vram[a.state_bank]);
+            read_vram_completion(rank,completed,completion[rank]);
+        };
+        vram->paired(omit>=0?"layer-missing-rank":delay_rank>=0?"layer-delayed-rank":"layer-proposal",std::ref(command));
+        check_vram(completion);last_profiled=false;vram_proposed=true;pending=true;
+    }
+#endif
     void healthy() const {if(poisoned)throw std::runtime_error("TP GDN session poisoned by prior device failure");}
     void sync() const {
+#if defined(STRATA_TP2_GDN_VRAM)
+        if(vram){vram->drain();return;}
+#endif
 #if defined(STRATA_TP2_GDN_RCCL)
         if(rccl){auto command=[&](int rank){rccl->complete(rank);};rccl->paired("layer-synchronize",std::ref(command));return;}
 #endif
@@ -677,6 +840,9 @@ struct TpGdnLayer::Impl {
         }
     }
     void run() {
+#if defined(STRATA_TP2_GDN_VRAM)
+        if(vram_mode()){run_vram([](Rank&){});return;}
+#endif
 #if defined(STRATA_TP2_GDN_RCCL)
         if(rccl_mode()){run_rccl([](Rank&){});return;}
 #endif
@@ -699,6 +865,7 @@ struct TpGdnLayer::Impl {
         if(flat_mode()&&!flat_prepared[t][execution==TpGdnExecution::FlatHcCaptured][profile_enabled])
             throw std::logic_error("TP GDN flat token/profile/HC variant was not prepared during startup");
         if(rccl_mode()&&!rccl_prepared[t])throw std::logic_error("TP GDN RCCL token count was not captured during startup");
+        if(vram_mode()&&!vram_prepared[t])throw std::logic_error("TP GDN VRAM token count was not captured during startup");
         tokens=t;epoch=e;seen_epoch=true;
     }
 };
@@ -753,6 +920,9 @@ void TpGdnLayer::prepare_rccl(int tokens,const TpGdnRcclOptions& options) {
     if(options.library.empty()||options.library.front()!='/'||options.timeout_ms<100||options.timeout_ms>120000||
        options.init_timeout_ms<100||options.init_timeout_ms>120000)
         throw std::invalid_argument("TP GDN RCCL requires an explicit library and bounded 100..120000 ms timeouts");
+#if defined(STRATA_TP2_GDN_VRAM)
+    if(p.vram)throw std::logic_error("TP GDN RCCL and VRAM sessions cannot share layer streams");
+#endif
 #if defined(STRATA_TP2_GDN_RCCL)
     if(p.rccl&&(options.library!=p.rccl_options.library||options.timeout_ms!=p.rccl_options.timeout_ms||
                 options.init_timeout_ms!=p.rccl_options.init_timeout_ms))
@@ -792,6 +962,65 @@ void TpGdnLayer::prepare_rccl(int tokens,const TpGdnRcclOptions& options) {
     (void)tokens;
     throw std::runtime_error("TP GDN RCCL was not built; configure STRATA_TP2_GDN_RCCL_BUILD=ON");
 #endif
+}
+void TpGdnLayer::prepare_vram(int tokens,const TpGdnVramOptions& options) {
+    auto& p=*impl_;p.healthy();
+    if(!p.hybrid()||tokens<1||tokens>p.capacity||p.seen_epoch||p.pending||p.profile_enabled||p.r[0]->inverse_plan.entry)
+        throw std::invalid_argument("TP GDN VRAM preparation requires idle startup unprofiled hybrid owners and T within capacity");
+    if(options.timeout_us<1||options.timeout_us>10000000||options.watchdog_ms<100||options.watchdog_ms>120000||
+       uint64_t(options.watchdog_ms)*1000<=options.timeout_us)
+        throw std::invalid_argument("TP GDN VRAM requires timeout 1us..10s and a longer 100ms..120s host watchdog");
+#if defined(STRATA_TP2_GDN_VRAM)
+#if defined(STRATA_TP2_GDN_RCCL)
+    if(p.rccl)throw std::logic_error("TP GDN VRAM and RCCL sessions cannot share layer streams");
+#endif
+    if(p.vram&&(options.timeout_us!=p.vram_options.timeout_us||options.watchdog_ms!=p.vram_options.watchdog_ms))
+        throw std::invalid_argument("TP GDN VRAM startup options cannot change within a session");
+    if(p.vram_prepared[tokens])return;
+    const int old_tokens=p.tokens;
+    try {
+        if(!p.vram){
+            // Warm normal dispatch and capture all bank-specific commit graphs
+            // before permanent owners take over experimental stream submissions.
+            for(int t=1;t<=p.capacity;++t)prepare_captured(t);
+            p.setup_vram(options);
+        }
+        p.tokens=tokens;
+        std::atomic<int> completed{0};
+        std::array<VramCompletion,2> completion{};
+        p.vram->paired("layer-warmup",[&](int rank){
+            p.vram_graph(*p.r[rank]);p.read_vram_completion(rank,completed,completion[rank]);
+        });
+        p.check_vram(completion);
+        p.vram->paired("layer-capture",[&](int rank){
+            auto& a=*p.r[rank];const int original=a.state_bank;
+            try {
+                for(int bank=0;bank<2;++bank){
+                    if(a.state_bank!=bank)a.swap_state_bank();
+                    a.capture(a.captured[tokens].vram[bank],[&]{p.vram_graph(a);});
+                }
+                if(a.state_bank!=original)a.swap_state_bank();
+            }catch(...){if(a.state_bank!=original)a.swap_state_bank();throw;}
+        });
+        p.vram_prepared[tokens]=true;p.tokens=old_tokens;
+    }catch(...){p.tokens=old_tokens;p.poison_and_drain();throw;}
+#else
+    (void)tokens;
+    throw std::runtime_error("TP GDN VRAM was not built; configure STRATA_TP2_GDN_VRAM_BUILD=ON");
+#endif
+}
+void TpGdnLayer::set_vram_launch_for_test(int first,int missing,int delayed,uint64_t delay) {
+    auto& p=*impl_;p.healthy();
+    if(!p.vram_mode()||p.pending||(first!=0&&first!=1)||missing < -1||missing>1||
+       delayed < -1||delayed>1||delay>10000000||(missing>=0&&delayed>=0))
+        throw std::invalid_argument("TP GDN VRAM launch test requires idle VRAM mode and valid rank/delay");
+    p.vram_first=first;p.missing_rank=missing;p.delayed_rank=delayed;p.delay_us=delay;
+}
+std::array<uint64_t,3> TpGdnLayer::vram_wait_polls_for_test(int rank) const {
+    const auto& p=*impl_;p.healthy();
+    if(!p.vram_mode()||!p.vram_proposed||rank<0||rank>=p.count)
+        throw std::logic_error("TP GDN VRAM has no successful proposal witnesses for that rank");
+    return p.vram_polls[rank];
 }
 void TpGdnLayer::set_rccl_launch_for_test(int first,int missing,int delayed,uint64_t delay) {
     auto& p=*impl_;p.healthy();
@@ -966,6 +1195,9 @@ std::vector<TpGdnFineCalibrationSample> TpGdnLayer::calibrate_fine_frozen(
         warmup < 1 || warmup > 16 || trials < 2 || trials > 64)
         throw std::invalid_argument("fine calibration requires matching full0/full1/hybrid, T1/8, warmup1..16, trials2..64");
     for (auto* owner : owners) {
+#if defined(STRATA_TP2_GDN_VRAM)
+        if(owner->vram)throw std::invalid_argument("fine calibration cannot snapshot/restore a live VRAM protocol");
+#endif
         if (owner->pending || owner->profile_enabled || owner->flat_mode() ||
             tokens > owner->capacity || !owner->prepared[tokens])
             throw std::invalid_argument("fine calibration requires idle unprofiled prepared layers");
@@ -1513,16 +1745,21 @@ void TpGdnLayer::prepare_flat(int tokens,bool shard_hc,bool profile,uint64_t tim
 void TpGdnLayer::set_execution(TpGdnExecution mode,bool profile) {
     auto& p=*impl_;p.healthy();
     if(p.pending)throw std::logic_error("TP GDN execution mode cannot change during an outstanding proposal");
-    if(mode!=TpGdnExecution::RuntimeCopies&&mode!=TpGdnExecution::Consolidated&&mode!=TpGdnExecution::Captured&&mode!=TpGdnExecution::ColumnCaptured&&mode!=TpGdnExecution::HybridCaptured&&mode!=TpGdnExecution::HybridRcclCaptured&&mode!=TpGdnExecution::FlatCaptured&&mode!=TpGdnExecution::FlatHcCaptured)
+    if(mode!=TpGdnExecution::RuntimeCopies&&mode!=TpGdnExecution::Consolidated&&mode!=TpGdnExecution::Captured&&mode!=TpGdnExecution::ColumnCaptured&&mode!=TpGdnExecution::HybridCaptured&&mode!=TpGdnExecution::HybridRcclCaptured&&mode!=TpGdnExecution::HybridVramCaptured&&mode!=TpGdnExecution::FlatCaptured&&mode!=TpGdnExecution::FlatHcCaptured)
         throw std::invalid_argument("TP GDN invalid execution mode");
     if(p.projection_columns()&&mode!=TpGdnExecution::ColumnCaptured)
         throw std::invalid_argument("TP GDN input-column owners require ColumnCaptured execution");
     if(p.count==2&&!p.projection_columns()&&mode==TpGdnExecution::ColumnCaptured)
         throw std::invalid_argument("TP GDN ColumnCaptured requires input-column weights");
-    if(p.hybrid()&&mode!=TpGdnExecution::HybridCaptured&&mode!=TpGdnExecution::HybridRcclCaptured)
+    if(p.hybrid()&&mode!=TpGdnExecution::HybridCaptured&&mode!=TpGdnExecution::HybridRcclCaptured&&mode!=TpGdnExecution::HybridVramCaptured)
         throw std::invalid_argument("TP GDN hybrid owners require a hybrid execution mode");
     if(p.count==2&&!p.hybrid()&&mode==TpGdnExecution::HybridCaptured)
         throw std::invalid_argument("TP GDN HybridCaptured requires hybrid weights");
+    if(mode==TpGdnExecution::HybridVramCaptured&&(!p.hybrid()||profile))
+        throw std::invalid_argument("TP GDN VRAM requires unprofiled hybrid weights");
+#if !defined(STRATA_TP2_GDN_VRAM)
+    if(mode==TpGdnExecution::HybridVramCaptured)throw std::runtime_error("TP GDN VRAM was not built");
+#endif
     if(mode==TpGdnExecution::HybridRcclCaptured&&(!p.hybrid()||profile))
         throw std::invalid_argument("TP GDN RCCL requires unprofiled hybrid weights");
 #if !defined(STRATA_TP2_GDN_RCCL)
@@ -1530,7 +1767,7 @@ void TpGdnLayer::set_execution(TpGdnExecution mode,bool profile) {
 #endif
     if(profile&&mode!=TpGdnExecution::Captured&&mode!=TpGdnExecution::ColumnCaptured&&mode!=TpGdnExecution::HybridCaptured&&mode!=TpGdnExecution::FlatCaptured&&mode!=TpGdnExecution::FlatHcCaptured)
         throw std::invalid_argument("TP GDN GPU profiling requires a captured graph variant");
-    p.execution=mode;p.profile_enabled=profile;p.last_profiled=false;
+    p.execution=mode;p.profile_enabled=profile;p.last_profiled=false;p.vram_proposed=false;
 }
 TpGdnExecution TpGdnLayer::execution() const {return impl_->execution;}
 void TpGdnLayer::set_flat_fault_for_test(int missing,int delayed,uint64_t delay) {
@@ -1584,13 +1821,16 @@ void TpGdnLayer::reset_state(const std::vector<float>& state,const std::vector<f
             for(int tap=0;tap<3;++tap)for(int c=0;c<r.channels;++c)cv[c*3+tap]=conv[map.qkv_rows[c]*3+tap];}
         check(cudaMemcpy(r.state,st.data(),st.size()*sizeof(float),cudaMemcpyHostToDevice),"state reset");
         check(cudaMemcpy(r.conv,cv.data(),cv.size()*sizeof(float),cudaMemcpyHostToDevice),"conv reset");}
-        p.pending=false;
+        p.pending=false;p.vram_proposed=false;
     }catch(...){p.poisoned=true;throw;}
 }
 void TpGdnLayer::propose(const std::vector<float>& residual,int tokens,uint64_t epoch) {
     auto& p=*impl_;if(residual.size()!=static_cast<size_t>(tokens)*HC*N)throw std::invalid_argument("TP GDN residual shape mismatch");
     p.begin(tokens,epoch);
     try{
+#if defined(STRATA_TP2_GDN_VRAM)
+        if(p.vram_mode()){p.run_vram([&](Rank& r){check(cudaMemcpyAsync(r.R,residual.data(),residual.size()*sizeof(float),cudaMemcpyHostToDevice,r.compute),"VRAM residual upload");});return;}
+#endif
 #if defined(STRATA_TP2_GDN_RCCL)
         if(p.rccl_mode()){p.run_rccl([&](Rank& r){check(cudaMemcpyAsync(r.R,residual.data(),residual.size()*sizeof(float),cudaMemcpyHostToDevice,r.compute),"RCCL residual upload");});return;}
 #endif
@@ -1601,6 +1841,9 @@ void TpGdnLayer::propose_device(const std::array<const float*,2>& residual,int t
     auto& p=*impl_;for(int i=0;i<p.count;++i)if(!residual[i])throw std::invalid_argument("TP GDN missing rank residual");
     p.begin(tokens,epoch);
     try{
+#if defined(STRATA_TP2_GDN_VRAM)
+        if(p.vram_mode()){p.run_vram([&](Rank& r){check(cudaMemcpyAsync(r.R,residual[r.w.rank],tokens*HC*N*sizeof(float),cudaMemcpyDeviceToDevice,r.compute),"VRAM residual device copy");});return;}
+#endif
 #if defined(STRATA_TP2_GDN_RCCL)
         if(p.rccl_mode()){p.run_rccl([&](Rank& r){check(cudaMemcpyAsync(r.R,residual[r.w.rank],tokens*HC*N*sizeof(float),cudaMemcpyDeviceToDevice,r.compute),"RCCL residual device copy");});return;}
 #endif
@@ -1611,6 +1854,15 @@ void TpGdnLayer::commit(int keep) {
     auto& p=*impl_;p.healthy();if(!p.pending||keep<0||keep>p.tokens)throw std::invalid_argument("TP GDN commit requires an outstanding window and keep in 0..T");
     if(keep==0){p.pending=false;return;}
     try{
+#if defined(STRATA_TP2_GDN_VRAM)
+        if(p.vram_mode()){
+            auto command=[&](int rank){auto& r=*p.r[rank];select(r.w.device);
+                check(cudaMemcpyAsync(r.keep,&keep,sizeof(keep),cudaMemcpyHostToDevice,r.compute),"VRAM commit count");
+                r.launch(r.captured[p.tokens].commit[r.state_bank]);p.vram->complete(rank);};
+            p.vram->paired("layer-commit",std::ref(command));
+        }
+        else
+#endif
 #if defined(STRATA_TP2_GDN_RCCL)
         if(p.rccl_mode()){
             auto command=[&](int rank){auto& r=*p.r[rank];select(r.w.device);
@@ -1630,6 +1882,9 @@ void TpGdnLayer::commit(int keep) {
     p.pending=false;
     }catch(...){
         p.poisoned=true;
+#if defined(STRATA_TP2_GDN_VRAM)
+        if(p.vram)p.poison_and_drain();
+#endif
 #if defined(STRATA_TP2_GDN_RCCL)
         if(p.rccl)p.rccl->fail("layer commit failed; no bank publication is valid");
 #endif

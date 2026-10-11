@@ -41,10 +41,13 @@ void on(int d) { ck(cudaSetDevice(d),"set device"); }
 struct Options {
     std::vector<std::string> shards; std::string pack,execution="runtime",hc_dispatch="legacy";
     int layer=0,mode=8,warmup=3,trials=12,block_calls=16,block_trials=4; bool benchmark=false,calibrate=false,model_probe=false,inverse_probe=false,profile_flat=false,execution_explicit=false;
-    bool warmup_explicit=false,trials_explicit=false,rccl_options_explicit=false;
+    bool warmup_explicit=false,trials_explicit=false,rccl_options_explicit=false,vram_options_explicit=false;
     tp::TpGdnRcclOptions rccl;
     std::string rccl_scenario="normal";
     int rccl_first=0,rccl_delay_ms=200;
+    tp::TpGdnVramOptions vram;
+    std::string vram_scenario="normal";
+    int vram_first=0,vram_delay_ms=20;
 };
 Options parse(int argc,char**argv) {
     Options o;
@@ -61,6 +64,15 @@ Options parse(int argc,char**argv) {
         else if(a=="--pack") o.pack=v;
         else if(a=="--execution"){o.execution=v;o.execution_explicit=true;}
         else if(a=="--hc-dispatch")o.hc_dispatch=v;
+        else if(a=="--vram-scenario"){o.vram_scenario=v;o.vram_options_explicit=true;}
+        else if(a=="--vram-timeout-us"||a=="--vram-watchdog-ms"||a=="--vram-launch-first"||a=="--vram-delay-ms"){
+            size_t used=0;const int n=std::stoi(v,&used);if(used!=v.size()||n<0)throw std::invalid_argument("invalid VRAM integer");
+            o.vram_options_explicit=true;
+            if(a=="--vram-timeout-us")o.vram.timeout_us=uint64_t(n);
+            else if(a=="--vram-watchdog-ms")o.vram.watchdog_ms=n;
+            else if(a=="--vram-launch-first")o.vram_first=n;
+            else o.vram_delay_ms=n;
+        }
         else if(a=="--rccl-library"){o.rccl.library=v;o.rccl_options_explicit=true;}
         else if(a=="--rccl-scenario"){o.rccl_scenario=v;o.rccl_options_explicit=true;}
         else if(a=="--rccl-timeout-ms"||a=="--rccl-init-timeout-ms"||a=="--rccl-launch-first"||a=="--rccl-delay-ms"){
@@ -81,8 +93,8 @@ Options parse(int argc,char**argv) {
         throw std::invalid_argument("--hc-dispatch requires legacy or production-check");
     if(o.shards.empty() || o.pack.empty() || o.layer<0 || o.layer>=48 || o.layer==1 || o.layer%4==3 ||
        (o.mode!=7 && o.mode!=8) || o.warmup<1 || o.warmup>100 || o.trials<2 || o.trials>1000 || o.block_calls<2 || o.block_calls>64 || o.block_trials<2 || o.block_trials>20 ||
-       (o.execution!="runtime"&&o.execution!="consolidated"&&o.execution!="captured"&&o.execution!="flat"&&o.execution!="flat-hc"&&o.execution!="column"&&o.execution!="hybrid"&&o.execution!="hybrid-rccl"&&o.execution!="hybrid-inverse"&&o.execution!="all"))
-        throw std::invalid_argument("usage: tp2_gdn_layer --pack PACK --gguf SHARD [--gguf SHARD ...] [--layer non-PLE-GDN-index] [--mode 7|8] [--hc-dispatch legacy|production-check] [--execution runtime|consolidated|captured|column|hybrid|hybrid-rccl|hybrid-inverse|flat|flat-hc|all] [--benchmark | --calibrate | --model-probe | --model-probe-inverse] [--bench-warmup 3] [--bench-trials 12] [--profile-stages] [--bench-block-calls 16] [--bench-block-trials 4]");
+       (o.execution!="runtime"&&o.execution!="consolidated"&&o.execution!="captured"&&o.execution!="flat"&&o.execution!="flat-hc"&&o.execution!="column"&&o.execution!="hybrid"&&o.execution!="hybrid-rccl"&&o.execution!="hybrid-vram"&&o.execution!="hybrid-inverse"&&o.execution!="all"))
+        throw std::invalid_argument("usage: tp2_gdn_layer --pack PACK --gguf SHARD [--gguf SHARD ...] [--layer non-PLE-GDN-index] [--mode 7|8] [--hc-dispatch legacy|production-check] [--execution runtime|consolidated|captured|column|hybrid|hybrid-rccl|hybrid-vram|hybrid-inverse|flat|flat-hc|all] [--benchmark | --calibrate | --model-probe | --model-probe-inverse] [--bench-warmup 3] [--bench-trials 12] [--profile-stages] [--bench-block-calls 16] [--bench-block-trials 4]");
     if(o.execution=="hybrid-rccl"){
 #ifndef STRATA_TP2_GDN_RCCL
         throw std::invalid_argument("hybrid-rccl requires STRATA_TP2_GDN_RCCL_BUILD=ON");
@@ -95,6 +107,19 @@ Options parse(int argc,char**argv) {
            (o.rccl_scenario=="delayed-rank"&&o.rccl_delay_ms>=o.rccl.timeout_ms))
             throw std::invalid_argument("hybrid-rccl needs --rccl-library ABS_PATH, bounded timeouts and unprofiled normal/fault scope; fault timing is forbidden");
     }else if(o.rccl_options_explicit)throw std::invalid_argument("RCCL options require --execution hybrid-rccl");
+    if(o.execution=="hybrid-vram"){
+#ifndef STRATA_TP2_GDN_VRAM
+        throw std::invalid_argument("hybrid-vram requires STRATA_TP2_GDN_VRAM_BUILD=ON");
+#endif
+        if(o.calibrate||o.model_probe||o.profile_flat||o.hc_dispatch!="production-check"||
+           o.vram.timeout_us<1000||o.vram.timeout_us>10000000||o.vram.watchdog_ms<1000||o.vram.watchdog_ms>120000||
+           o.vram.timeout_us>=uint64_t(o.vram.watchdog_ms)*1000||
+           (o.vram_first!=0&&o.vram_first!=1)||o.vram_delay_ms<1||o.vram_delay_ms>10000||
+           (o.vram_scenario!="normal"&&o.vram_scenario!="delayed-rank"&&o.vram_scenario!="missing-rank")||
+           (o.vram_scenario!="normal"&&o.benchmark)||
+           (o.vram_scenario=="delayed-rank"&&uint64_t(o.vram_delay_ms)*1000>=o.vram.timeout_us))
+            throw std::invalid_argument("hybrid-vram requires production-check staged HC, bounded timeouts and unprofiled whole-layer scope; fault timing is forbidden");
+    }else if(o.vram_options_explicit)throw std::invalid_argument("VRAM options require --execution hybrid-vram");
     if(o.execution=="hybrid-inverse"&&(o.calibrate||o.model_probe||o.profile_flat))
         throw std::invalid_argument("hybrid-inverse only supports unprofiled whole-layer correctness/benchmark; instrumented graphs are forbidden");
     if(o.calibrate){
@@ -137,11 +162,32 @@ void hc_dispatch_startup(const Options& o) {
         if(variant<1||variant>3)throw std::runtime_error("unknown HC dispatch variant");
         const char* name=variant==1?"plain":variant==2?"split":"staged";
         std::printf("HC_DISPATCH_SELECTED policy=%s device=%d hc-variant=%d hc-variant-name=%s check-invoked=%d\n",o.hc_dispatch.c_str(),d,variant,name,int(checked));
+        if(o.execution=="hybrid-vram"&&variant!=3)throw std::runtime_error("hybrid-vram comparison requires staged HC on both GPUs; fallback is not admission");
     }
     on(saved_device);
     // Initialization admission only: the void selector API can fall back to
     // plain if its self-test cannot run. Numerical/timing gates still follow.
     if(checked)std::printf("HC_DISPATCH_INIT_PASS policy=production-check devices=2 before-layer-setup=1\n");
+}
+void vram_device_metadata(const Options& o) {
+    if(o.execution!="hybrid-vram")return;
+#ifdef STRATA_TP2_GDN_VRAM
+    int runtime=0,driver=0;
+    ck(cudaRuntimeGetVersion(&runtime),"VRAM runtime version");
+    ck(cudaDriverGetVersion(&driver),"VRAM driver version");
+    std::array<std::string,2> physical;
+    for(int rank=0;rank<2;++rank){
+        cudaDeviceProp prop{};ck(cudaGetDeviceProperties(&prop,rank),"VRAM device properties");
+        char pci[64]{};ck(hipDeviceGetPCIBusId(pci,sizeof(pci),rank),"VRAM device PCI identity");
+        const std::string arch=prop.gcnArchName;physical[rank]=pci;
+        if(arch!="gfx906"&&arch.rfind("gfx906:",0)!=0)throw std::runtime_error("VRAM layer requires gfx906");
+        std::printf("VRAM_LAYER_GPU rank=%d device=%d pci=%s arch=%s runtime=%d driver=%d\n",rank,rank,pci,arch.c_str(),runtime,driver);
+    }
+    if(physical[0].empty()||physical[0]==physical[1]||runtime<=0||driver<=0)
+        throw std::runtime_error("VRAM layer requires two distinct physical GPUs and valid runtime identity");
+#else
+    throw std::runtime_error("VRAM layer requires opt-in HIP build");
+#endif
 }
 void hc_source_metadata(const Options& o) {
     // GgufFile mmaps the source but only find()/shape/type directory entries are
@@ -645,13 +691,14 @@ void committed(Checks& c,const tp::TpGdnLayerSnapshot& a,const tp::TpGdnLayerSna
 }
 
 const char* execution_name(tp::TpGdnExecution mode) {
-    switch(mode){case tp::TpGdnExecution::RuntimeCopies:return "runtime";case tp::TpGdnExecution::Consolidated:return "consolidated";case tp::TpGdnExecution::Captured:return "captured";case tp::TpGdnExecution::FlatCaptured:return "flat";case tp::TpGdnExecution::FlatHcCaptured:return "flat-hc";case tp::TpGdnExecution::ColumnCaptured:return "column";case tp::TpGdnExecution::HybridCaptured:return "hybrid";case tp::TpGdnExecution::HybridRcclCaptured:return "hybrid-rccl";}
+    switch(mode){case tp::TpGdnExecution::RuntimeCopies:return "runtime";case tp::TpGdnExecution::Consolidated:return "consolidated";case tp::TpGdnExecution::Captured:return "captured";case tp::TpGdnExecution::FlatCaptured:return "flat";case tp::TpGdnExecution::FlatHcCaptured:return "flat-hc";case tp::TpGdnExecution::ColumnCaptured:return "column";case tp::TpGdnExecution::HybridCaptured:return "hybrid";case tp::TpGdnExecution::HybridRcclCaptured:return "hybrid-rccl";case tp::TpGdnExecution::HybridVramCaptured:return "hybrid-vram";}
     throw std::invalid_argument("unknown execution mode");
 }
 std::vector<tp::TpGdnExecution> execution_modes(const Options& o) {
     if(o.benchmark&&!o.execution_explicit)return {tp::TpGdnExecution::Captured,tp::TpGdnExecution::ColumnCaptured};
     if(o.execution=="all")return {tp::TpGdnExecution::RuntimeCopies,tp::TpGdnExecution::Consolidated,tp::TpGdnExecution::Captured,tp::TpGdnExecution::FlatCaptured,tp::TpGdnExecution::FlatHcCaptured,tp::TpGdnExecution::ColumnCaptured};
     if(o.execution=="hybrid-inverse")return {tp::TpGdnExecution::HybridCaptured};
+    if(o.execution=="hybrid-vram")return {tp::TpGdnExecution::HybridCaptured,tp::TpGdnExecution::HybridVramCaptured};
     if(o.execution=="hybrid-rccl")return {tp::TpGdnExecution::HybridCaptured,tp::TpGdnExecution::HybridRcclCaptured};
     if(o.execution=="hybrid")return o.benchmark?std::vector<tp::TpGdnExecution>{tp::TpGdnExecution::Captured,tp::TpGdnExecution::HybridCaptured}:std::vector<tp::TpGdnExecution>{tp::TpGdnExecution::HybridCaptured};
     if(o.execution=="column")return {tp::TpGdnExecution::ColumnCaptured};
@@ -666,9 +713,10 @@ std::vector<tp::TpGdnExecution> execution_modes(const Options& o) {
 void execution_metadata(tp::TpGdnExecution mode,bool inverse_plan=false) {
     const bool flat=mode==tp::TpGdnExecution::FlatCaptured||mode==tp::TpGdnExecution::FlatHcCaptured;
     const bool column=mode==tp::TpGdnExecution::ColumnCaptured;
-    const bool hybrid=mode==tp::TpGdnExecution::HybridCaptured||mode==tp::TpGdnExecution::HybridRcclCaptured;
+    const bool hybrid=mode==tp::TpGdnExecution::HybridCaptured||mode==tp::TpGdnExecution::HybridRcclCaptured||mode==tp::TpGdnExecution::HybridVramCaptured;
     const bool graph=flat||column||hybrid||mode==tp::TpGdnExecution::Captured;
-    std::printf("EXECUTION_LAYOUT mode=%s full-proposal-graph-launches=%d full-commit-graph-launches=%d tp-proposal-graph-launches-per-rank=%d tp-commit-graph-launches-per-rank=%d positive-keep-only; graph-counts-exclude-copy/host-commands\n",execution_name(mode),graph?1:0,graph?1:0,(flat||mode==tp::TpGdnExecution::HybridRcclCaptured)?1:(column?3:(hybrid?4:(graph?5:0))),graph?1:0);
+    std::printf("EXECUTION_LAYOUT mode=%s full-proposal-graph-launches=%d full-commit-graph-launches=%d tp-proposal-graph-launches-per-rank=%d tp-commit-graph-launches-per-rank=%d positive-keep-only; graph-counts-exclude-copy/host-commands\n",execution_name(mode),graph?1:0,graph?1:0,(flat||mode==tp::TpGdnExecution::HybridRcclCaptured||mode==tp::TpGdnExecution::HybridVramCaptured)?1:(column?3:(hybrid?4:(graph?5:0))),graph?1:0);
+    if(mode==tp::TpGdnExecution::HybridVramCaptured)std::printf("VRAM_LAYER_TRANSPORT one-complete-proposal-graph-per-rank; Y=raw-mapped-gather output=raw-row-gather FFN=rank0-then-rank1-fadd_rn; no-host-phase-joins; persistent-worker-dispatch-and-completion-in-wall; final-completion-witness-D2H-inside-wall; replicated-original-staged-HC; no-new-quantization; protocol-epochs-not-reset-between-replays\n");
     if(mode==tp::TpGdnExecution::HybridRcclCaptured)std::printf("RCCL_LAYER_TRANSPORT one-complete-proposal-graph-per-rank; Y=raw-mapped-gather output=raw-row-gather FFN=rank0-then-rank1-fadd_rn; no-host-phase-joins; end-of-proposal-plan-status-only; worker-dispatch-and-completion-in-wall; replicated-original-HC; no-new-quantization\n");
     if(mode==tp::TpGdnExecution::HybridCaptured&&!inverse_plan)std::printf("HYBRID_TRANSPORT row-attention Y/projection gathers; local-hidden320 column-FFN fused down; three joins/four segments vs row four/five; one fewer join, wall-time saving unmeasured; no new GPU kernel; expert-parts snapshot diagnostic recomputation\n");
     if(inverse_plan)std::printf("HYBRID_INVERSE_TRANSPORT same row-attention Y/projection gathers; local-hidden320 column-FFN fused down; unchanged three joins/four segments; once-built device inverse routes plus preplanned Down consumer; planner inside timed proposal; expert-parts snapshot diagnostic recomputation\n");
@@ -774,13 +822,122 @@ void rccl_fault_gate(const Options& o) {
     }
     std::printf("RCCL_LAYER_FAULT_PASS scenario=delayed-rank first=%d delay_ms=%d exact_continuation=1 timing_admitted=0\n",o.rccl_first,o.rccl_delay_ms);
 }
+void vram_lifecycle_gate(Checks& c,const Options& o,const strata::core::ModelGeometry& g,
+                         const tp::TpGdnRankWeights& rank0,const tp::TpGdnRankWeights& rank1,
+                         const std::vector<float>& state,const std::vector<float>& conv) {
+    for(int life=0;life<2;++life){
+        {
+            tp::TpGdnLayer old(g,rank0,&rank1,8,o.mode),candidate(g,rank0,&rank1,8,o.mode);
+            for(int t:{1,8}){old.prepare_captured(t);candidate.prepare_vram(t,o.vram);}
+            old.set_execution(tp::TpGdnExecution::HybridCaptured);
+            candidate.set_execution(tp::TpGdnExecution::HybridVramCaptured);
+            uint64_t epoch=0;
+            for(int first:{0,1}){
+                old.reset_state(state,conv);candidate.reset_state(state,conv);
+                // T changes share the live inboxes and GPU-owned protocol epochs.
+                // Two consecutive positive commits visit both physical banks for
+                // each shape; reset_state never resets protocol history.
+                for(int t:{1,8,1,8})for(int bank=0;bank<2;++bank){
+                    candidate.set_vram_launch_for_test(first);
+                    const auto input=signed_input(size_t(t)*H*N,8701+life*101+first*31+int(epoch)*7+bank,0.65f);
+                    old.propose(input,t,++epoch);candidate.propose(input,t,epoch);
+                    exact_hybrid_layers(c,old,candidate,"VRAM_LAYER");
+                    old.commit(t);candidate.commit(t);exact_hybrid_layers(c,old,candidate,"VRAM_LAYER");
+                }
+            }
+        } // Complete only after graphs/workers/inboxes are drained and destroyed.
+        std::printf("VRAM_LAYER_LIFECYCLE_PASS life=%d orders=2 tokens=1,8 banks=2\n",life);
+    }
+}
+void vram_bank_gate(Checks& c,tp::TpGdnLayer& old,tp::TpGdnLayer& candidate,
+                   uint64_t& epoch,const std::vector<float>& state,const std::vector<float>& conv) {
+    old.set_execution(tp::TpGdnExecution::HybridCaptured);
+    candidate.set_execution(tp::TpGdnExecution::HybridVramCaptured);
+    for(int first:{0,1})for(int tokens=1;tokens<=8;++tokens){
+        old.reset_state(state,conv);candidate.reset_state(state,conv);
+        for(int bank=0;bank<2;++bank){
+            candidate.set_vram_launch_for_test(first);
+            const auto input=signed_input(size_t(tokens)*H*N,9101+tokens*37+first*13+bank*19,0.65f);
+            std::printf("VRAM_LAYER_BANK_CASE first=%d T=%d bank=%d capacity=8\n",first,tokens,bank);
+            old.propose(input,tokens,++epoch);candidate.propose(input,tokens,epoch);
+            exact_hybrid_layers(c,old,candidate,"VRAM_LAYER");
+            old.commit(tokens);candidate.commit(tokens);exact_hybrid_layers(c,old,candidate,"VRAM_LAYER");
+        }
+    }
+    std::printf("VRAM_LAYER_BANK_GATE_PASS T=1..8 orders=2 owners=2 banks=2 fields=19 capacity=8 inputs=changing\n");
+}
+void vram_fault_gate(const Options& o) {
+    strata::core::ModelGeometry g;tp::TpGdnWeights weights0,weights1;std::string error;
+    if(!weights0.load(o.shards,o.pack,g,o.layer,0,0,error,tp::TpGdnPartition::HybridRowsColumns))throw std::runtime_error(error);
+    if(!weights1.load(o.shards,o.pack,g,o.layer,1,1,error,tp::TpGdnPartition::HybridRowsColumns))throw std::runtime_error(error);
+    Checks c;const auto state=signed_input(STATE,17,0.015f),conv=signed_input(CONV,31,0.12f);
+    const int other=1-o.vram_first;const bool missing=o.vram_scenario=="missing-rank";
+    {
+        tp::TpGdnLayer old(g,weights0.weights(),&weights1.weights(),2,o.mode),candidate(g,weights0.weights(),&weights1.weights(),2,o.mode);
+        for(int t:{1,2}){old.prepare_captured(t);candidate.prepare_vram(t,o.vram);}
+        old.set_execution(tp::TpGdnExecution::HybridCaptured);candidate.set_execution(tp::TpGdnExecution::HybridVramCaptured);
+        old.reset_state(state,conv);candidate.reset_state(state,conv);
+        candidate.set_vram_launch_for_test(o.vram_first,missing?other:-1,missing?-1:other,uint64_t(o.vram_delay_ms)*1000);
+        const auto input=signed_input(H*N,8901,0.65f);
+        old.propose(input,1,1);
+        std::printf("VRAM_LAYER_FAULT_ARMED scenario=%s first=%d target=%d\n",o.vram_scenario.c_str(),o.vram_first,other);
+        if(missing){
+            bool rejected=false;std::string reason;
+            try{candidate.propose(input,1,1);}catch(const std::exception& e){rejected=true;reason=e.what();}
+            c.require(rejected,"VRAM missing peer rejects proposal");
+            c.require(reason.find("TP GDN VRAM protocol aborted/timed out or invalid epoch")!=std::string::npos,"VRAM missing peer fails through transport protocol");
+            auto rejects=[&](const char* label,auto action){bool blocked=false;try{action();}catch(const std::exception&){blocked=true;}c.require(blocked,label);};
+            for(int rank:{0,1}){
+                rejects("VRAM failed snapshot unavailable",[&](){(void)candidate.snapshot(rank);});
+                rejects("VRAM failed residual unavailable",[&](){(void)candidate.residual(rank);});
+            }
+            rejects("VRAM failed positive commit unavailable",[&](){candidate.commit(1);});
+            rejects("VRAM failed zero commit unavailable",[&](){candidate.commit(0);});
+            rejects("VRAM failed reset unavailable",[&](){candidate.reset_state(state,conv);});
+            rejects("VRAM failed proposal unavailable",[&](){candidate.propose(input,1,2);});
+            rejects("VRAM failed preparation unavailable",[&](){candidate.prepare_vram(1,o.vram);});
+            rejects("VRAM failed execution switch unavailable",[&](){candidate.set_execution(tp::TpGdnExecution::HybridCaptured);});
+            for(int d=0;d<2;++d){on(d);ck(cudaDeviceSynchronize(),"VRAM fault gate clean device drain");}
+            if(c.failures)throw std::runtime_error("VRAM missing-peer fail-closed gate failed");
+            std::printf("VRAM_LAYER_FAULT_PASS scenario=missing-rank first=%d target=%d rejected=1 sticky=1 both_drained=1 timing_admitted=0\n",o.vram_first,other);
+        }else{
+            candidate.propose(input,1,1);
+            c.require(candidate.vram_wait_polls_for_test(o.vram_first)[0]>0,"VRAM delayed peer exercises live first-seam polling");
+            exact_hybrid_layers(c,old,candidate,"VRAM_LAYER");
+            old.commit(1);candidate.commit(1);exact_hybrid_layers(c,old,candidate,"VRAM_LAYER");
+            const auto next=signed_input(size_t(2)*H*N,8902,0.55f);
+            old.propose(next,2,2);candidate.propose(next,2,2);exact_hybrid_layers(c,old,candidate,"VRAM_LAYER");
+            old.commit(2);candidate.commit(2);exact_hybrid_layers(c,old,candidate,"VRAM_LAYER");
+            for(int d=0;d<2;++d){on(d);ck(cudaDeviceSynchronize(),"VRAM delayed gate clean device drain");}
+            std::printf("VRAM_LAYER_DELAY_PASS first=%d delayed=%d delay_ms=%d observed_polls=1 exact_continuation=1 both_drained=1 timing_admitted=0\n",o.vram_first,other,o.vram_delay_ms);
+        }
+    }
+    // Never clear sticky flags or reuse the failed owner. Recovery means new
+    // streams, controls, buffers, graphs and workers after clean destruction.
+    {
+        tp::TpGdnLayer old(g,weights0.weights(),&weights1.weights(),2,o.mode),candidate(g,weights0.weights(),&weights1.weights(),2,o.mode);
+        for(int t:{1,2}){old.prepare_captured(t);candidate.prepare_vram(t,o.vram);}
+        old.set_execution(tp::TpGdnExecution::HybridCaptured);candidate.set_execution(tp::TpGdnExecution::HybridVramCaptured);
+        old.reset_state(state,conv);candidate.reset_state(state,conv);
+        uint64_t epoch=0;
+        for(int t:{1,2}){
+            candidate.set_vram_launch_for_test(o.vram_first);
+            const auto input=signed_input(size_t(t)*H*N,8971+t*19,0.65f);
+            old.propose(input,t,++epoch);candidate.propose(input,t,epoch);exact_hybrid_layers(c,old,candidate,"VRAM_LAYER");
+            old.commit(t);candidate.commit(t);exact_hybrid_layers(c,old,candidate,"VRAM_LAYER");
+        }
+    }
+    std::printf("VRAM_LAYER_RECOVERY_PASS scenario=%s first=%d prefix=1 continuation=2 owners=2 banks=2 exact=1 released=1\n",o.vram_scenario.c_str(),o.vram_first);
+    std::printf("VRAM_LAYER_FAULT_GATE_PASS scenario=%s first=%d exact_recovery=1 timing_admitted=0\n",o.vram_scenario.c_str(),o.vram_first);
+}
 struct LayerTime {double propose_ms=0,commit_ms=0,total_ms=0;};
 LayerTime timed_layer(tp::TpGdnLayer& layer,const std::array<const float*,2>& input,int tokens,uint64_t epoch) {
     using Clock=std::chrono::steady_clock;
     // Both APIs synchronize their own rank streams before return. The wall
     // interval includes D2D input copies, host orchestration, launches, peer
     // exchange, whole-layer compute, accepted-prefix replay and synchronization.
-    // No device-wide sync, diagnostic download, reset/upload or graph build.
+    // Candidate final completion/witness readbacks stay inside this clock.
+    // No device-wide sync, snapshots, reset/upload or graph build.
     const auto start=Clock::now();layer.propose_device(input,tokens,epoch);
     const auto proposed=Clock::now();layer.commit(tokens);const auto end=Clock::now();
     auto ms=[](auto a,auto b){return std::chrono::duration<double,std::milli>(b-a).count();};
@@ -791,6 +948,7 @@ double quantile(std::vector<double> values,double q) {
     const size_t i=size_t(x),j=std::min(i+1,values.size()-1);return values[i]+(values[j]-values[i])*(x-double(i));
 }
 
+uint64_t fixture_hash(const std::vector<float>& values);
 struct BenchStudy {
     tp::TpGdnLayer& baseline;tp::TpGdnLayer& candidate;
     tp::TpGdnExecution baseline_mode,candidate_mode;
@@ -802,7 +960,7 @@ void sustained_benchmark(Checks& c,const Options& o,const BenchStudy& study,cons
                          uint64_t& epoch,const std::vector<float>& state,const std::vector<float>& conv) {
     auto& reference=study.baseline;auto& parallel=study.candidate;const auto mode=study.candidate_mode;
     const bool association=mode==tp::TpGdnExecution::ColumnCaptured;
-    const bool hybrid=mode==tp::TpGdnExecution::HybridCaptured||mode==tp::TpGdnExecution::HybridRcclCaptured;
+    const bool hybrid=mode==tp::TpGdnExecution::HybridCaptured||mode==tp::TpGdnExecution::HybridRcclCaptured||mode==tp::TpGdnExecution::HybridVramCaptured;
     std::printf("BLOCK_STUDY baseline=%s candidate=%s\n",study.baseline_label,study.candidate_label);
     std::printf("BLOCK_SCOPE complete-call evolving-state blocks; shadow pass checks every step, measured blocks download no intermediate outputs/state and check final results only; not full-model throughput\n");
     std::printf("BLOCK_METHOD calls=%d crossovers=%d same preuploaded input sequence in both orders; equal untimed %d-call evolving warm block immediately before each measured arm; initial state reset outside clock; block wall includes all host looping/proposals/commits/sync; no snapshots within block\n",o.block_calls,o.block_trials,o.block_calls);
@@ -810,6 +968,7 @@ void sustained_benchmark(Checks& c,const Options& o,const BenchStudy& study,cons
         reference.set_execution(study.baseline_mode);parallel.set_execution(study.candidate_mode);execution_metadata(study.baseline_mode);execution_metadata(study.candidate_mode,std::strcmp(study.candidate_label,"tp-hybrid-inverse")==0);
         const size_t stride=size_t(tokens)*H*N;std::vector<float> sequence_values;
         for(int j=0;j<o.block_calls;++j){const auto v=signed_input(stride,3301+tokens*71+j*37,0.65f);sequence_values.insert(sequence_values.end(),v.begin(),v.end());}
+        if(mode==tp::TpGdnExecution::HybridVramCaptured)std::printf("VRAM_MATCHED_FIXTURE family=block baseline=%s candidate=%s T=%d calls=%d residual-fnv1a64=%016llx state-fnv1a64=%016llx conv-fnv1a64=%016llx same-bytes-both-arms=1\n",study.baseline_label,study.candidate_label,tokens,o.block_calls,(unsigned long long)fixture_hash(sequence_values),(unsigned long long)fixture_hash(state),(unsigned long long)fixture_hash(conv));
         Buffer<float> input0(sequence_values.size(),0),input1(sequence_values.size(),1);input0.set(sequence_values);input1.set(sequence_values);
         for(int d=0;d<2;++d){on(d);ck(cudaDeviceSynchronize(),"block input upload completion");}
         auto input=[&](int j){return std::array<const float*,2>{input0.p+size_t(j)*stride,input1.p+size_t(j)*stride};};
@@ -849,7 +1008,7 @@ void benchmark(Checks& c,const Options& o,const BenchStudy& study,const tp::TpGd
                uint64_t& epoch,const std::vector<float>& state,const std::vector<float>& conv) {
     auto& reference=study.baseline;auto& parallel=study.candidate;const auto mode=study.candidate_mode;
     const bool association=mode==tp::TpGdnExecution::ColumnCaptured;
-    const bool hybrid=mode==tp::TpGdnExecution::HybridCaptured||mode==tp::TpGdnExecution::HybridRcclCaptured;
+    const bool hybrid=mode==tp::TpGdnExecution::HybridCaptured||mode==tp::TpGdnExecution::HybridRcclCaptured||mode==tp::TpGdnExecution::HybridVramCaptured;
     std::printf("BENCH_STUDY baseline=%s candidate=%s\n",study.baseline_label,study.candidate_label);
     std::printf("\nBENCH_SCOPE real-weight-one-GDN-layer; explicit-arm-labels-above; matched-input-and-state; not-EP-or-full-model-generation\n");
     std::printf("BENCH_METHOD wall=propose_device+commit(T), includes D2D input/host launch/P2P/compute/commit/sync; excludes reset/H2D/weight-load/graph-preparation/snapshots; fixed initialized state, varying matched signed input; keep=T is a workload choice, not measured speculative acceptance\n");
@@ -864,6 +1023,7 @@ void benchmark(Checks& c,const Options& o,const BenchStudy& study,const tp::TpGd
         std::vector<double>rt,pt,ratio,rp,pp,rc,pc;
         for(int trial=-o.warmup;trial<o.trials;++trial){
             const auto input=signed_input(size_t(tokens)*H*N,1201+tokens*97+(trial+o.warmup)*31,0.65f);
+            if(mode==tp::TpGdnExecution::HybridVramCaptured)std::printf("VRAM_MATCHED_FIXTURE family=burst baseline=%s candidate=%s T=%d trial=%d residual-fnv1a64=%016llx state-fnv1a64=%016llx conv-fnv1a64=%016llx same-bytes-both-arms=1\n",study.baseline_label,study.candidate_label,tokens,trial,(unsigned long long)fixture_hash(input),(unsigned long long)fixture_hash(state),(unsigned long long)fixture_hash(conv));
             input0.set(input);input1.set(input);
             // Pageable/default-stream uploads do not establish a dependency on
             // either executor's nonblocking compute stream. Finish both outside
@@ -1046,13 +1206,14 @@ void model_probe(const Options& o) {
 } // namespace
 int main(int argc,char** argv) {
     try {
-        const auto o=parse(argc,argv);if(o.model_probe||o.execution=="hybrid-rccl"||o.execution=="hybrid-inverse")std::setvbuf(stdout,nullptr,_IOLBF,0);hc_source_metadata(o);int devices=0;ck(cudaGetDeviceCount(&devices),"device count");
+        const auto o=parse(argc,argv);if(o.model_probe||o.execution=="hybrid-rccl"||o.execution=="hybrid-vram"||o.execution=="hybrid-inverse")std::setvbuf(stdout,nullptr,_IOLBF,0);hc_source_metadata(o);int devices=0;ck(cudaGetDeviceCount(&devices),"device count");
         if(devices<2)throw std::runtime_error("two GPUs required; this is not a CPU or single-GPU pass");
         for(int d=0;d<2;++d){cudaDeviceProp prop{};ck(cudaGetDeviceProperties(&prop,d),"device properties");std::printf("device=%d name=%s\n",d,prop.name);int access=0;ck(cudaDeviceCanAccessPeer(&access,d,1-d),"P2P check");if(!access)throw std::runtime_error("bidirectional P2P required");}
-        hc_dispatch_startup(o);
+        vram_device_metadata(o);hc_dispatch_startup(o);
         k::gr_set_native_mmvf(true);k::shared_expert_set_native_bf16(true);k::native_mmvq_set_multi_exact(true);k::native_expert_set_mode(o.mode,0);
         if(o.model_probe){model_probe(o);return 0;}
         if(o.execution=="hybrid-rccl"&&o.rccl_scenario!="normal"){rccl_fault_gate(o);return 0;}
+        if(o.execution=="hybrid-vram"&&o.vram_scenario!="normal"){vram_fault_gate(o);return 0;}
         const auto executions=execution_modes(o);
         const bool use_flat=std::find(executions.begin(),executions.end(),tp::TpGdnExecution::FlatCaptured)!=executions.end()||
                             std::find(executions.begin(),executions.end(),tp::TpGdnExecution::FlatHcCaptured)!=executions.end();
@@ -1060,8 +1221,9 @@ int main(int argc,char** argv) {
         const bool use_column=std::find(executions.begin(),executions.end(),tp::TpGdnExecution::ColumnCaptured)!=executions.end();
         const bool use_hybrid=std::find(executions.begin(),executions.end(),tp::TpGdnExecution::HybridCaptured)!=executions.end();
         const bool use_rccl=o.execution=="hybrid-rccl";
+        const bool use_vram=o.execution=="hybrid-vram";
         const bool use_inverse=o.execution=="hybrid-inverse";
-        const bool profiles=(o.profile_flat||o.benchmark)&&!use_rccl&&!use_inverse;
+        const bool profiles=(o.profile_flat||o.benchmark)&&!use_rccl&&!use_vram&&!use_inverse;
         strata::core::ModelGeometry g;tp::TpGdnWeights full,rank0,rank1,column0,column1,hybrid0,hybrid1;std::string err;
         if(!full.load(o.shards,o.pack,g,o.layer,-1,0,err))throw std::runtime_error("full reference load: "+err);
         if(!rank0.load(o.shards,o.pack,g,o.layer,0,0,err))throw std::runtime_error("rank0 load: "+err);
@@ -1086,11 +1248,13 @@ int main(int argc,char** argv) {
         if(use_column)std::printf("COLUMN_REFERENCE_CONTRACT original-full seam/residual/state bounds unchanged; original router IDs exact; router logits/weights use predeclared hc_gate(abs2e-6,scaled2e-5,rms5e-6) only when FFN inputs differ; candidate-same-input original full GU/Q8 exact and complete FFN numerical gate; original-input Q8 differences diagnostic, not exact PASS; diagnostic recomputed expert parts do not establish fused output correctness; engineering parity only\n");
         const auto state=signed_input(STATE,17,0.015f),conv=signed_input(CONV,31,0.12f);
         if(use_flat)flat_failure_gate(c,o,g,rank0.weights(),rank1.weights(),state,conv);
+        if(use_vram)vram_lifecycle_gate(c,o,g,hybrid0.weights(),hybrid1.weights(),state,conv);
         if(use_rccl)rccl_lifecycle_gate(c,o,g,hybrid0.weights(),hybrid1.weights(),state,conv);
         tp::TpGdnLayer reference(g,full.weights(),nullptr,8,o.mode),row_parallel(g,rank0.weights(),&rank1.weights(),8,o.mode);
-        std::unique_ptr<tp::TpGdnLayer> column_parallel,hybrid_parallel,rccl_parallel,inverse_parallel;
+        std::unique_ptr<tp::TpGdnLayer> column_parallel,hybrid_parallel,rccl_parallel,vram_parallel,inverse_parallel;
         if(use_column)column_parallel=std::make_unique<tp::TpGdnLayer>(g,column0.weights(),&column1.weights(),8,o.mode);
         if(use_hybrid)hybrid_parallel=std::make_unique<tp::TpGdnLayer>(g,hybrid0.weights(),&hybrid1.weights(),8,o.mode);
+        if(use_vram)vram_parallel=std::make_unique<tp::TpGdnLayer>(g,hybrid0.weights(),&hybrid1.weights(),8,o.mode);
         if(use_rccl)rccl_parallel=std::make_unique<tp::TpGdnLayer>(g,hybrid0.weights(),&hybrid1.weights(),8,o.mode);
         if(use_inverse){
             inverse_parallel=std::make_unique<tp::TpGdnLayer>(g,hybrid0.weights(),&hybrid1.weights(),8,o.mode,true);
@@ -1101,6 +1265,7 @@ int main(int argc,char** argv) {
         auto candidate_for=[&](tp::TpGdnExecution mode)->tp::TpGdnLayer&{
             if(mode==tp::TpGdnExecution::ColumnCaptured)return *column_parallel;
             if(mode==tp::TpGdnExecution::HybridCaptured)return use_inverse?*inverse_parallel:*hybrid_parallel;
+            if(mode==tp::TpGdnExecution::HybridVramCaptured)return *vram_parallel;
             if(mode==tp::TpGdnExecution::HybridRcclCaptured)return *rccl_parallel;
             return row_parallel;
         };
@@ -1110,6 +1275,7 @@ int main(int argc,char** argv) {
                 for(int t=1;t<=8;++t){candidate.prepare_captured(t);if(profiles)candidate.prepare_captured(t,true);}
                 if(o.benchmark||o.calibrate)for(int t:{1,2,4,5,8})reference.prepare_captured(t);
             }
+            if(execution==tp::TpGdnExecution::HybridVramCaptured)for(int t=1;t<=8;++t)candidate.prepare_vram(t,o.vram);
             if(execution==tp::TpGdnExecution::HybridRcclCaptured)for(int t=1;t<=8;++t)candidate.prepare_rccl(t,o.rccl);
             if(execution==tp::TpGdnExecution::FlatCaptured||execution==tp::TpGdnExecution::FlatHcCaptured){
                 const bool shard_hc=execution==tp::TpGdnExecution::FlatHcCaptured;
@@ -1117,15 +1283,17 @@ int main(int argc,char** argv) {
                 if(o.benchmark)for(int t:{1,2,4,5,8})reference.prepare_flat(t,shard_hc,false);
             }
         }
-        uint64_t epoch=0;int cases=0,rccl_cases=0,inverse_cases=0;
+        uint64_t epoch=0;int cases=0,rccl_cases=0,vram_cases=0,inverse_cases=0;
+        if(use_vram)vram_bank_gate(c,*hybrid_parallel,*vram_parallel,epoch,state,conv);
         if(use_inverse)inverse_plan_bank_gate(c,*hybrid_parallel,*inverse_parallel,epoch,state,conv);
         std::vector<int32_t> prior_routes;bool routes_changed=false,repeated_ids=false;
         for(auto execution:executions){
         const bool rccl=execution==tp::TpGdnExecution::HybridRcclCaptured;
-        const bool paired_exact=rccl||use_inverse;
-        const char* exact_contract=use_inverse?"INVERSE_PLAN":"RCCL";
+        const bool vram=execution==tp::TpGdnExecution::HybridVramCaptured;
+        const bool paired_exact=rccl||vram||use_inverse;
+        const char* exact_contract=use_inverse?"INVERSE_PLAN":(vram?"VRAM_LAYER":"RCCL");
         const bool association=execution==tp::TpGdnExecution::ColumnCaptured;
-        const bool hybrid=execution==tp::TpGdnExecution::HybridCaptured||execution==tp::TpGdnExecution::HybridRcclCaptured;
+        const bool hybrid=execution==tp::TpGdnExecution::HybridCaptured||execution==tp::TpGdnExecution::HybridRcclCaptured||execution==tp::TpGdnExecution::HybridVramCaptured;
         auto& parallel=candidate_for(execution);
         const bool profiled=profiles&&(execution==tp::TpGdnExecution::Captured||association||hybrid||execution==tp::TpGdnExecution::FlatCaptured||execution==tp::TpGdnExecution::FlatHcCaptured);
         parallel.set_execution(execution,false);execution_metadata(execution,use_inverse);
@@ -1136,6 +1304,7 @@ int main(int argc,char** argv) {
             reference.reset_state(state,conv);parallel.reset_state(state,conv);
             if(paired_exact)hybrid_parallel->reset_state(state,conv);
             if(rccl)parallel.set_rccl_launch_for_test((tokens+keep)&1);
+            if(vram)parallel.set_vram_launch_for_test((tokens+keep)&1);
             reference.propose(input,tokens,++epoch);parallel.propose(input,tokens,epoch);
             if(paired_exact){hybrid_parallel->propose(input,tokens,epoch);exact_hybrid_layers(c,*hybrid_parallel,parallel,exact_contract);}
             auto a=reference.snapshot(),b=parallel.snapshot();seams(c,a,b,false,true,association,&full.weights(),hybrid);seams(c,b,parallel.snapshot(1),true);
@@ -1161,7 +1330,7 @@ int main(int argc,char** argv) {
             c.floats("continuation legacy GDN",continuation.output,nb.gdn_output,gdn_gate);
             c.floats("continuation legacy mixer",continuation.mixer,nb.mixer_output,gdn_gate);
             reference.commit(2);parallel.commit(2);committed(c,reference.snapshot(),parallel.snapshot(),continuation);++cases;
-            if(paired_exact){hybrid_parallel->commit(2);exact_hybrid_layers(c,*hybrid_parallel,parallel,exact_contract);if(rccl)++rccl_cases;else ++inverse_cases;}
+            if(paired_exact){hybrid_parallel->commit(2);exact_hybrid_layers(c,*hybrid_parallel,parallel,exact_contract);if(rccl)++rccl_cases;else if(vram)++vram_cases;else ++inverse_cases;}
         }
         if(profiled){
             // Instrumentation may change scheduling. It never replaces the
@@ -1187,6 +1356,11 @@ int main(int argc,char** argv) {
             std::printf("RCCL_LAYER_EXACT_GATE_PASS prefix_cases=%d continuation_cases=%d T=1..8 orders=2 banks=2 old_hybrid_tolerance_bits=0 original_full_gates=unchanged\n",rccl_cases,rccl_cases);
             rccl_parallel->set_rccl_launch_for_test(o.rccl_first);
         }
+        if(use_vram){
+            if(vram_cases!=44)throw std::runtime_error("VRAM all-prefix gate incomplete; timing prohibited");
+            std::printf("VRAM_LAYER_EXACT_GATE_PASS prefix_cases=%d continuation_cases=%d T=1..8 orders=2 banks=2 old_hybrid_tolerance_bits=0 original_full_gates=unchanged\n",vram_cases,vram_cases);
+            vram_parallel->set_vram_launch_for_test(o.vram_first);
+        }
         if(use_inverse){
             if(inverse_cases!=44)throw std::runtime_error("inverse-plan all-prefix gate incomplete; timing prohibited");
             std::printf("INVERSE_PLAN_EXACT_GATE_PASS prefix_cases=%d continuation_cases=%d T=1..8 owners=2 banks=2 fields=19 old_hybrid_tolerance_bits=0 original_full_gates=unchanged instrumentation=none\n",inverse_cases,inverse_cases);
@@ -1197,6 +1371,9 @@ int main(int argc,char** argv) {
             if(use_inverse){
                 studies.push_back({*hybrid_parallel,*inverse_parallel,tp::TpGdnExecution::HybridCaptured,tp::TpGdnExecution::HybridCaptured,"tp-hybrid-captured","tp-hybrid-inverse",true,"INVERSE_PLAN"});
                 studies.push_back({reference,*inverse_parallel,tp::TpGdnExecution::Captured,tp::TpGdnExecution::HybridCaptured,"single-gpu-captured","tp-hybrid-inverse"});
+            }else if(use_vram){
+                studies.push_back({*hybrid_parallel,*vram_parallel,tp::TpGdnExecution::HybridCaptured,tp::TpGdnExecution::HybridVramCaptured,"tp-hybrid-captured","tp-hybrid-vram",true,"VRAM_LAYER"});
+                studies.push_back({reference,*vram_parallel,tp::TpGdnExecution::Captured,tp::TpGdnExecution::HybridVramCaptured,"single-gpu-captured","tp-hybrid-vram"});
             }else if(use_rccl){
                 studies.push_back({reference,*rccl_parallel,tp::TpGdnExecution::Captured,tp::TpGdnExecution::HybridRcclCaptured,"single-gpu-captured","tp-hybrid-rccl"});
                 studies.push_back({*hybrid_parallel,*rccl_parallel,tp::TpGdnExecution::HybridCaptured,tp::TpGdnExecution::HybridRcclCaptured,"tp-hybrid-captured","tp-hybrid-rccl",true});
