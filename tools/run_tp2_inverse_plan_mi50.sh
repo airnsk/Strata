@@ -9,6 +9,7 @@ Usage: bash tools/run_tp2_inverse_plan_mi50.sh MODEL_ROOT \
 Only the installed pinned MI50 image is used. No RCCL artifact is needed.
 MODEL_ROOT is an existing absolute directory, mounted read-only. Both GPUs must be idle.
 Options: --layer 0..47 (non-PLE GDN only) --mode 7|8
+  --hc-dispatch legacy|production-check (default legacy)
   --bench-warmup 1..100 --bench-trials 2..1000
   --bench-block-calls 2..64 --bench-block-trials 2..20
 Defaults: layer=0, mode=8, warmup=3, trials=12, block-calls=16, block-trials=4.
@@ -16,6 +17,8 @@ Checks exact old-hybrid parity on both owners for T1..8, all prefixes and
 continuations, both banks; unchanged full-reference oracles precede timing.
 Runs unprofiled burst and sustained whole-layer pairs at T1/2/4/5/8, including
 inverse plan generation in the timed proposal. A skip or missing gate fails.
+production-check uses the production HC selector on each GPU before captures;
+it can select plain/split/staged. Legacy preserves historical unchecked dispatch.
 Optional env: BUILD_JOBS=48 TP2_TIMEOUT=1200 TP2_BUILD_TIMEOUT=600 TP2_OUTER_TIMEOUT=2400.
 Deadlines are seconds; outer bounds discovery, build and all subprocesses.
 Sudo authorization precedes timed operations and is never captured in logs.
@@ -32,6 +35,7 @@ CONTAINER_NAME="strata-tp2-inverse-plan-$RUN_ID"
 CONTAINER_STARTED=0
 DOCKER=(docker)
 SOURCE_FILES=(CMakeLists.txt tests/hip/tp2_gdn_layer.cpp src/core/tp_gdn_layer.cpp
+  src/kernels/cuda/fused_gr.cu include/strata/kernels/fused_gr.hpp
   include/strata/core/tp_gdn_layer.hpp src/kernels/cuda/iq_kernels.cu
   src/kernels/cuda/verify_kernels.cu src/kernels/cuda/native_down_plan.cuh
   include/strata/kernels/iq_kernels.hpp
@@ -163,6 +167,9 @@ validate_host() {
         if [[ "$flag" == --gguf ]]; then ggufs=$((ggufs + 1)); fi
         ;;
       --mode) [[ "$value" == 7 || "$value" == 8 ]] || { echo 'Mode must be 7 or 8.' >&2; return 2; } ;;
+      --hc-dispatch) [[ "$value" == legacy || "$value" == production-check ]] || {
+        echo 'HC dispatch must be legacy or production-check.' >&2; return 2;
+      } ;;
       --layer|--bench-warmup|--bench-trials|--bench-block-calls|--bench-block-trials)
         [[ "$value" =~ ^(0|[1-9][0-9]{0,3})$ ]] || { echo "Invalid integer: $flag=$value" >&2; return 2; }
         local lower=1 upper=1
@@ -271,10 +278,11 @@ set -euo pipefail
 echo 'INVERSE_PLAN_CONTAINER_ENTER'
 export PATH=/opt/venv/bin:/opt/rocm/bin:$PATH
 runtime_deadline=$1; build_deadline=$2; jobs=$3; shift 3
-model_args=(); bench_args=()
+model_args=(); bench_args=(); hc_dispatch=legacy
 while (( $# )); do
   case "$1" in
     --bench-*) bench_args+=("$1" "$2") ;;
+    --hc-dispatch) hc_dispatch=$2; model_args+=("$1" "$2") ;;
     *) model_args+=("$1" "$2") ;;
   esac
   shift 2
@@ -328,6 +336,25 @@ run_case() {
   printf 'INVERSE_PLAN_PROCESS_EXIT phase=benchmark code=%s\n' "$rc"
   (( pipe_status[1] == 0 )) || { echo 'INVERSE_PLAN_LOG_FAILURE' >&2; return "${pipe_status[1]}"; }
   (( rc == 0 )) || return "$rc"
+  if [[ "$hc_dispatch" == production-check ]]; then
+    # Selection provenance is additional to every existing numerical gate.
+    # A late, duplicate or malformed marker cannot admit earlier samples.
+    awk '
+      /^HC_DISPATCH_SELECTED/ {
+        if ($0 !~ /^HC_DISPATCH_SELECTED policy=production-check device=[01] hc-variant=[123] hc-variant-name=(plain|split|staged) check-invoked=1$/) bad=1
+        if (($4=="hc-variant=1" && $5!="hc-variant-name=plain") ||
+            ($4=="hc-variant=2" && $5!="hc-variant-name=split") ||
+            ($4=="hc-variant=3" && $5!="hc-variant-name=staged")) bad=1
+        if (++selected[$3]!=1 || initialized) bad=1
+      }
+      /^HC_DISPATCH_INIT_PASS/ {
+        if ($0!="HC_DISPATCH_INIT_PASS policy=production-check devices=2 before-layer-setup=1" ||
+            selected["device=0"]!=1 || selected["device=1"]!=1 || initialized++) bad=1
+      }
+      /^(BENCH_|BLOCK_)/ { if (!initialized) bad=1 }
+      END { exit (bad || initialized!=1 || selected["device=0"]!=1 || selected["device=1"]!=1) }
+    ' "$log" || { echo 'INVERSE_PLAN_ADMISSION_FAIL HC production selection missing, malformed or late' >&2; return 4; }
+  fi
   for marker in INVERSE_PLAN_BANK_GATE_PASS INVERSE_PLAN_EXACT_GATE_PASS; do
     grep -Eq "^$marker([[:space:]]|$)" "$log" || {
       echo "INVERSE_PLAN_ADMISSION_FAIL absent $marker" >&2; return 4;

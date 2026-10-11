@@ -8,6 +8,8 @@ Uses only the already installed, pinned MI50 image; sudo docker supports the sta
 Runs --model-probe: hybrid local-hidden FFN plus output-row attention, T=1/8 only.
 Five targeted prefix cases and one-token continuations precede paired fine-phase probes.
 Defaults: --layer 0 --mode 8 --bench-warmup 1 --bench-trials 4.
+Optional: --hc-dispatch legacy|production-check (default legacy).
+production-check selects HC on each GPU using the production startup check before captures.
 Optional: BUILD_JOBS=48 TP2_TIMEOUT=600. Runtime timeout excludes compilation.
 Reuse the verified model root, pack and GGUF shards from the existing stand run.
 Both GPUs must be idle. No downloads, service stops, clock or power changes.
@@ -42,7 +44,7 @@ root = Path(sys.argv[2])
 physical = root.resolve(strict=True)
 views = [Path(p) for p in model_views(root)]
 args = sys.argv[3:]
-allowed = {"--pack", "--gguf", "--layer", "--mode", "--bench-warmup", "--bench-trials"}
+allowed = {"--pack", "--gguf", "--layer", "--mode", "--bench-warmup", "--bench-trials", "--hc-dispatch"}
 if len(args) % 2:
     raise SystemExit("Expected option/value pairs; the runner adds --model-probe itself")
 seen = set()
@@ -50,6 +52,8 @@ for flag, value in zip(args[::2], args[1::2]):
     if flag not in allowed or (flag in seen and flag != "--gguf"):
         raise SystemExit("Unsupported or repeated option: " + flag)
     seen.add(flag)
+    if flag == "--hc-dispatch" and value not in {"legacy", "production-check"}:
+        raise SystemExit("HC dispatch must be legacy or production-check")
     if flag not in {"--pack", "--gguf"}:
         continue
     path = Path(value)
@@ -103,6 +107,7 @@ PY
   printf 'PROBE_TRACKED_DIFF_SHA256 '; git -C "$ROOT" diff --binary HEAD -- | sha256sum
   git -C "$ROOT" status --short
   sha256sum "$ROOT/tests/hip/tp2_gdn_layer.cpp" "$ROOT/src/core/tp_gdn_layer.cpp" \
+    "$ROOT/src/kernels/cuda/fused_gr.cu" "$ROOT/include/strata/kernels/fused_gr.hpp" \
     "$ROOT/include/strata/core/tp_gdn_layer.hpp" "$ROOT/tools/run_tp2_model_probe_mi50.sh"
   image_id=$(sudo docker image inspect --format '{{.Id}}' "$IMAGE")
   printf 'PROBE_RESOLVED_IMAGE %s\n' "$image_id"
@@ -164,6 +169,31 @@ set +e
 STATUS=("${PIPESTATUS[@]}")
 RC=${STATUS[0]}
 if (( RC == 0 && STATUS[1] != 0 )); then RC=${STATUS[1]}; fi
+hc_dispatch=legacy
+args=("$@")
+for ((i=1; i+1<${#args[@]}; i+=2)); do
+  if [[ ${args[$i]} == --hc-dispatch ]]; then hc_dispatch=${args[$((i+1))]}; fi
+done
+if (( RC == 0 )) && [[ "$hc_dispatch" == production-check ]]; then
+  # Checked selection must precede phase samples, independently of the
+  # targeted numerical gate. This does not assert a full-model result.
+  awk '
+    /^HC_DISPATCH_SELECTED/ {
+      if ($0 !~ /^HC_DISPATCH_SELECTED policy=production-check device=[01] hc-variant=[123] hc-variant-name=(plain|split|staged) check-invoked=1$/) bad=1
+      if (($4=="hc-variant=1" && $5!="hc-variant-name=plain") ||
+          ($4=="hc-variant=2" && $5!="hc-variant-name=split") ||
+          ($4=="hc-variant=3" && $5!="hc-variant-name=staged")) bad=1
+      if (++selected[$3]!=1 || initialized) bad=1
+    }
+    /^HC_DISPATCH_INIT_PASS/ {
+      if ($0!="HC_DISPATCH_INIT_PASS policy=production-check devices=2 before-layer-setup=1" ||
+          selected["device=0"]!=1 || selected["device=1"]!=1 || initialized++) bad=1
+    }
+    /^PROBE_PHASE([[:space:]]|$)/ { if (!initialized) bad=1 }
+    /^PROBE_GATE PASS([[:space:]]|$)/ { gate=1 }
+    END { exit (bad || initialized!=1 || selected["device=0"]!=1 || selected["device=1"]!=1 || !gate) }
+  ' "$LOG" || { echo 'PROBE_ADMISSION_FAIL HC production selection missing, malformed or late; final probe gate required' | tee -a "$LOG"; RC=4; }
+fi
 if (( RC == 77 )); then echo 'SKIPPED is not a pass.' | tee -a "$LOG"; fi
 if (( RC == 124 || RC == 137 )); then echo 'Timeout/kill: inspect GPU state before another run.' | tee -a "$LOG"; fi
 printf 'TP2_MODEL_PROBE_EXIT=%s LOG=%s\n' "$RC" "$LOG" | tee -a "$LOG"

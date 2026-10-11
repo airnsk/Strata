@@ -39,7 +39,7 @@ void ck(cudaError_t e,const char* where) {
 }
 void on(int d) { ck(cudaSetDevice(d),"set device"); }
 struct Options {
-    std::vector<std::string> shards; std::string pack,execution="runtime";
+    std::vector<std::string> shards; std::string pack,execution="runtime",hc_dispatch="legacy";
     int layer=0,mode=8,warmup=3,trials=12,block_calls=16,block_trials=4; bool benchmark=false,calibrate=false,model_probe=false,inverse_probe=false,profile_flat=false,execution_explicit=false;
     bool warmup_explicit=false,trials_explicit=false,rccl_options_explicit=false;
     tp::TpGdnRcclOptions rccl;
@@ -60,6 +60,7 @@ Options parse(int argc,char**argv) {
         if(a=="--gguf") o.shards.push_back(v);
         else if(a=="--pack") o.pack=v;
         else if(a=="--execution"){o.execution=v;o.execution_explicit=true;}
+        else if(a=="--hc-dispatch")o.hc_dispatch=v;
         else if(a=="--rccl-library"){o.rccl.library=v;o.rccl_options_explicit=true;}
         else if(a=="--rccl-scenario"){o.rccl_scenario=v;o.rccl_options_explicit=true;}
         else if(a=="--rccl-timeout-ms"||a=="--rccl-init-timeout-ms"||a=="--rccl-launch-first"||a=="--rccl-delay-ms"){
@@ -76,10 +77,12 @@ Options parse(int argc,char**argv) {
             if(a=="--layer")o.layer=n;else if(a=="--mode")o.mode=n;else if(a=="--bench-warmup"){o.warmup=n;o.warmup_explicit=true;}else if(a=="--bench-trials"){o.trials=n;o.trials_explicit=true;}else if(a=="--bench-block-calls")o.block_calls=n;else o.block_trials=n;
         } else throw std::invalid_argument("unknown option "+a);
     }
+    if(o.hc_dispatch!="legacy"&&o.hc_dispatch!="production-check")
+        throw std::invalid_argument("--hc-dispatch requires legacy or production-check");
     if(o.shards.empty() || o.pack.empty() || o.layer<0 || o.layer>=48 || o.layer==1 || o.layer%4==3 ||
        (o.mode!=7 && o.mode!=8) || o.warmup<1 || o.warmup>100 || o.trials<2 || o.trials>1000 || o.block_calls<2 || o.block_calls>64 || o.block_trials<2 || o.block_trials>20 ||
        (o.execution!="runtime"&&o.execution!="consolidated"&&o.execution!="captured"&&o.execution!="flat"&&o.execution!="flat-hc"&&o.execution!="column"&&o.execution!="hybrid"&&o.execution!="hybrid-rccl"&&o.execution!="hybrid-inverse"&&o.execution!="all"))
-        throw std::invalid_argument("usage: tp2_gdn_layer --pack PACK --gguf SHARD [--gguf SHARD ...] [--layer non-PLE-GDN-index] [--mode 7|8] [--execution runtime|consolidated|captured|column|hybrid|hybrid-rccl|hybrid-inverse|flat|flat-hc|all] [--benchmark | --calibrate | --model-probe | --model-probe-inverse] [--bench-warmup 3] [--bench-trials 12] [--profile-stages] [--bench-block-calls 16] [--bench-block-trials 4]");
+        throw std::invalid_argument("usage: tp2_gdn_layer --pack PACK --gguf SHARD [--gguf SHARD ...] [--layer non-PLE-GDN-index] [--mode 7|8] [--hc-dispatch legacy|production-check] [--execution runtime|consolidated|captured|column|hybrid|hybrid-rccl|hybrid-inverse|flat|flat-hc|all] [--benchmark | --calibrate | --model-probe | --model-probe-inverse] [--bench-warmup 3] [--bench-trials 12] [--profile-stages] [--bench-block-calls 16] [--bench-block-trials 4]");
     if(o.execution=="hybrid-rccl"){
 #ifndef STRATA_TP2_GDN_RCCL
         throw std::invalid_argument("hybrid-rccl requires STRATA_TP2_GDN_RCCL_BUILD=ON");
@@ -109,6 +112,36 @@ Options parse(int argc,char**argv) {
             throw std::invalid_argument("--model-probe requires mode=8, warmup=1..16 and trials=2..64");
     }
     return o;
+}
+void hc_dispatch_startup(const Options& o) {
+    // Keep the output-changing overrides refused under both policies. Legacy
+    // deliberately does not initialize the selector, preserving old commands.
+    for(const char* flag:{"STRATA_GR_V3","STRATA_GR_SPLIT"}){
+        const char* value=std::getenv(flag);
+        if(value&&std::atoi(value)!=0)throw std::runtime_error(std::string("parity gate requires ")+flag+"=0 before process startup");
+        std::printf("HC_DISPATCH %s=%s effective=0\n",flag,value?value:"unset");
+    }
+    std::printf("HC_DISPATCH_SCOPE env=raw-process variant=effective-selection production-equivalence=selector-only\n");
+    for(const char* flag:{"STRATA_HC_PERSIST","STRATA_HC_SPLIT","STRATA_GR_FAST","STRATA_GR_V3","STRATA_GR_SPLIT",
+                         "STRATA_GR_DOWN_MAX4","STRATA_NO_MULTI_GR","STRATA_TSUM","STRATA_SM70_TABLE","STRATA_HC_Q8","STRATA_QFUSE"}){
+        const char* value=std::getenv(flag);std::printf("HC_DISPATCH_ENV %s=%s\n",flag,value?value:"unset");
+    }
+    int saved_device=0;ck(cudaGetDevice(&saved_device),"HC dispatch current device");
+    const bool checked=o.hc_dispatch=="production-check";
+    for(int d=0;d<2;++d){
+        on(d);
+        // Exactly the production Verifier::init selector, before layer setup,
+        // graph captures or timers. It may select plain/split/staged per card.
+        if(checked)k::fused_gr_check();
+        const int variant=k::fused_gr_variant();
+        if(variant<1||variant>3)throw std::runtime_error("unknown HC dispatch variant");
+        const char* name=variant==1?"plain":variant==2?"split":"staged";
+        std::printf("HC_DISPATCH_SELECTED policy=%s device=%d hc-variant=%d hc-variant-name=%s check-invoked=%d\n",o.hc_dispatch.c_str(),d,variant,name,int(checked));
+    }
+    on(saved_device);
+    // Initialization admission only: the void selector API can fall back to
+    // plain if its self-test cannot run. Numerical/timing gates still follow.
+    if(checked)std::printf("HC_DISPATCH_INIT_PASS policy=production-check devices=2 before-layer-setup=1\n");
 }
 void hc_source_metadata(const Options& o) {
     // GgufFile mmaps the source but only find()/shape/type directory entries are
@@ -1016,11 +1049,7 @@ int main(int argc,char** argv) {
         const auto o=parse(argc,argv);if(o.model_probe||o.execution=="hybrid-rccl"||o.execution=="hybrid-inverse")std::setvbuf(stdout,nullptr,_IOLBF,0);hc_source_metadata(o);int devices=0;ck(cudaGetDeviceCount(&devices),"device count");
         if(devices<2)throw std::runtime_error("two GPUs required; this is not a CPU or single-GPU pass");
         for(int d=0;d<2;++d){cudaDeviceProp prop{};ck(cudaGetDeviceProperties(&prop,d),"device properties");std::printf("device=%d name=%s\n",d,prop.name);int access=0;ck(cudaDeviceCanAccessPeer(&access,d,1-d),"P2P check");if(!access)throw std::runtime_error("bidirectional P2P required");}
-        for(const char* flag:{"STRATA_GR_V3","STRATA_GR_SPLIT"}){
-            const char* value=std::getenv(flag);
-            if(value&&std::atoi(value)!=0)throw std::runtime_error(std::string("parity gate requires ")+flag+"=0 before process startup");
-            std::printf("HC_DISPATCH %s=%s effective=0\n",flag,value?value:"unset");
-        }
+        hc_dispatch_startup(o);
         k::gr_set_native_mmvf(true);k::shared_expert_set_native_bf16(true);k::native_mmvq_set_multi_exact(true);k::native_expert_set_mode(o.mode,0);
         if(o.model_probe){model_probe(o);return 0;}
         if(o.execution=="hybrid-rccl"&&o.rccl_scenario!="normal"){rccl_fault_gate(o);return 0;}

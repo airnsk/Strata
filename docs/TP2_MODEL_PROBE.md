@@ -25,6 +25,26 @@ BUILD_JOBS=48 TP2_TIMEOUT=600 bash tools/run_tp2_model_probe_mi50.sh \
   --layer 0 --mode 8 --bench-warmup 1 --bench-trials 4
 ```
 
+That historical command keeps `--hc-dispatch legacy`: it does not call the
+production HC startup selector. With `STRATA_HC_SPLIT` unset, an unchecked device
+uses variant 1 (plain). Do not combine those HC phase measurements with production
+logs that selected split or staged.
+
+For a new dispatch-aligned baseline, add `--hc-dispatch production-check` to the
+same command. This calls the same `fused_gr_check()` as `Verifier::init` on both
+GPUs before layer setup, capture or timing. It logs the raw process HC/GR environment
+(an unset value is not a resolved backend default),
+then each device's selected variant (1=plain, 2=split, 3=staged) and
+`HC_DISPATCH_INIT_PASS`. The runner requires both checked selection records and
+initialization admission before phase samples, plus the existing `PROBE_GATE`.
+The selector may legitimately choose different variants or fall back to plain;
+the initialization marker does not claim that its optional self-test ran or that
+staged was selected. The kernel's own `strata hc:` lines report those details.
+Only compare HC timings when both logs establish compatible selected variants
+and environment. This option changes diagnostic startup only. It neither changes
+production defaults nor retroactively corrects old logs, and adds no new timing
+or performance result. The probe remains T=1/8 and has no inverse-plan candidate.
+
 The wrapper adds `--model-probe`. It refuses unrelated benchmark/execution flags
 and uses only the installed image
 `sha256:1947f7b9ea3514f137b3cabe5dc4f48ddabeb9c7bac78b4959a03b7dc7fcf4ca`.

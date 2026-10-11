@@ -162,11 +162,22 @@ CPU-only runner boundary checks:
 
 ```bash
 python tools/test_tp2_inverse_plan_runner.py
+python tools/test_tp2_hc_dispatch.py
 ```
 
 These mocks cover authorization, identity, read-only mounts, deadlines, cleanup,
 argument rejection, both synthetic-device gates, mandatory complete pair labels,
 profiling refusal and timing admission order. They do not execute HIP or Docker.
+
+The runner also accepts `--hc-dispatch production-check` to run production's HC
+selector on each GPU before layer setup/capture. It requires the per-device
+selected variants and `HC_DISPATCH_INIT_PASS` before benchmark samples, in
+addition to every existing inverse-plan gate. The default remains `legacy`,
+preserving historical unchecked selection. A selector may fall back to plain;
+initialization admission is not numerical or performance evidence. Do not merge
+measurements from different HC policies or selected variants. No corrected GPU
+measurement is supplied by this startup/provenance change. For the baseline-only
+T1/8 phase probe, use the dispatch option in [the model-probe runner](TP2_MODEL_PROBE.md).
 
 Related: [whole-GDN-layer reference gates](TP2_GDN_LAYER_TEST.md) and
 [earlier frozen model probes](TP2_MODEL_PROBE.md).

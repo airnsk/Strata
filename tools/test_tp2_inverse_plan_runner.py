@@ -47,6 +47,7 @@ class RunnerTests(unittest.TestCase):
             (self.repo / name).mkdir(parents=True)
         shutil.copy2(RUNNER, self.repo / "tools" / RUNNER.name)
         for name in ("CMakeLists.txt", "deps/llama.cpp/ggml/CMakeLists.txt", "tests/hip/tp2_gdn_layer.cpp",
+                     "src/kernels/cuda/fused_gr.cu", "include/strata/kernels/fused_gr.hpp",
                      "src/core/tp_gdn_layer.cpp", "include/strata/core/tp_gdn_layer.hpp",
                      "src/kernels/cuda/iq_kernels.cu", "src/kernels/cuda/verify_kernels.cu",
                      "src/kernels/cuda/native_down_plan.cuh",
@@ -197,6 +198,8 @@ elif args[0] == "ps" and os.environ.get("MOCK_CLEANUP_FAIL"):
         cases = [(["--execution", "hybrid"], {}), (["--benchmark", "1"], {}),
                  (["--layer", "1"], {}), (["--layer", "47"], {}), (["--layer", "08"], {}),
                  (["--mode", "9"], {}), (["--rccl-library", "/other"], {}),
+                 (["--hc-dispatch", "staged"], {}),
+                 (["--hc-dispatch", "legacy", "--hc-dispatch", "production-check"], {}),
                  (["--bench-trials", "1"], {}), (["--bench-block-calls", "65"], {}),
                  (["--bench-warmup", "101"], {}), (["--bench-block-trials", "21"], {}),
                  (["--mode", "8", "--mode", "8"], {}), (["--layer"], {}),
@@ -209,6 +212,17 @@ elif args[0] == "ps" and os.environ.get("MOCK_CLEANUP_FAIL"):
                 self.assertEqual(result.returncode, 2, saved)
                 self.assertFalse(self.calls.exists())
                 self.assertFalse(self.sudo_calls.exists())
+
+    def test_host_forwards_explicit_hc_policy_only(self):
+        for policy in (None, "legacy", "production-check"):
+            with self.subTest(policy=policy):
+                result, saved = self.host([] if policy is None else ["--hc-dispatch", policy])
+                self.assertEqual(result.returncode, 0, saved)
+                run = next(call for call in records(self.calls) if call[0] == "run")
+                if policy is None:
+                    self.assertNotIn("--hc-dispatch", run)
+                else:
+                    self.assertEqual(run[run.index("--hc-dispatch")+1], policy)
 
     def test_host_rejects_invalid_model_inputs(self):
         cases = [[], [str(self.models)], ["relative", *self.inputs[1:]],
@@ -352,6 +366,19 @@ if kind == "kernel":
     code=int(os.environ.get("MOCK_KERNEL_EXIT", "0"))
     if os.environ.get("MOCK_SECOND_KERNEL_EXIT") and device == "1": code=int(os.environ["MOCK_SECOND_KERNEL_EXIT"])
     sys.exit(code)
+hc_mode=os.environ.get("MOCK_HC_RECORD", "normal")
+def hc_records():
+    if hc_mode == "missing": return
+    for device in (0, 1):
+        if hc_mode == "missing-device" and device == 1: continue
+        logged_device=0 if hc_mode == "duplicate-device" else (2 if hc_mode == "wrong-device" and device == 1 else device)
+        policy="legacy" if hc_mode == "wrong-policy" else "production-check"
+        name="plain" if hc_mode == "wrong-name" else "staged"
+        checked=0 if hc_mode == "unchecked" else 1
+        print(f"HC_DISPATCH_SELECTED policy={{policy}} device={{logged_device}} hc-variant=3 hc-variant-name={{name}} check-invoked={{checked}}")
+    if hc_mode != "missing-init": print("HC_DISPATCH_INIT_PASS policy=production-check devices=2 before-layer-setup=1")
+    if hc_mode == "duplicate-init": print("HC_DISPATCH_INIT_PASS policy=production-check devices=2 before-layer-setup=1")
+if "--hc-dispatch" in args and args[args.index("--hc-dispatch")+1] == "production-check" and hc_mode != "late": hc_records()
 if os.environ.get("MOCK_EARLY_TIMING"): print("BENCH_SAMPLE forbidden premature timing")
 if os.environ.get("MOCK_BANKS", "1") == "1": print("INVERSE_PLAN_BANK_GATE_PASS T=1..8 owners=2 banks=2 fields=19")
 if os.environ.get("MOCK_EXACT", "1") == "1": print("INVERSE_PLAN_EXACT_GATE_PASS prefix_cases=44 continuation_cases=44")
@@ -363,6 +390,7 @@ for baseline in ("tp-hybrid-captured", "single-gpu-captured"):
             candidate="wrong-mode" if os.environ.get("MOCK_WRONG_LABEL") else "tp-hybrid-inverse"
             print(f"{{kind}} baseline={{baseline}} candidate={{candidate}} mode=hybrid T={{tokens}} pairs=2")
 if os.environ.get("MOCK_BENCH", "1") == "1": print("BENCH_GATE PASS test=CPU-mock")
+if hc_mode == "late": hc_records()
 sys.exit(int(os.environ.get("MOCK_NORMAL_EXIT", "0")))
 ''')
         executable(self.bin / "cmake", f'''#!{sys.executable}
@@ -427,6 +455,24 @@ exit 0
                           "native_down_plan_test", "native_down_plan_parity", "tp2_gdn_layer"])
         self.assertEqual(len([call for call in records(self.inner_calls) if call[0] == "host-gate"]), 7)
         self.assertIn(str(self.root / "inner-tmp/build-tp2-inverse-plan"), build)
+
+    def test_inner_production_hc_selection_is_required_before_timing(self):
+        result = self.inner(["--hc-dispatch", "production-check"])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        layer = next(call for call in records(self.inner_calls) if call[0] == "layer")
+        self.assertEqual(layer[layer.index("--hc-dispatch")+1], "production-check")
+        for mode in ("missing", "missing-device", "duplicate-device", "wrong-device", "wrong-policy",
+                     "wrong-name", "unchecked", "missing-init", "duplicate-init", "late"):
+            with self.subTest(mode=mode):
+                result = self.inner(["--hc-dispatch", "production-check"], MOCK_HC_RECORD=mode)
+                self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
+                self.assertIn("HC production selection", result.stderr)
+                self.assertNotIn(GATES, result.stdout)
+
+    def test_inner_legacy_does_not_require_new_hc_records(self):
+        for args in ([], ["--hc-dispatch", "legacy"]):
+            result = self.inner(args, MOCK_HC_RECORD="missing")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_inner_build_failure_never_launches(self):
         for env, code in (({"MOCK_CONFIGURE_EXIT": "33"}, 33), ({"MOCK_BUILD_EXIT": "34"}, 34),
