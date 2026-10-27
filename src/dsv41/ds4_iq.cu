@@ -518,9 +518,12 @@ template <int T, bool F = true> constexpr int kTabWords = F && Fast<T>::WORDS > 
 
 // Persistent grids (blocks looping over work items) only for the types with a codebook worth keeping in the block (8 KiB and
 // more); the others run a block (tile, group) as before - their blocks leave at once when the group is empty.
-#if defined(STRATA_USE_HIP)
+#if defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
 template <int T>
 constexpr bool kPersist = false;   // (HIP keeps the release grids)
+#elif defined(STRATA_HIP_GFX906)
+template <int T>
+constexpr bool kPersist = kTabWords<T> >= 256;   // (gfx906: IQ3_XXS/IQ2_XXS/IQ3_S/IQ2_XS/IQ2_S load codebook once per resident CTA)
 #else
 template <int T>
 constexpr bool kPersist = kTabWords<T> * 4 >= 8192;
@@ -1120,9 +1123,11 @@ bool tc_ok() {   // as ds4_gguf.cu's: sm_70 and later, STRATA_DS4_NO_TC=1 keeps 
 // its codebook loaded once; HIP keeps the full grid (one tile a block)
 template <auto Kernel>
 int resident_ctas() {   // (a static a kernel: the occupancy differs by the codebook's shared memory)
-#if defined(STRATA_USE_HIP)
+#if defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
     return 1 << 30;
 #else
+    static const bool persist_off = std::getenv("DS4_IQ_PERSIST") != nullptr && std::atoi(std::getenv("DS4_IQ_PERSIST")) == 0;
+    if (persist_off) return 1 << 30;
     static std::atomic<int> cache[16];
     int dev = 0;
     cudaGetDevice(&dev);

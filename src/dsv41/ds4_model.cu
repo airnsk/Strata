@@ -545,6 +545,11 @@ struct Chunk {
     uint16_t *x16 = nullptr, *qr16 = nullptr, *o16 = nullptr, *oa16 = nullptr, *lat16 = nullptr, *sh16 = nullptr,
              *h16 = nullptr, *eg_x16 = nullptr, *ext = nullptr, *w16 = nullptr, *emb = nullptr;
     size_t w16_elems = 0;
+    // wq_b's F16 copy, unpacked once a layer: gemm() would repack its 6 column slices for each of the chunk's
+    // 32 slabs (192 unpacks a layer-chunk); a slab reads this instead (one unpack - 84 MB of VRAM)
+    uint16_t* wq_b16 = nullptr;
+    size_t wq_b16_elems = 0;
+    const void* wq_b16_src = nullptr;
     int *ridx = nullptr, *topk = nullptr, *cand = nullptr, *bounds = nullptr, *row_tok = nullptr, *pos = nullptr;
     uint8_t* eg_rows = nullptr;
     int* bounds_pin = nullptr;   // pinned: the sort's bounds, read back
@@ -1286,6 +1291,11 @@ struct Model::Impl {
             if (chunks[i] && chunks[i]->blas) {
                 cudaSetDevice(devs[i].id);
                 cublasDestroy(chunks[i]->blas);
+            if (chunks[i] && chunks[i]->wq_b16 != nullptr) {
+                cudaSetDevice(devs[i].id);
+                cudaFree(chunks[i]->wq_b16);
+                chunks[i]->wq_b16 = nullptr;
+            }
             }
         quit.store(true);
         if (service.joinable()) service.join();
@@ -3179,6 +3189,46 @@ struct Model::Impl {
                 err = "cublasGemmEx: status " + std::to_string((int) st);
                 return false;
             }
+        }
+        return true;
+    }
+    // wq_b through its cached F16 copy: the pack unpacks it once a layer, the slabs read it in place.  false: the
+    // cache could not be taken (no room, a format gg::rows does not read) - the caller runs gemm(), as before
+    bool gemm_wq_b(Dev& d, Chunk& c, const x3::Mat& m, const uint16_t* x16, int ldx, int rows, float* y, int ldy,
+                   float beta, std::string& err) {
+        if (rows <= 0) return true;
+        static const bool off = std::getenv("DS4_NO_WQB_CACHE") != nullptr && std::atoi(std::getenv("DS4_NO_WQB_CACHE")) != 0;
+        if (off) return false;
+        if (m.raw == nullptr || m.fmt == 0 || m.k <= 0 || m.n <= 0) return false;   // (already F16: gemm is as good)
+        const size_t elems = (size_t) m.n * (size_t) m.k;
+        const void* key = (const void*) m.raw;
+        if (c.wq_b16 == nullptr || c.wq_b16_elems != elems) {
+            if (c.wq_b16 != nullptr) {
+                cudaSetDevice(d.id);
+                cudaFree(c.wq_b16);
+                c.wq_b16 = nullptr;
+            }
+            void* v = nullptr;
+            cudaSetDevice(d.id);
+            if (cudaMalloc(&v, align256(elems * sizeof(uint16_t))) != cudaSuccess) {
+                (void) cudaGetLastError();
+                return false;   // (no room: the slab-at-a-time path)
+            }
+            c.wq_b16 = (uint16_t*) v;
+            c.wq_b16_elems = elems;
+            c.wq_b16_src = nullptr;
+        }
+        if (c.wq_b16_src != key) {   // (a new layer's weight)
+            gg::rows(m, c.wq_b16, false, d.st);
+            c.wq_b16_src = key;
+        }
+        const float one = 1.0f;
+        const cublasStatus_t st = cublasGemmEx(c.blas, CUBLAS_OP_T, CUBLAS_OP_N, m.n, rows, m.k, &one, c.wq_b16,
+                                               CUDA_R_16F, m.k, x16, CUDA_R_16F, ldx, &beta, y, CUDA_R_32F, ldy,
+                                               CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        if (st != CUBLAS_STATUS_SUCCESS) {
+            err = "cublasGemmEx (wq_b cached): status " + std::to_string((int) st);
+            return false;
         }
         return true;
     }
@@ -7511,7 +7561,9 @@ struct Model::Impl {
         if (NHL == 0) CK(cudaMemsetAsync(c.acc, 0, (size_t) T * D * sizeof(*c.acc), s));   // (no heads)
         for (int a0 = 0; a0 < T && NHL > 0; a0 += c.A) {
             const int na = std::min(c.A, T - a0);
-            if (!gemm(d, c, l.wq_b, c.qr16 + (size_t) a0 * g.q_lora, g.q_lora, na, c.q, HQ, 0.0f, err)) return false;
+            if (!gemm_wq_b(d, c, l.wq_b, c.qr16 + (size_t) a0 * g.q_lora, g.q_lora, na, c.q, HQ, 0.0f, err) &&
+                !gemm(d, c, l.wq_b, c.qr16 + (size_t) a0 * g.q_lora, g.q_lora, na, c.q, HQ, 0.0f, err))
+                return false;
             Finish fr;
             fr.rd = g.rd;
             fr.pos = (int) (p0 + a0);
