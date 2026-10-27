@@ -50,6 +50,8 @@
 #define cudaStreamCaptureStatusActive hipStreamCaptureStatusActive
 #define cudaEventDisableTiming hipEventDisableTiming
 #define cudaEventBlockingSync hipEventBlockingSync
+#define cudaDeviceGetStreamPriorityRange hipDeviceGetStreamPriorityRange
+#define cudaStreamCreateWithPriority hipStreamCreateWithPriority
 #define cudaEventDefault hipEventDefault
 #define cudaHostAllocDefault hipHostMallocDefault
 #define cudaHostAllocPortable hipHostMallocPortable

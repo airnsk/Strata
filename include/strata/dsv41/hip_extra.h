@@ -4,6 +4,9 @@
 // (include/strata/hip_compat) does not map.  Force-included into the dsv41 targets only, so no other target changes.
 // The mappings are Project Maya's include/strata/hip_compat (MIT, third_party/project-maya/NOTICE.md).
 #pragma once
+#ifndef HIPBLAS_V2  // mi50-dsv41: GemmEx-variant accepting hipDataType (the shim maps the R-constants to it)
+#define HIPBLAS_V2
+#endif
 #include <hip/hip_runtime.h>
 #include <hipblas/hipblas.h>
 #ifndef __grid_constant__

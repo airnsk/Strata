@@ -13,6 +13,7 @@
 #define cublasDestroy hipblasDestroy
 #define cublasSetStream hipblasSetStream
 #define cublasGemmEx hipblasGemmEx
+#define cublasSgemm hipblasSgemm  // mi50-dsv41: ds4_model.cu's FP32 warm-flow GEMM
 #define CUBLAS_OP_N HIPBLAS_OP_N
 #define CUBLAS_OP_T HIPBLAS_OP_T
 #define CUBLAS_GEMM_DEFAULT HIPBLAS_GEMM_DEFAULT

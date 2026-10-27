@@ -379,7 +379,7 @@ target_link_libraries(strata-plan PRIVATE strata_plan)
 
 # ---- strata_core (GPU runtime) ---------------------------------------------
 # Only built when a GPU backend is on, so the Phase 1 targets keep working without a toolkit.
-if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP OR STRATA_HIP_GFX906)  # mi50-dsv41: caught via our own backend
   add_library(strata_core STATIC src/core/device.cu src/core/pinned.cu src/platform/memory.cpp src/core/graph.cpp src/core/weights.cpp
                                src/core/layout.cpp)
   target_include_directories(strata_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -877,7 +877,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # Its own executable for now (strata-dsv41); a family switch in `strata` comes after first light.  OFF by default: it
   # changes no existing target (the vendored kernels live in strata::dsv41k, so no symbol is shared with strata_kernels).
   option(STRATA_BUILD_DSV41 "Build the DeepSeek-V4.1 engine path (strata-dsv41)" OFF)
-  if(STRATA_BUILD_DSV41 AND NOT STRATA_HIP_GFX906)
+  if(STRATA_BUILD_DSV41)  # mi50-dsv41: gfx906 no longer excluded
     add_library(strata_dsv41_kernels STATIC src/dsv41/vendor/exl3.cu src/dsv41/vendor/sampler.cu src/dsv41/vendor/moe_win.cu
                 src/dsv41/vendor/exl3_cpu.cpp)
     if(NOT STRATA_ENABLE_HIP)   # (the pre-sm_80 NVIDIA decode kernels exl3.cu dispatches to)
@@ -926,12 +926,19 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     if(STRATA_NATIVE_EXPERTS)
       # the trellis experts (device kernels ds4_tq.cu, CPU lane ds4_tq_cpu.cpp) against a double reference; needs a GPU, no model
       # both test .cpp files launch kernels, so they compile as HIP on the AMD backend and as CUDA on the NVIDIA one
-      if(STRATA_ENABLE_HIP)
+      if(STRATA_ENABLE_HIP OR STRATA_HIP_GFX906)  # DSV41_TESTS_GFX906
         set(_ds4_test_lang HIP)
+        if(STRATA_HIP_GFX906)
+          set(_ds4_use_hip STRATA_USE_HIP=1)  # DSV41_USE_HIP_DEF
+        else()
+          set(_ds4_use_hip "")
+        endif()
       elseif(STRATA_ENABLE_CUDA)
         set(_ds4_test_lang CUDA)
+        set(_ds4_use_hip "")
       else()
         set(_ds4_test_lang CXX)
+        set(_ds4_use_hip "")
       endif()
       set_source_files_properties(tests/dsv41/tq_expert_test.cpp PROPERTIES LANGUAGE ${_ds4_test_lang})
       add_executable(ds4_tq_test tests/dsv41/tq_expert_test.cpp src/dsv41/ds4_tq.cu src/dsv41/ds4_iq.cu src/dsv41/ds4_tq_cpu.cpp
@@ -940,6 +947,9 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                                  ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/cpu)
       target_link_libraries(ds4_tq_test PRIVATE strata_kernels_cpu ${_strata_gpu_runtime_target} Threads::Threads)
       target_compile_definitions(ds4_tq_test PRIVATE STRATA_DSV41_TQ_CPU=1)
+      if(_ds4_use_hip)
+        target_compile_definitions(ds4_tq_test PRIVATE ${_ds4_use_hip})
+      endif()
       # the same with the plain-FMA tile instead of the gfx12 WMMA one (what CUDA and gfx11 builds run)
       add_executable(ds4_tq_test_portable tests/dsv41/tq_expert_test.cpp src/dsv41/ds4_tq.cu src/dsv41/ds4_iq.cu src/dsv41/ds4_tq_cpu.cpp
                      src/dsv41/ds4_iq_cpu.cpp src/dsv41/ds4_gg_cpu.cpp tools/trellis/tqenc.cpp)
@@ -947,10 +957,13 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                                  ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/cpu)
       target_link_libraries(ds4_tq_test_portable PRIVATE strata_kernels_cpu ${_strata_gpu_runtime_target} Threads::Threads)
       target_compile_definitions(ds4_tq_test_portable PRIVATE STRATA_DSV41_TQ_CPU=1 DS4_TQ_PORTABLE=1)
-      if(STRATA_ENABLE_HIP)
+      if(_ds4_use_hip)
+        target_compile_definitions(ds4_tq_test_portable PRIVATE ${_ds4_use_hip})
+      endif()
+      if(STRATA_ENABLE_HIP OR STRATA_HIP_GFX906)  # DSV41_TESTS_GFX906
         target_compile_options(ds4_tq_test_portable PRIVATE "$<$<COMPILE_LANGUAGE:HIP,CXX>:SHELL:-include ${CMAKE_CURRENT_SOURCE_DIR}/include/strata/dsv41/hip_extra.h>")
       endif()
-      if(STRATA_ENABLE_HIP)
+      if(STRATA_ENABLE_HIP OR STRATA_HIP_GFX906)  # DSV41_TESTS_GFX906
         target_compile_options(ds4_tq_test PRIVATE "$<$<COMPILE_LANGUAGE:HIP,CXX>:SHELL:-include ${CMAKE_CURRENT_SOURCE_DIR}/include/strata/dsv41/hip_extra.h>")
       endif()
       # the i-quant experts (ds4_iq.cu) against ggml's own decode of the same blocks + a double reference, device and CPU
@@ -962,7 +975,10 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                                  ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/cpu)
       target_link_libraries(ds4_iq_test PRIVATE strata_kernels_cpu ${_strata_gpu_runtime_target} Threads::Threads)
       target_compile_definitions(ds4_iq_test PRIVATE STRATA_DSV41_TQ_CPU=1)
-      if(STRATA_ENABLE_HIP)
+      if(_ds4_use_hip)
+        target_compile_definitions(ds4_iq_test PRIVATE ${_ds4_use_hip})
+      endif()
+      if(STRATA_ENABLE_HIP OR STRATA_HIP_GFX906)  # DSV41_TESTS_GFX906
         target_compile_options(ds4_iq_test PRIVATE "$<$<COMPILE_LANGUAGE:HIP,CXX>:SHELL:-include ${CMAKE_CURRENT_SOURCE_DIR}/include/strata/dsv41/hip_extra.h>")
       endif()
       # the kept conversations' .meta file and prefix matching (ds4_slotmeta.hpp): no GPU, no model
@@ -976,8 +992,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       target_include_directories(ds4_pick_rule_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41)
       target_compile_features(ds4_pick_rule_test PRIVATE cxx_std_17)
     endif()
-    if(STRATA_ENABLE_HIP)
+    if(STRATA_ENABLE_HIP OR STRATA_HIP_GFX906)  # DSV41_TESTS_GFX906
       foreach(_t strata_dsv41_kernels strata-dsv41)
+        if(STRATA_HIP_GFX906)
+          target_compile_definitions(${_t} PRIVATE STRATA_USE_HIP=1)  # DSV41_USE_HIP_DEF: Maya's own HIP branches
+        endif()
         target_compile_options(${_t} PRIVATE "$<$<COMPILE_LANGUAGE:HIP,CXX>:SHELL:-include ${CMAKE_CURRENT_SOURCE_DIR}/include/strata/dsv41/hip_extra.h>")
       endforeach()
     endif()
