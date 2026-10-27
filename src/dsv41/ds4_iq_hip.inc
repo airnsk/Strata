@@ -245,7 +245,9 @@ inline bool ok_device() {   // gfx12 unless STRATA_DS4_HIPK=0
         int c = capable[dev].load(std::memory_order_relaxed);
         if (c == 0) {
             cudaDeviceProp pr{};
-            const bool g = cudaGetDeviceProperties(&pr, dev) == cudaSuccess && (std::strncmp(pr.gcnArchName, "gfx12", 5) == 0 || std::strncmp(pr.gcnArchName, "gfx11", 5) == 0);
+            const bool g = cudaGetDeviceProperties(&pr, dev) == cudaSuccess && (std::strncmp(pr.gcnArchName, "gfx12", 5) == 0 ||
+                                                                              std::strncmp(pr.gcnArchName, "gfx11", 5) == 0 ||
+                                                                              std::strncmp(pr.gcnArchName, "gfx906", 6) == 0);
             c = g ? 1 : 2;
             capable[dev].store(c, std::memory_order_relaxed);
         }
@@ -257,8 +259,11 @@ inline bool ok_device() {   // gfx12 unless STRATA_DS4_HIPK=0
         const bool ok = cudaGetDeviceProperties(&prop, dev) == cudaSuccess;
         const bool gfx12 = ok && std::strncmp(prop.gcnArchName, "gfx12", 5) == 0;
         const bool gfx11 = ok && std::strncmp(prop.gcnArchName, "gfx11", 5) == 0;
+        const bool g906 = ok && std::strncmp(prop.gcnArchName, "gfx906", 6) == 0;
         const char* e = std::getenv("STRATA_DS4_HIPK");
         v = gfx12 && !(e != nullptr && e[0] == '0') ? 1 : 2;   // (on by default on gfx12; STRATA_DS4_HIPK=0 off)
+        // gfx906: the register-weights tiles on fdot2 (opt-in until measured: STRATA_DS4_HIPK=1)
+        if (g906) v = (e != nullptr && e[0] == '1') ? 3 : 2;
         // gfx11: the register-weights tiles only.  On by default on gfx1151 (Strix Halo: prompts +22..29% at the same KL, measured), opt-in
         // (STRATA_DS4_HIPK=1) on the other gfx11 parts, which were not measured; STRATA_DS4_HIPK=0 turns it off everywhere
         if (gfx11) {
@@ -278,6 +283,21 @@ inline bool is_g11() {
     int v = g[dev].load(std::memory_order_relaxed);
     if (v == 0) {
         v = cudaGetDeviceProperties(&prop, dev) == cudaSuccess && std::strncmp(prop.gcnArchName, "gfx11", 5) == 0 ? 1 : 2;
+        g[dev].store(v, std::memory_order_relaxed);
+    }
+    return v == 1;
+}
+
+// gfx906: no WMMA at all. The register-weights kernel runs there on fdot2 (v_dot2_f32_f16).
+inline bool is_g906() {
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (dev < 0 || dev >= 16) return false;
+    static std::atomic<int> g[16];
+    int v = g[dev].load(std::memory_order_relaxed);
+    if (v == 0) {
+        cudaDeviceProp prop{};
+        v = cudaGetDeviceProperties(&prop, dev) == cudaSuccess && std::strncmp(prop.gcnArchName, "gfx906", 6) == 0 ? 1 : 2;
         g[dev].store(v, std::memory_order_relaxed);
     }
     return v == 1;
@@ -304,7 +324,15 @@ inline bool launch(const SetArgs& a, cudaStream_t s) {
         if (((uintptr_t) (GU ? (const void*) a.xf : (const void*) a.xh) & 15) != 0) return false;
         static const int var = std::getenv("STRATA_DS4_HIPK") ? std::atoi(std::getenv("STRATA_DS4_HIPK")) : 0;
         if (is_g11() && var == 2) return false;   // (the shared-memory weights kernel is gfx12 only)
+        if (is_g906() && var == 2) return false;  // (gfx906 has no WMMA: only the register-weights tiles)
         if (var != 2) {   // 2: the shared-memory weights kernel
+#if defined(STRATA_HIP_GFX906)
+            // gfx906 build: no WMMA in device code - the register-weights tiles on fdot2, 32 rows x 128 columns,
+            // 128 threads (acc is 64 floats). The gate is STRATA_HIP_GFX906, NOT __gfx906__: that macro exists in
+            // BOTH passes, so host and device instantiate the same kernels. A device-only gate left the host pass
+            // calling a kernel the device pass never emitted - HIP then aborts with "Cannot find Symbol".
+            return runr<T, GU, 32, 4, 2>(a, s);
+#else
             static const int cfg = std::getenv("HIPK_CFG") ? std::atoi(std::getenv("HIPK_CFG")) : 0;
             if (cfg == 1 && a.max_rows <= 32) return runr<T, GU, 32, 4, 1>(a, s);
             if (cfg == 2 && a.max_rows <= 32) return runr<T, GU, 32, 8, 1>(a, s);
@@ -327,6 +355,7 @@ inline bool launch(const SetArgs& a, cudaStream_t s) {
             if (a.max_rows <= 32) return runr<T, GU, 32, 4, 2>(a, s);
             if (a.max_rows <= 64) return runr<T, GU, 64, 4, 2>(a, s);
             return runr<T, GU, 128, 8, 1>(a, s);
+#endif
         }
         if (a.max_rows <= 32) return run<T, GU, 32, 64, 2, 4>(a, s);
         if (a.max_rows <= 64) return run<T, GU, 64, 64, 2, 4>(a, s);

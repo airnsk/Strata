@@ -117,6 +117,60 @@ __global__ void __launch_bounds__(NW * 32) set_kernel_r(const SetArgs a, int dbg
 #else
         hv8 bf[NM][NTW];
 #endif
+#if defined(__gfx906__)
+        // gfx906: no WMMA. Every lane decodes its column's whole 16-value slice (both half-wave groups through
+        // step_dec) and dots it into its own 8 rows with v_dot2_f32_f16: 2 MAC an instruction, no barrier, no LDS weights.
+        auto step906 = [&](auto tt) {
+            constexpr int t = decltype(tt)::value;
+            constexpr int sub = t >> 1, ks = t & 1;
+            hv2 wv[NM][NTW][8];
+#pragma unroll
+            for (int m = 0; m < NM; ++m)
+#pragma unroll
+                for (int j = 0; j < NTW; ++j) {
+                    int ca0, ca1, cb0, cb1;
+                    float sa = 0.0f, sb = 0.0f;
+                    step_dec<T, t>(cur[m][j], s, 0, tab, ca0, ca1, sa);
+                    step_dec<T, t>(cur[m][j], s, 1, tab, cb0, cb1, sb);
+                    const hv2 ha = {(_Float16) sa, (_Float16) sa};
+                    const hv2 hb = {(_Float16) sb, (_Float16) sb};
+                    ((uint2*) wv[m][j])[0] = codes4(ca0, ha);
+                    ((uint2*) wv[m][j])[1] = codes4(ca1, ha);
+                    ((uint2*) wv[m][j])[2] = codes4(cb0, hb);
+                    ((uint2*) wv[m][j])[3] = codes4(cb1, hb);
+                }
+            const int kcol = sub * 32 + ks * 16;
+#pragma unroll
+            for (int i = 0; i < MT; ++i) {
+                const int r0 = i * 16 + 8 * hi;
+#pragma unroll
+                for (int q = 0; q < 8; ++q) {
+                    const int row = r0 + q;
+                    if (row >= nr) continue;
+                    hv2 xv[8];
+                    const _Float16* xp = &xs[b][row][kcol];
+                    ((uint4*) xv)[0] = *(const uint4*) xp;
+                    ((uint4*) xv)[1] = *(const uint4*) (xp + 8);
+#pragma unroll
+                    for (int m = 0; m < NM; ++m)
+#pragma unroll
+                        for (int j = 0; j < NTW; ++j) {
+                            float acc_ = acc[m][i][j][q];
+#pragma unroll
+                            for (int e = 0; e < 8; ++e) acc_ = __builtin_amdgcn_fdot2(wv[m][j][e], xv[e], acc_, false);
+                            acc[m][i][j][q] = acc_;
+                        }
+                }
+            }
+        };
+        step906(std::integral_constant<int, 0>{});
+        step906(std::integral_constant<int, 1>{});
+        step906(std::integral_constant<int, 2>{});
+        step906(std::integral_constant<int, 3>{});
+        if (s + 1 < nst) storex(R, b ^ 1);
+        __syncthreads();
+        return;
+#endif
         auto step = [&](auto tt) {
             constexpr int t = decltype(tt)::value;
             constexpr int sub = t >> 1, ks = t & 1;
