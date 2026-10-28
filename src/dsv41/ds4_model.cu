@@ -14,6 +14,7 @@
 // and after the last layer logits = head(rmsnorm(sum_s pre[s] h[s])).
 #include "ds4_model.hpp"
 #include "ds4_pick_rule.hpp"
+#include "ds4_yoco_pipeline.hpp"
 #include "ds4_experts_rule.hpp"
 #include "ds4_engram_io.hpp"
 
@@ -4836,6 +4837,21 @@ struct Model::Impl {
                           d.id, a, b, tp, (int) di == head_dev ? " + head" : "", d.weights / 1e9, d.experts / 1e9, ev, et,
                           d.caches / 1e9, fr / 1048576.0);
             s << line;
+            if (std::getenv("DS4_YOCO_PIPELINE_DIAG")) {
+                std::fprintf(stderr,"YOCO15_MEM gpu=%d total=%zu free=%zu weights=%zu experts=%zu caches=%zu scratch=%zu\n",
+                             d.id,tot,fr,d.weights,d.experts,d.caches,d.scratch);
+                if (di<chunks.size() && chunks[di]) {
+                    const Chunk& c=*chunks[di];
+                    std::fprintf(stderr,"YOCO15_WORK gpu=%d C=%d A=%d AI=%d ring_n=%d ring_stride=%zu wqb_elems=%zu\n",
+                                 d.id,c.C,c.A,c.AI,c.ring_n,c.ring_stride,c.wq_b16_elems);
+                }
+                for(const Layer& l:L) if(l.dev==(int)di)
+                    std::fprintf(stderr,"YOCO15_LAYER layer=%d gpu=%d grp=%d nm=%d slots=%d resident=%d unit=%zu src=%d kvsrc=%d ixsrc=%d\n",
+                                 l.il,d.id,l.grp,l.nm,l.n_slots,l.n_vram,unit(l),l.src,(int)l.kv_src,(int)l.ix_src);
+                for(const Src& sr:srcs)
+                    std::fprintf(stderr,"YOCO15_SOURCE gpu=%d layer=%d ckv=%d ik=%d remote=%d\n",
+                                 d.id,sr.layer,sr.ckv[di]!=nullptr,sr.ik[di]!=nullptr,(int)sr.remote);
+            }
         }
         int nh = 0;
         size_t hb_ = 0;
@@ -8081,6 +8097,8 @@ struct Model::Impl {
                         x.bytes[x.n++] = (size_t) ng * ik_rb();
                     }
                     if (x.n > 0) xfer_get(x, sr.flag(slot), wp.win, s);
+                    if (std::getenv("DS4_YOCO_PIPELINE_DIAG"))
+                        std::fprintf(stderr,"YOCO15_SOURCE_CONSUME_ENQUEUE gpu=%d k=%d source=%d rows=%d seq=%u\n",d.id,k,sr.layer,ng,wp.win);
                     set_flag(sr.x_ack + ((size_t) slot * devs.size() + di) * 32, wp.win, s);   // (taken, or none)
                 }
                 if (last_k && mi == 0 && g.n_mtp > 0) {   // the drafter's taps: the last chunk's last rows
@@ -8518,9 +8536,25 @@ struct Model::Impl {
         for (int il = 0; il < g.nl && yl < 0; ++il)
             if (g.ratios[(size_t) il] == 1) yl = il;
         if (yl <= 0 || !L[(size_t) yl].kv_src) return -1;
+        bool pipeline15 = false;
+        if (const char* flag = std::getenv("DS4_YOCO_PIPELINE15"); flag && std::atoi(flag)==1) {
+            // No approximate keep override is admitted by this prototype.
+            const char* keep_override = std::getenv("DS4_YOCO_KEEP");
+            if (yoco_mode()!=1 || keep_override != nullptr || g.win!=128 || devs.size()!=2 || groups.size()!=2)
+                return -1;
+            std::vector<int> dev(g.nl), nm(g.nl), grp(g.nl);
+            for(int il=0;il<g.nl;++il) {dev[il]=L[il].dev;nm[il]=L[il].nm;grp[il]=L[il].grp;}
+            pipeline15 = yoco_pipeline15_layout(g.nl,yl,dev.data(),nm.data(),grp.data());
+            if (!pipeline15) return -1;
+            // Source14 crosses the boundary; no compressed source after20
+            // crosses back to GPU0. Existing run_dev_chunks consumes every
+            // activation/source14 before its mandatory layers15..19.
+            if (!L[14].kv_src || L[14].ratio!=2 || L[15].src!=L[14].src || L[20].dev!=head_dev)
+                return -1;
+        }
         for (int il = 0; il < g.nl; ++il) {
             const Layer& l = L[(size_t) il];
-            if (l.nm != 1 || l.dev != L[0].dev) return -1;
+            if (l.nm != 1 || (!pipeline15 && l.dev != L[0].dev)) return -1;
             if (il > yl && (g.ratios[(size_t) il] != 1 || l.kv_src)) return -1;
         }
         return yl;
@@ -8568,6 +8602,10 @@ struct Model::Impl {
             run.yoco = yl;
             run.cut_k = a / per;
             run.cut_r = a - run.cut_k * per;
+        }
+        if (std::getenv("DS4_YOCO_PIPELINE_DIAG")) {
+            std::fprintf(stderr,"YOCO15_RUN n=%d pos=%lld chunks=%d per=%d yoco=%d keep=%d cut_k=%d cut_r=%d snap=%lld\n",
+                         n,(long long)pos,nc,per,run.yoco,keep,run.cut_k,run.cut_r,(long long)run.snap_pos);
         }
         logits_all = logits_rows > kWin;
         if (logits_all) chunk_logits.resize((size_t) n * g.vocab);
