@@ -1213,6 +1213,7 @@ struct Model::Impl {
     // hc_post), 2 router-side tail (shared expert), 3 experts (+ waits), 4 Engram, 5 attn mHC (mix, split, norm), 6 attention
     // projections (wq_a, wkv, compressor), 7 compressor + indexer, 8 q_b + rope, 9 sparse attention, 10 ffn mHC + router + sort
     double cprof_ms[16] = {};
+    double cprof_dev_ms[16][16] = {};   // [device][stage]: the same run's stages per card, not only their sum
     // DS4_PROF: the experts' kernels alone, by type (events around the gate/up and down calls of run_set)
     struct EkMark {
         cudaEvent_t e0, e1, e2;
@@ -1259,8 +1260,12 @@ struct Model::Impl {
             if (it != last.end()) {
                 float ms = 0.0f;
                 cudaSetDevice(m.d->id);
-                if (cudaEventElapsedTime(&ms, it->second, m.ev) == cudaSuccess)
-                    (prof_chunk ? cprof_ms : st.prof_ms)[m.stage] += ms;
+                if (cudaEventElapsedTime(&ms, it->second, m.ev) == cudaSuccess) {
+                    if (prof_chunk) {
+                        cprof_ms[m.stage] += ms;
+                        if (m.d->id >= 0 && m.d->id < 16) cprof_dev_ms[m.d->id][m.stage] += ms;
+                    } else st.prof_ms[m.stage] += ms;
+                }
                 it->second = m.ev;
             } else {
                 last.push_back({m.d, m.ev});
@@ -8678,6 +8683,15 @@ struct Model::Impl {
                 for (double v : cprof_ms) sum += v;
                 for (int i = 0; i < 11; ++i)
                     std::fprintf(stderr, "ds4 prof  %-34s %9.1f ms %5.1f%%\n", nm_[i], cprof_ms[i], sum > 0 ? 100.0 * cprof_ms[i] / sum : 0.0);
+                for (const Dev& dv : devs) {
+                    if (dv.id < 0 || dv.id >= 16) continue;
+                    double dsum = 0;
+                    for (double v : cprof_dev_ms[dv.id]) dsum += v;
+                    std::fprintf(stderr, "ds4 prof CUDA%d total %.1f ms\n", dv.id, dsum);
+                    for (int i = 0; i < 11; ++i)
+                        std::fprintf(stderr, "ds4 prof CUDA%d %-30s %9.1f ms %5.1f%%\n", dv.id, nm_[i],
+                                     cprof_dev_ms[dv.id][i], dsum > 0 ? 100.0 * cprof_dev_ms[dv.id][i] / dsum : 0.0);
+                }
                 struct Agg {
                     double ms = 0, flops = 0;
                     long calls = 0, rows = 0, experts = 0;
@@ -8717,6 +8731,8 @@ struct Model::Impl {
                 std::fprintf(stderr, "ds4 prof  expert kernels total %.1f ms\n", tot);
             }
             for (double& v : cprof_ms) v = 0;
+            for (auto& per_dev : cprof_dev_ms)
+                for (double& v : per_dev) v = 0;
             prof_chunk = false;
         }
         if (o.verbose || std::getenv("DS4_FLOW_STATS") != nullptr) {
