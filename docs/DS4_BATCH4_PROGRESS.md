@@ -174,3 +174,6 @@ already running window 9 binary; the next native build must include it.
 Optional HTTP prefill progress timestamps use a separate diagnostic JSONL file,
 so they cannot be confused with RNG draws. Actual-client CPU regression passed.
 A staggered HTTP prefill/decode probe is prepared but has not run.
+
+
+Window 9 GPU gate PASS at 2026-10-29 14:16:25 UTC: 480 bitwise full-logit/state comparisons; 32 partial prefill states; 96 common B4 steps. Three existing requests decode while a fourth prefills 512 tokens in 16-token quanta. Both reference and mixed execution use identical prefill partitions. Restoration began 14:16:27, server PID 272070; READY pending at this checkpoint. Evidence: /var/tmp/strata-batch4-1029-evidence/window9-summary.json and mixed-prefill-driver.log.
