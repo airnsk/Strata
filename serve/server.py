@@ -1203,6 +1203,9 @@ class StrataEngine:
         batch_wire = getattr(self, "batch_wire", None)
         line = None
         for line in proc.stdout:
+            if path := os.environ.get("STRATA_DS4_TEST_WIRE_LOG"):
+                with open(path, "a", encoding="utf-8") as capture:
+                    capture.write(line)
             # checked before batch routing: a fatal line is never a slot's own
             if line.startswith(FATAL_PREFIXES):
                 # release_gpu_waits invalidates the verifier, even if the native
@@ -1310,6 +1313,9 @@ class StrataEngine:
         done = False
         try:
             for line in proc.stdout:
+                if path := os.environ.get("STRATA_DS4_TEST_WIRE_LOG"):
+                    with open(path, "a", encoding="utf-8") as capture:
+                        capture.write(line)
                 out.put(line)
                 if line.startswith("READY"):
                     done = True

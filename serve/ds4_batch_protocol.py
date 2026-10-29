@@ -147,6 +147,23 @@ def stream_request(engine, ids, max_new, sampling, cancel, embeddings, error_typ
     allowed = {"temperature", "top_p", "top_k", "min_p", "seed"}
     if any(part.split("=")[0] not in allowed for part in keys.split()):
         raise ValueError("unsupported DS4 batch command option")
+    # One cancel/context object spans all transport segments of one HTTP request.
+    # Only delivered model tokens commit draws; server-inserted prompt tokens and
+    # queued tokens discarded when a segment closes do not advance this stream.
+    rng = getattr(cancel, "_strata_ds4_rng", None)
+    effective_seed = 0 if seed is None else seed
+    if rng is None:
+        rng = {"seed": effective_seed, "next": 0}
+        cancel._strata_ds4_rng = rng
+    elif rng["seed"] != effective_seed:
+        raise ValueError("DS4 logical request seed changed between segments")
+    counter = rng["next"]
+    if not 0 <= counter <= (2**64 - 1) - max_new:
+        raise ValueError("DS4 logical request RNG counter overflow")
+    if engine.info.get("batch_counter") == "1":
+        keys += f" counter={counter}"
+    elif counter:
+        raise ValueError("DS4 engine cannot preserve segmented RNG counter")
     wire, proc = engine.batch_wire, engine.proc
     ticket = wire.enqueue()
     lease = None
@@ -197,6 +214,7 @@ def stream_request(engine, ids, max_new, sampling, cancel, embeddings, error_typ
             if fields[0] == "BT2":
                 engine.last = {**engine.last, "generated": engine.last["generated"] + 1}
                 if not stopped:
+                    rng["next"] += 1
                     yield int(fields[3])
             elif fields[0] == "BPP2":
                 cancel._strata_batch_progress = (int(fields[3]), int(fields[4]))

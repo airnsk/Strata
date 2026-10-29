@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstring>
 #include <stdexcept>
+#include <fstream>
 namespace strata::ds4::test {
 inline int packed_long_test(Model& m) {
     std::string err;
@@ -12,6 +13,7 @@ inline int packed_long_test(Model& m) {
     };
     struct Snapshot {std::vector<float> logits;std::vector<uint8_t> state;int draw=-1;};
     std::array<std::vector<Snapshot>,4> ref;
+    std::array<Snapshot,4> prefill_ref;
     for(auto& q:ref)q.resize(129);
     int comparisons=0,bad=0,top1_changes=0,draw_changes=0,state_changes=0;
     double worst_abs=0,worst_rms=0,worst_kl=0;
@@ -49,6 +51,18 @@ inline int packed_long_test(Model& m) {
         top1_changes+=ri!=si;draw_changes+=s.draw!=r.draw;state_changes+=!bytes;
         if(changed || !bytes || s.draw!=r.draw) {
             if(bad++==0) {
+                if(const char* root=std::getenv("DS4_BATCH_TEST_ARTIFACTS")) {
+                    const std::string prefix=std::string(root)+"/first-diff";
+                    auto save=[&](const char* suffix,const void* data,size_t bytes){
+                        std::ofstream f(prefix+suffix,std::ios::binary);
+                        f.write(static_cast<const char*>(data),bytes);
+                        require(bool(f),"write first difference artifact");
+                    };
+                    save("-reference.state",r.state.data(),r.state.size());
+                    save("-actual.state",s.state.data(),s.state.size());
+                    save("-reference.logits",r.logits.data(),r.logits.size()*sizeof(float));
+                    save("-actual.logits",s.logits.data(),s.logits.size()*sizeof(float));
+                }
                 if(!bytes && r.state.size()==s.state.size()) {
                     const auto u64=[&](size_t at){uint64_t v=0;if(at+8<=r.state.size())std::memcpy(&v,r.state.data()+at,8);return v;};
                     size_t at=16+(size_t)u64(8);
@@ -57,7 +71,9 @@ inline int packed_long_test(Model& m) {
                         const size_t wb=(size_t)u64(at);at+=8;
                         if(at+wb>r.state.size())break;
                         if(std::memcmp(r.state.data()+at,s.state.data()+at,wb)!=0) {
-                            std::fprintf(stderr,"PACKED_LONG_FIRST_STATE layer=%d field=window\n",layer);break;
+                            size_t off=0;while(off<wb && r.state[at+off]==s.state[at+off])++off;
+                            std::fprintf(stderr,"PACKED_LONG_FIRST_STATE layer=%d field=window offset=%zu row=%zu pos=%lld\n",
+                                         layer,off,wb?off/(wb/128):0,(long long)m.pos());break;
                         }
                         at+=wb;if(at+8>r.state.size())break;
                         const size_t cb=(size_t)u64(at)*8;at+=8;
@@ -79,7 +95,7 @@ inline int packed_long_test(Model& m) {
             for(int i=0;i<lengths[q];++i)prompts[q].push_back(100+(i*17+q*31)%900);
             require(m.request_select(0,err),"select base");m.reset();
             require(m.feed(prompts[q].data(),lengths[q],1,err),"reference prefill");
-            m.checkpoint(0);
+            capture(prefill_ref[q]);m.checkpoint(0);
             for(int i=0;i<128;++i){
                 require(m.step(1300+q*7+i,true,err),"reference step");capture(ref[q][i]);
             }
@@ -101,7 +117,10 @@ inline int packed_long_test(Model& m) {
         require(!m.request_create(512,excess,err)&&excess==0,"fifth admission rejected");err.clear();
         for(int q=0;q<4;++q){
             require(m.request_select(ids[q],err),"select resident");
-            require(m.feed(prompts[q].data(),lengths[q],1,err),"resident prefill");m.checkpoint(0);
+            require(m.feed(prompts[q].data(),lengths[q],1,err),"resident prefill");
+            compare(prefill_ref[q],q,-1);
+            require(bad==0,"resident prefill differs before packed execution");
+            m.checkpoint(0);
         }
         // Exercise all 24 permutations repeatedly, with mixed absolute positions.
         std::array<int,4> order={0,1,2,3};
