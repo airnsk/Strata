@@ -5475,7 +5475,13 @@ struct Model::Impl : RequestHostState<strata::dsv41k::SpecList, kWin> {
         cudaSetDevice(d.id);
         CK(cudaMemcpyAsync(d.h,p.h,R*nh,cudaMemcpyDeviceToDevice,d.st));
         CK(cudaMemcpyAsync(d.a_pre,p.a_pre,R*np,cudaMemcpyDeviceToDevice,d.st));
-        WinPlan common;common.async=!sync_decode && R<=async_max_t;
+        WinPlan common;
+        // Batch size must not switch a request from the asynchronous routed
+        // arithmetic to the host-routed path. All supported speculative
+        // segments fit the existing async window; aggregate storage fits kWin.
+        const bool async_segments=f.speculative && std::all_of(f.counts.begin(),f.counts.begin()+B,
+            [&](int count){return count<=async_max_t;});
+        common.async=!sync_decode && (R<=async_max_t || async_segments);
         if(common.async) {
             common.seq[il]=++seq_issued;
             layer_of[seq_issued%kRing].store(il,std::memory_order_release);

@@ -8,6 +8,7 @@ int serve_batch4(strata::ds4::Model& m,const std::string& eos_list,float conf_mi
         uint64_t handle=0,epoch=0,counter=0;
         Req req;
         int read=0,generated=0,next=-1;
+        uint64_t rounds=0,offered=0,accepted=0;
         bool busy=false,decode=false,cancel=false,cool=false;
         double born=0,first=0,prompt_ms=0;
     };
@@ -29,6 +30,9 @@ int serve_batch4(strata::ds4::Model& m,const std::string& eos_list,float conf_mi
         // Completion and arena release precede BDONE2; this is a no-more-writes barrier.
         if(!m.request_release(s.handle,err))return false;
         s.handle=0;
+        if(spec_enabled)std::fprintf(stderr,"DS4_BATCH_SUMMARY slot=%d epoch=%llu rounds=%llu offered=%llu accepted=%llu emitted=%d\n",
+            b,(unsigned long long)s.epoch,(unsigned long long)s.rounds,(unsigned long long)s.offered,
+            (unsigned long long)s.accepted,s.generated);
         std::printf("BDONE2 %d %llu %s %d %.3f %.3f\n",b,(unsigned long long)s.epoch,
                     why,s.generated,s.prompt_ms,decode);std::fflush(stdout);
         s.busy=false;s.decode=false;s.cancel=false;
@@ -96,7 +100,7 @@ int serve_batch4(strata::ds4::Model& m,const std::string& eos_list,float conf_mi
                 std::printf("BERR2 %d %llu capacity_unavailable\n",b,(unsigned long long)epoch);std::fflush(stdout);err.clear();continue;
             }
             s.epoch=epoch;s.req=std::move(request);s.counter=s.req.rng_counter;
-            s.read=s.generated=0;s.next=-1;s.busy=true;s.decode=s.cancel=s.cool=false;
+            s.read=s.generated=0;s.rounds=s.offered=s.accepted=0;s.next=-1;s.busy=true;s.decode=s.cancel=s.cool=false;
             s.born=now_ms();s.first=s.prompt_ms=0;
         }
         if(quit)break;
@@ -140,6 +144,7 @@ int serve_batch4(strata::ds4::Model& m,const std::string& eos_list,float conf_mi
                 if(!m.verify_batch(requests,results,err)){quit=true;break;}
                 for(size_t i=0;i<owners.size();++i) {
                     const int b=owners[i];const auto& result=results[i];
+                    ++slots[b].rounds;slots[b].offered+=requests[i].drafts.size();slots[b].accepted+=result.accepted;
                     if(!m.request_select(slots[b].handle,err)||!m.logits(checked_logits)){quit=true;break;}
                     if(checked_logits.empty()||std::any_of(checked_logits.begin(),checked_logits.end(),
                         [](float value){return !std::isfinite(value);})) {

@@ -88,6 +88,13 @@ inline int resident_spec_test(Model& m, bool batched=false) {
                 if(!same || state!=ref.state || accepted!=ref.accepted || next!=ref.next) {
                     std::fprintf(stderr,"RESIDENT_SPEC_DIFF request=%d round=%d logits=%d state=%d accepted=%d/%d next=%d/%d\n",
                         q,r,int(same),int(state==ref.state),accepted,ref.accepted,next,ref.next);
+                    double sq=0,max_abs=0;
+                    if(logits.size()==ref.logits.size())for(size_t k=0;k<logits.size();++k) {
+                        double d=double(logits[k])-ref.logits[k];sq+=d*d;max_abs=std::max(max_abs,std::abs(d));
+                    }
+                    size_t first=0;while(first<state.size() && first<ref.state.size() && state[first]==ref.state[first])++first;
+                    std::fprintf(stderr,"RESIDENT_SPEC_BOUNDS max_abs=%.9g rms=%.9g first_state_byte=%zu sizes=%zu/%zu\n",
+                        max_abs,logits.empty()?0:std::sqrt(sq/logits.size()),first,state.size(),ref.state.size());
                     throw std::runtime_error("resident speculative parity");
                 }
                 counter[q]+=(uint64_t)accepted+1;token[q]=next;++comparisons;

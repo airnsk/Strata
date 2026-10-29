@@ -324,3 +324,27 @@ the user's request to shorten validation. Window 13 correctness plus a bounded
 HTTP four-stream/cancel check and one comparable measurement remain release
 conditions. Adaptive-profile arithmetic uncertainty remains a documented limit,
 not a claimed production correction.
+
+
+### 2026-10-29 17:30 UTC — window 13 actual result and bounded correction
+
+Serial resident sampled-q oracle PASS: 32 bitwise full-state/logit comparisons.
+Joint verify completed two 12-row groups but failed its first comparison
+(request 3, round 0). Accepted 3 and next token 270 matched. Numerical/state
+parity did not pass and DSpark was not deployed. Restoration began 17:23:07 UTC.
+
+Static inspection identified a dispatch mismatch: async_max_t defaults to 8.
+A solo six-row verify used async routed MoE while the aggregate 12-row frame
+selected host-routed MoE. The candidate now preserves the async route when all
+logical speculative segments individually qualify and total storage fits kWin.
+This is a concrete dispatch correction, not a change of weight/activation
+precision. Its sufficiency is pending the next GPU gate.
+
+To avoid an extra reload, the next native binary includes an optional
+STRATA_DS4_BATCH_SELFTEST build-time entry. DS4_BATCH_SELFTEST runs the joint
+oracle once after model load; it clears fixed-flow and diagnostic flags before
+entering the normal HTTP scheduler. Ordinary builds do not include this entry.
+The final window combines that gate with four HTTP streams, cancellation/reuse
+and one small matched original-service observation. Per-request native terminal
+summaries count rounds/offered/accepted/emitted tokens. HTTP chunk gaps are
+reported as such and not mislabeled token TPOT.

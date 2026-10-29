@@ -1188,6 +1188,10 @@ int spec_eval(strata::ds4::Model& m, const std::string& ids_path, int n, int win
 }
 }  // namespace
 
+#if defined(STRATA_DS4_BATCH_SELFTEST)
+#include "../../tests/dsv41/resident_spec_gpu.hpp"
+#endif
+
 #ifndef DS4_BUILD_ID
 #define DS4_BUILD_ID "unknown"
 #endif
@@ -1306,6 +1310,17 @@ int main(int argc, char** argv) {
     }
     if (!o.vision_only) std::fprintf(stderr, "%s", m.describe().c_str());
     if (const char* idle = std::getenv("DS4_TEST_IDLE_MS")) std::this_thread::sleep_for(std::chrono::milliseconds(std::atoi(idle)));   // (tests: a person typing)
+#if defined(STRATA_DS4_BATCH_SELFTEST)
+    if(std::getenv("DS4_BATCH_SELFTEST")) {
+        setenv("DS4_BATCH_TEST_FIXED_FLOW","1",1);
+        const int test_rc=strata::ds4::test::resident_spec_test(m,true);
+        unsetenv("DS4_BATCH_TEST_FIXED_FLOW");
+        unsetenv("DS4_BATCH_SPEC_TEST");
+        unsetenv("DS4_BATCH_DIAG");
+        unsetenv("DS4_BATCH_SELFTEST");
+        if(test_rc)return test_rc;
+    }
+#endif
     if (serve_mode && std::getenv("DS4_BATCH4") && std::atoi(std::getenv("DS4_BATCH4"))==1)
         return serve_batch4(m,eos,o.dspark_conf);
     if (serve_mode) return serve(m, eos, spec, o.dspark_conf, o.pack);
