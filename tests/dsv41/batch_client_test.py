@@ -27,6 +27,19 @@ with tempfile.TemporaryDirectory() as td:
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
             assert list(pool.map(run,range(4)))==[24]*4
         assert not any(engine.batch_wire.active)
+        barrier5=threading.Barrier(5)
+        def queued(seed):
+            cancel=threading.Event();barrier5.wait(timeout=5);out=[]
+            for token in engine.generate_batched([2,3],32,{"seed":seed},cancel):
+                if token is not None:
+                    out.append(token)
+                    if seed==9:cancel.set()
+            if seed!=9:assert out==[10+(seed+i)%40 for i in range(32)],(seed,out)
+            return len(out)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
+            result=list(pool.map(queued,range(5,10)))
+        assert result[:4]==[32]*4 and result[4]==1,result
+        assert not any(engine.batch_wire.active)
         for _ in range(2):
             cancel=threading.Event()
             stream=engine.generate_batched([1,2],64,{"seed":9},cancel)
@@ -35,6 +48,6 @@ with tempfile.TemporaryDirectory() as td:
             cancel.set()
             list(stream)
         assert not any(engine.batch_wire.active)
-        print("REAL_CLIENT_NATIVE_MOCK_PASS 4 concurrent streams; request-local last; cancel/reuse; no legacy migration")
+        print("REAL_CLIENT_NATIVE_MOCK_PASS 4 concurrent streams; request-local last; cancel/reuse; fifth waiter; no legacy migration")
     finally:
         engine.close()
