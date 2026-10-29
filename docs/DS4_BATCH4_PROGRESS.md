@@ -149,3 +149,28 @@ Evidence: http-rng-driver.log, http-rng-native.stdout.segments.jsonl, http-rng-*
 
 
 Window 8 restoration verified at 2026-10-29 14:04:27 UTC: READY since 13:56:58, server 269150 / engine 269158, original binary and config SHA256 unchanged, health loaded. Driver smoke returned 4. Mixed-prefill isolated harness compile/link passed; GPU execution pending. It compares identical 16-token prefill partitions, not optimized full-chunk prefill. Fixed-profile parity is a diagnostic oracle, not a production adaptive-profile fix.
+
+
+### Why the learned prefill profile is part of the numerical control
+Static code audit (not a measured first-kernel attribution): `flow_spec` sorts likely
+host experts from `prof` and assigns virtual slots in that order. `flow_layer`
+forms fixed stream batches and interleaves resident sets between them; `run_set`
+groups these slots under the workspace row cap, computes each set and adds its
+contributions into the accumulator. Thus a changed profile can change both
+accumulation partition/order and the maximum rows passed to expert dispatch.
+It does not directly change the router's selected expert IDs or weights.
+Downstream routing can nevertheless change after floating-point differences.
+The exact first mechanism for window 6 has not been kernel-localized, and this
+audit must not be presented as that measurement. The window 7 fixed-profile
+oracle only establishes state isolation under the same numerical control; it
+does not make adaptive production behavior tenant-invariant. A long B1/B1
+comparison under different profiles remains an explicit outstanding control.
+
+
+The saved-conversation admission now checks the active resident arena capacity,
+not only the model-wide maximum. The shared helper passed boundary tests at
+128/129, zero, negative and mismatched stored positions. This is not in the
+already running window 9 binary; the next native build must include it.
+Optional HTTP prefill progress timestamps use a separate diagnostic JSONL file,
+so they cannot be confused with RNG draws. Actual-client CPU regression passed.
+A staggered HTTP prefill/decode probe is prepared but has not run.

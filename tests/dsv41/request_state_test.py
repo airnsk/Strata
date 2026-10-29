@@ -12,6 +12,12 @@ source=r'''
 using namespace strata::ds4;
 struct Probability { int n=0; };
 int main() {
+    assert(request_saved_position_fits(128,128,128));
+    assert(!request_saved_position_fits(128,129,129));
+    assert(!request_saved_position_fits(128,0,0));
+    assert(!request_saved_position_fits(128,-1,UINT64_MAX));
+    assert(!request_saved_position_fits(128,127,128));
+    assert(request_saved_position_fits(262144,262144,262144));
     using State=RequestHostState<Probability,16>;
     State a,b;
     a.pos=129;a.toks={7,8};a.ctoks={70,80};a.ck[0].pos=128;

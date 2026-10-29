@@ -8,6 +8,10 @@
 
 namespace strata::ds4 {
 
+inline bool request_saved_position_fits(int64_t capacity, int64_t position, uint64_t stored) {
+    return position > 0 && position <= capacity && stored == static_cast<uint64_t>(position);
+}
+
 // Non-owning device views. An execution lane binds one request's views;
 // allocations belong to a resident request arena, not to copied Layer weights.
 struct LayerRequestViews {

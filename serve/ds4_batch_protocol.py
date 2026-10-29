@@ -232,6 +232,14 @@ def stream_request(engine, ids, max_new, sampling, cancel, embeddings, error_typ
                     yield int(fields[3])
             elif fields[0] == "BPP2":
                 cancel._strata_batch_progress = (int(fields[3]), int(fields[4]))
+                # Separate diagnostic file: progress is not an RNG draw or segment.
+                trace = os.environ.get("STRATA_DS4_TEST_WIRE_LOG")
+                if trace:
+                    record = {"time":time.monotonic(), "logical":rng["logical"],
+                              "slot":slot, "epoch":epoch,
+                              "done":int(fields[3]), "total":int(fields[4])}
+                    with _trace_lock, open(trace+".progress.jsonl","a",encoding="utf-8") as f:
+                        f.write(json.dumps(record)+"\n")
             elif fields[0] == "BERR2":
                 raise ValueError("native batch admission: " + fields[3])
             elif fields[0] == "BDONE2":

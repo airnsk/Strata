@@ -5732,7 +5732,8 @@ struct Model::Impl : RequestHostState<strata::dsv41k::SpecList, kWin> {
                 return false;
             }
         }
-        if (n != (uint64_t) n_pos || n_pos <= 0 || n_pos > o.max_context || !room((size_t) n * 4)) {
+        const int64_t restore_capacity = active_request ? resident[active_request].capacity : o.max_context;
+        if (!request_saved_position_fits(restore_capacity, n_pos, n) || !room((size_t) n * 4)) {
             err = "the conversation's position is not this prompt's";
             return false;
         }
