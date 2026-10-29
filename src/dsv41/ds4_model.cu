@@ -14,6 +14,7 @@
 // and after the last layer logits = head(rmsnorm(sum_s pre[s] h[s])).
 #include "ds4_model.hpp"
 #include "ds4_request_state.hpp"
+#include "ds4_batch_execution.hpp"
 #include "ds4_pick_rule.hpp"
 #include "ds4_yoco_pipeline.hpp"
 #include "ds4_experts_rule.hpp"
@@ -5184,6 +5185,8 @@ struct Model::Impl : RequestHostState<strata::dsv41k::SpecList, kWin> {
     std::array<Resident,5> resident;
     unsigned active_request = 0;
     bool resident_initialized = false;
+    std::atomic<bool> batch_cpu_accounting{false};
+    BatchExecutionAccounting batch_execution_accounting;
     bool request_sync(std::string& err) {
         for(auto& b:eg_win) if(b->live) eg_finish(*b);
         for(auto& d:devs) {
@@ -5208,6 +5211,7 @@ struct Model::Impl : RequestHostState<strata::dsv41k::SpecList, kWin> {
         for(const auto& l:L) base.layers.push_back(static_cast<const LayerRequestViews&>(l));
         for(const auto& s:srcs) base.sources.push_back(static_cast<const SourceRequestViews&>(s));
         base.logits=devs[head_dev].logits;
+        batch_cpu_accounting.store(true,std::memory_order_release);
         resident_initialized=true;return true;
     }
     template<class T>
@@ -5272,7 +5276,18 @@ struct Model::Impl : RequestHostState<strata::dsv41k::SpecList, kWin> {
         }
         if(slot==active_request) return true;
         if(spec_win || drafts_q) {err="cannot switch an unfinished speculative round";return false;}
-        if(!request_sync(err)) return false;
+        if(request_binding_device<0) {
+            if(!request_sync(err)) return false;
+        } else {
+            // One enqueue owner. Other-device kernels already captured their
+            // pointers. CPU mailbox accounting never writes this movable host state.
+            for(auto& work:eg_win)if(work->live)eg_finish(*work);
+            auto& bind_dev=devs[(size_t)request_binding_device];
+            cudaSetDevice(bind_dev.id);
+            if(cudaStreamSynchronize(bind_dev.st)!=cudaSuccess) {
+                err="pipeline binding stream completion failed";return false;
+            }
+        }
         for(size_t i=0;i<L.size();++i) resident[active_request].layers[i]=static_cast<LayerRequestViews&>(L[i]);
         for(size_t i=0;i<srcs.size();++i) resident[active_request].sources[i]=static_cast<SourceRequestViews&>(srcs[i]);
         resident[active_request].host=std::move(static_cast<HostRequest&>(*this));
@@ -5303,10 +5318,13 @@ struct Model::Impl : RequestHostState<strata::dsv41k::SpecList, kWin> {
         float *h=nullptr,*pre=nullptr,*a_pre=nullptr;
         int *topk=nullptr,*cand=nullptr;
     };
-    std::vector<PackedRows> packed;
+    std::vector<PackedRows> packed,packed_other;
+    int request_binding_device=-1;
+    bool packed_pipeline_live=false;
     bool packed_failed=false;
     uint64_t packed_steps=0,packed_rows=0;
-    bool packed_init(std::string& err) {
+    bool packed_init(std::string& err,int frame=0) {
+        auto& packed=frame==0?this->packed:packed_other;
         if(packed_failed) {err="packed workspace unavailable after allocation failure";return false;}
         if(packed.size()==devs.size()) return true;
         packed_failed=true;packed.resize(devs.size());
@@ -5323,15 +5341,29 @@ struct Model::Impl : RequestHostState<strata::dsv41k::SpecList, kWin> {
     // remains segmented and uses the unchanged single-request kernels. This
     // correctness-first path is deliberately serialized at binding boundaries;
     // it is not the later overlapping 2+2 pipeline.
-    bool decode_batch(const std::vector<uint64_t>& ids,const std::vector<int>& tk,std::string& err) {
-        const int B=(int)ids.size(),D=g.dim,H=g.hc;
-        if(B<1 || B>4 || tk.size()!=ids.size() || !resident_initialized) {
-            err="packed decode needs 1..4 resident rows";return false;
-        }
+    // A frame owns row identities/plans/taps until all submitted device work retires.
+    // The default caller still runs one frame to completion with the original barriers.
+    struct PackedFrame {
+        std::vector<uint64_t> ids;
+        std::vector<int> tokens;
         std::array<unsigned,4> slots{};
         std::array<int64_t,4> positions{};
         std::array<WinPlan,4> plans;
         std::array<std::vector<float>,4> taps;
+        std::vector<PackedRows>* workspace=nullptr;
+        int cur=0;
+        bool started=false,completed=false;
+    };
+    bool packed_prepare(PackedFrame& f,std::string& err) {
+        const auto& ids=f.ids; const auto& tk=f.tokens;
+        const int B=(int)ids.size(),D=g.dim,H=g.hc;
+        auto& slots=f.slots;auto& positions=f.positions;auto& plans=f.plans;auto& taps=f.taps;
+        int& cur=f.cur;
+        auto& packed=*f.workspace;
+        const size_t nh=(size_t)H*D*4,np=8*4,nk=topk_stride()*4,nc=cand_stride()*4;
+        if(B<1 || B>4 || tk.size()!=ids.size() || !resident_initialized) {
+            err="packed decode needs 1..4 resident rows";return false;
+        }
         // Validate the entire batch before mutating any history.
         for(int q=0;q<B;++q) {
             const unsigned sl=(unsigned)(ids[q]&255);slots[q]=sl;
@@ -5345,15 +5377,11 @@ struct Model::Impl : RequestHostState<strata::dsv41k::SpecList, kWin> {
             positions[q]=h.pos;
             taps[q].resize((size_t)g.d_targets.size()*D);
         }
-        if(!packed_init(err)) return false;
-        bool completed=false;
-        struct FailBatch {
-            Impl& owner;const std::array<unsigned,4>& slots;int n;bool& completed;
-            ~FailBatch(){if(!completed)for(int i=0;i<n;++i)owner.resident[slots[i]].poisoned=true;}
-        } fail{*this,slots,B,completed};
+        if(!packed_init(err,f.workspace==&packed_other?1:0)) return false;
+        f.started=true;
+        if(packed_pipeline_live)request_binding_device=L[0].dev;
         prof_window=false;
-        const size_t nh=(size_t)H*D*4,np=8*4,nk=topk_stride()*4,nc=cand_stride()*4;
-        int cur=L[0].dev;
+        cur=L[0].dev;
         for(int q=0;q<B;++q) {
             if(!request_select(ids[q],err)) return false;
             slot_held=false;logits_all=false;chunk_logits.clear();
@@ -5368,62 +5396,80 @@ struct Model::Impl : RequestHostState<strata::dsv41k::SpecList, kWin> {
             CK(cudaMemsetAsync(p.topk+(size_t)q*topk_stride(),0,nk,d.st));
             CK(cudaMemsetAsync(p.cand+(size_t)q*cand_stride(),0,nc,d.st));
         }
-        for(int il=0;il<g.nl;++il) {
-            const int di=L[il].dev;
-            if(di!=cur) {
-                auto& a=devs[cur];auto& b=devs[di];auto& x=packed[cur];auto& y=packed[di];
-                cudaSetDevice(a.id);auto* bb=a.bounce;
-                CK(cudaMemcpyAsync(bb,x.h,B*nh,cudaMemcpyDeviceToHost,a.st));
-                CK(cudaMemcpyAsync(bb+B*nh,x.pre,B*np,cudaMemcpyDeviceToHost,a.st));
-                CK(cudaMemcpyAsync(bb+B*(nh+np),x.topk,B*nk,cudaMemcpyDeviceToHost,a.st));
-                CK(cudaMemcpyAsync(bb+B*(nh+np+nk),x.cand,B*nc,cudaMemcpyDeviceToHost,a.st));
-                CK(cudaEventRecord(a.ev_out,a.st));cudaSetDevice(b.id);
-                CK(cudaStreamWaitEvent(b.st,a.ev_out,0));
-                CK(cudaMemcpyAsync(y.h,bb,B*nh,cudaMemcpyHostToDevice,b.st));
-                CK(cudaMemcpyAsync(y.pre,bb+B*nh,B*np,cudaMemcpyHostToDevice,b.st));
-                CK(cudaMemcpyAsync(y.topk,bb+B*(nh+np),B*nk,cudaMemcpyHostToDevice,b.st));
-                CK(cudaMemcpyAsync(y.cand,bb+B*(nh+np+nk),B*nc,cudaMemcpyHostToDevice,b.st));
-                cur=di;
-            }
-            auto& d=devs[di];auto& p=packed[di];
-            for(int q=0;q<B;++q) {
-                if(!request_select(ids[q],err)) return false;
-                cudaSetDevice(d.id);
-                CK(cudaMemcpyAsync(d.h,p.h+(size_t)q*H*D,nh,cudaMemcpyDeviceToDevice,d.st));
-                CK(cudaMemcpyAsync(d.pre,p.pre+(size_t)q*8,np,cudaMemcpyDeviceToDevice,d.st));
-                CK(cudaMemcpyAsync(d.topk,p.topk+(size_t)q*topk_stride(),nk,cudaMemcpyDeviceToDevice,d.st));
-                CK(cudaMemcpyAsync(d.cand,p.cand+(size_t)q*cand_stride(),nc,cudaMemcpyDeviceToDevice,d.st));
-                if(L[il].eg>=0) {
-                    auto& b=*eg_win[(size_t)L[il].eg];if(b.live)eg_finish(b);
-                    eg_issue(positions[q],1,L[il].eg,nullptr,b);
-                }
-                const bool capture=std::find(g.d_targets.begin(),g.d_targets.end(),il)!=g.d_targets.end();
-                if(capture) {
-                    std::copy(taps[q].begin(),taps[q].end(),h_taps);
-                    if(!tap(d,il,1,err))return false;
-                }
-                if(!layer(L[il],0,positions[q],1,plans[q],err,true)) return false;
-                CK(cudaMemcpyAsync(p.h+(size_t)q*H*D,d.h,nh,cudaMemcpyDeviceToDevice,d.st));
-                CK(cudaMemcpyAsync(p.a_pre+(size_t)q*8,d.a_pre,np,cudaMemcpyDeviceToDevice,d.st));
-                CK(cudaMemcpyAsync(p.topk+(size_t)q*topk_stride(),d.topk,nk,cudaMemcpyDeviceToDevice,d.st));
-                CK(cudaMemcpyAsync(p.cand+(size_t)q*cand_stride(),d.cand,nc,cudaMemcpyDeviceToDevice,d.st));
-                if(capture) {
-                    CK(cudaStreamSynchronize(d.st));
-                    std::copy(h_taps,h_taps+taps[q].size(),taps[q].begin());
-                }
-            }
-            cudaSetDevice(d.id);
-            CK(cudaMemcpyAsync(d.h,p.h,B*nh,cudaMemcpyDeviceToDevice,d.st));
-            CK(cudaMemcpyAsync(d.a_pre,p.a_pre,B*np,cudaMemcpyDeviceToDevice,d.st));
-            WinPlan common;common.async=!sync_decode && B<=async_max_t;
-            if(common.async) {
-                common.seq[il]=++seq_issued;
-                layer_of[seq_issued%kRing].store(il,std::memory_order_release);
-            }
-            if(!layer_moe(L[il],0,B,common,err)) return false;
-            CK(cudaMemcpyAsync(p.h,d.h,B*nh,cudaMemcpyDeviceToDevice,d.st));
-            CK(cudaMemcpyAsync(p.pre,d.pre,B*np,cudaMemcpyDeviceToDevice,d.st));
+        return true;
+    }
+    bool packed_layer(PackedFrame& f,int il,std::string& err) {
+        const auto& ids=f.ids; const auto& tk=f.tokens;
+        const int B=(int)ids.size(),D=g.dim,H=g.hc;
+        auto& slots=f.slots;auto& positions=f.positions;auto& plans=f.plans;auto& taps=f.taps;
+        int& cur=f.cur;
+        auto& packed=*f.workspace;
+        const size_t nh=(size_t)H*D*4,np=8*4,nk=topk_stride()*4,nc=cand_stride()*4;
+        const int di=L[il].dev;
+        if(packed_pipeline_live)request_binding_device=di;
+        if(di!=cur) {
+            auto& a=devs[cur];auto& b=devs[di];auto& x=packed[cur];auto& y=packed[di];
+            cudaSetDevice(a.id);auto* bb=a.bounce;
+            CK(cudaMemcpyAsync(bb,x.h,B*nh,cudaMemcpyDeviceToHost,a.st));
+            CK(cudaMemcpyAsync(bb+B*nh,x.pre,B*np,cudaMemcpyDeviceToHost,a.st));
+            CK(cudaMemcpyAsync(bb+B*(nh+np),x.topk,B*nk,cudaMemcpyDeviceToHost,a.st));
+            CK(cudaMemcpyAsync(bb+B*(nh+np+nk),x.cand,B*nc,cudaMemcpyDeviceToHost,a.st));
+            CK(cudaEventRecord(a.ev_out,a.st));cudaSetDevice(b.id);
+            CK(cudaStreamWaitEvent(b.st,a.ev_out,0));
+            CK(cudaMemcpyAsync(y.h,bb,B*nh,cudaMemcpyHostToDevice,b.st));
+            CK(cudaMemcpyAsync(y.pre,bb+B*nh,B*np,cudaMemcpyHostToDevice,b.st));
+            CK(cudaMemcpyAsync(y.topk,bb+B*(nh+np),B*nk,cudaMemcpyHostToDevice,b.st));
+            CK(cudaMemcpyAsync(y.cand,bb+B*(nh+np+nk),B*nc,cudaMemcpyHostToDevice,b.st));
+            cur=di;
         }
+        auto& d=devs[di];auto& p=packed[di];
+        for(int q=0;q<B;++q) {
+            if(!request_select(ids[q],err)) return false;
+            cudaSetDevice(d.id);
+            CK(cudaMemcpyAsync(d.h,p.h+(size_t)q*H*D,nh,cudaMemcpyDeviceToDevice,d.st));
+            CK(cudaMemcpyAsync(d.pre,p.pre+(size_t)q*8,np,cudaMemcpyDeviceToDevice,d.st));
+            CK(cudaMemcpyAsync(d.topk,p.topk+(size_t)q*topk_stride(),nk,cudaMemcpyDeviceToDevice,d.st));
+            CK(cudaMemcpyAsync(d.cand,p.cand+(size_t)q*cand_stride(),nc,cudaMemcpyDeviceToDevice,d.st));
+            if(L[il].eg>=0) {
+                auto& b=*eg_win[(size_t)L[il].eg];if(b.live)eg_finish(b);
+                eg_issue(positions[q],1,L[il].eg,nullptr,b);
+            }
+            const bool capture=std::find(g.d_targets.begin(),g.d_targets.end(),il)!=g.d_targets.end();
+            if(capture) {
+                std::copy(taps[q].begin(),taps[q].end(),h_taps);
+                if(!tap(d,il,1,err))return false;
+            }
+            if(!layer(L[il],0,positions[q],1,plans[q],err,true)) return false;
+            CK(cudaMemcpyAsync(p.h+(size_t)q*H*D,d.h,nh,cudaMemcpyDeviceToDevice,d.st));
+            CK(cudaMemcpyAsync(p.a_pre+(size_t)q*8,d.a_pre,np,cudaMemcpyDeviceToDevice,d.st));
+            CK(cudaMemcpyAsync(p.topk+(size_t)q*topk_stride(),d.topk,nk,cudaMemcpyDeviceToDevice,d.st));
+            CK(cudaMemcpyAsync(p.cand+(size_t)q*cand_stride(),d.cand,nc,cudaMemcpyDeviceToDevice,d.st));
+            if(capture) {
+                CK(cudaStreamSynchronize(d.st));
+                std::copy(h_taps,h_taps+taps[q].size(),taps[q].begin());
+            }
+        }
+        cudaSetDevice(d.id);
+        CK(cudaMemcpyAsync(d.h,p.h,B*nh,cudaMemcpyDeviceToDevice,d.st));
+        CK(cudaMemcpyAsync(d.a_pre,p.a_pre,B*np,cudaMemcpyDeviceToDevice,d.st));
+        WinPlan common;common.async=!sync_decode && B<=async_max_t;
+        if(common.async) {
+            common.seq[il]=++seq_issued;
+            layer_of[seq_issued%kRing].store(il,std::memory_order_release);
+        }
+        if(!layer_moe(L[il],0,B,common,err)) return false;
+        CK(cudaMemcpyAsync(p.h,d.h,B*nh,cudaMemcpyDeviceToDevice,d.st));
+        CK(cudaMemcpyAsync(p.pre,d.pre,B*np,cudaMemcpyDeviceToDevice,d.st));
+        return true;
+    }
+    bool packed_finish(PackedFrame& f,std::string& err,bool retire_cache=true) {
+        request_binding_device=-1;
+        const auto& ids=f.ids; const auto& tk=f.tokens;
+        const int B=(int)ids.size(),D=g.dim,H=g.hc;
+        auto& slots=f.slots;auto& positions=f.positions;auto& plans=f.plans;auto& taps=f.taps;
+        int& cur=f.cur;
+        auto& packed=*f.workspace;
+        const size_t nh=(size_t)H*D*4,np=8*4,nk=topk_stride()*4,nc=cand_stride()*4;
         auto& d=devs[head_dev];cudaSetDevice(d.id);
         // Shared head reads all B rows; scatter into each arena before rebinding.
         n_logits=B;
@@ -5442,11 +5488,84 @@ struct Model::Impl : RequestHostState<strata::dsv41k::SpecList, kWin> {
             }
         }
         if(!request_sync(err))return false;
-        cache_tick(B);++packed_steps;packed_rows+=B;completed=true;
+        if(retire_cache)cache_tick(B);
+        ++packed_steps;packed_rows+=B;f.completed=true;
         if(std::getenv("DS4_BATCH_DIAG"))
             std::fprintf(stderr,"DS4_PACKED_AR rows=%d steps=%llu total_rows=%llu\n",B,
                          (unsigned long long)packed_steps,(unsigned long long)packed_rows);
         return true;
+    }
+    bool decode_pipeline22(const std::vector<uint64_t>& ids,const std::vector<int>& tk,std::string& err) {
+        // First supported topology only. No global guard relaxation.
+        if(devs.size()!=2 || g.nl!=40 || L[9].dev!=0 || L[10].dev!=1 ||
+           head_dev!=1 || yoco_layer()!=20) {
+            err="pipeline22 requires the verified 10/30 source topology";return false;
+        }
+        if(ids.size()!=4 || tk.size()!=4) {err="pipeline22 needs four rows";return false;}
+        PackedFrame a,b;
+        a.ids.assign(ids.begin(),ids.begin()+2);a.tokens.assign(tk.begin(),tk.begin()+2);
+        b.ids.assign(ids.begin()+2,ids.end());b.tokens.assign(tk.begin()+2,tk.end());
+        a.workspace=&packed;b.workspace=&packed_other;
+        struct PipelineGuard {
+            Impl& owner;PackedFrame &a,&b;
+            ~PipelineGuard() {
+                owner.request_binding_device=-1;
+                std::string ignored;owner.request_sync(ignored);
+                owner.packed_pipeline_live=false;
+                for(auto* f:{&a,&b})if(f->started&&!f->completed)
+                    for(size_t i=0;i<f->ids.size();++i)owner.resident[f->slots[i]].poisoned=true;
+            }
+        } guard{*this,a,b};
+        // Reject cross-frame aliasing and bad tokens before either frame mutates.
+        for(size_t i=0;i<4;++i) {
+            const unsigned slot=(unsigned)(ids[i]&255);
+            if(slot==0 || slot>=resident.size() || !resident[slot].live || resident[slot].poisoned ||
+               resident[slot].generation!=(ids[i]>>8) ||
+               std::find(ids.begin(),ids.begin()+i,ids[i])!=ids.begin()+i ||
+               tk[i]<0 || tk[i]>=g.vocab) {err="invalid pipeline row";return false;}
+            const HostRequest& h=slot==active_request?static_cast<const HostRequest&>(*this):resident[slot].host;
+            if(!h.imgs.empty() || h.spec_win || h.drafts_q || h.pos<0 || h.pos>=resident[slot].capacity) {
+                err="unsupported pipeline row state";return false;
+            }
+        }
+        if(!packed_init(err,0)||!packed_init(err,1)||!request_sync(err))return false;
+        packed_pipeline_live=true;
+        if(!packed_prepare(a,err))return false;
+        for(int il=0;il<=10;++il)if(!packed_layer(a,il,err))return false;
+        // Device1 owns A's later stage while device0 advances B. Each device has
+        // one stream/scratch owner; frames have separate retained activations.
+        if(!packed_prepare(b,err))return false;
+        for(int il=0;il<10;++il) {
+            if(!packed_layer(b,il,err)||!packed_layer(a,11+il,err))return false;
+        }
+        for(int il=21;il<g.nl;++il)if(!packed_layer(a,il,err))return false;
+        if(!packed_finish(a,err,false))return false;
+        // A's consumer has completed before the shared pinned activation bounce
+        // is reused by B. Source staging has its own consumer acknowledgement.
+        for(int il=10;il<g.nl;++il)if(!packed_layer(b,il,err))return false;
+        if(!packed_finish(b,err,false)||!request_sync(err))return false;
+        cache_tick(4);
+        if(std::getenv("DS4_BATCH_DIAG"))
+            std::fprintf(stderr,"DS4_PIPELINE22 frames=2 rows=4 completed\n");
+        return true;
+    }
+    bool decode_batch(const std::vector<uint64_t>& ids,const std::vector<int>& tk,std::string& err) {
+        const char* p22=std::getenv("DS4_BATCH_PIPELINE22");
+        if(p22 && std::atoi(p22)==1 && ids.size()==4 && tk.size()==4)
+            return decode_pipeline22(ids,tk,err);
+        PackedFrame f;f.ids=ids;f.tokens=tk;f.workspace=&packed;
+        struct FrameGuard {
+            Impl& owner;PackedFrame& f;
+            ~FrameGuard() {
+                if(f.started&&!f.completed) {
+                    std::string ignored;owner.request_sync(ignored);
+                    for(size_t i=0;i<f.ids.size();++i)owner.resident[f.slots[i]].poisoned=true;
+                }
+            }
+        } guard{*this,f};
+        if(!packed_prepare(f,err))return false;
+        for(int il=0;il<g.nl;++il)if(!packed_layer(f,il,err))return false;
+        return packed_finish(f,err);
     }
 
     void reset() {
@@ -7010,7 +7129,7 @@ struct Model::Impl : RequestHostState<strata::dsv41k::SpecList, kWin> {
     // lookahead on the CPU lane: request r (layer li, seq) carries the device's guesses for the next layers - the
     // guessed experts read from the files asked for now (each once a window), the guesses kept for the hit counts
     std::vector<std::pair<const void*, size_t>> pf_want;
-    void ahead_ask(int li, const Req& r, unsigned seq, int T) {
+    void ahead_ask(int li, const Req& r, unsigned seq, int T, Stats& lane_stats) {
         pf_want.clear();
         for (int a = 1; a <= 2; ++a) {
             const int m = std::min(r.na[a - 1], a == 1 ? kAhead1 : kPicks), j = li + a;
@@ -7034,7 +7153,7 @@ struct Model::Impl : RequestHostState<strata::dsv41k::SpecList, kWin> {
                     if (store) store->prefetch(j, e);
                     else
                         for (int q = 0; q < 3; ++q) pf_want.push_back({mx_mat(n, e, q), mx_part_bytes(n, q)});
-                    ++st.ahead_pf;
+                    ++lane_stats.ahead_pf;
                 }
         }
         if (pf_want.empty()) return;
@@ -7062,6 +7181,9 @@ struct Model::Impl : RequestHostState<strata::dsv41k::SpecList, kWin> {
             std::atomic_thread_fence(std::memory_order_acquire);
             const int li = layer_of[next % kRing].load(std::memory_order_acquire);
             Resp& rp = resps[next % kRing];
+            const bool shared_accounting=batch_cpu_accounting.load(std::memory_order_acquire);
+            Stats task_stats{};
+            Stats& lane_stats=shared_accounting?task_stats:st;
             const int T = std::max(1, std::min(kWin, r.T));
             for (int t = 0; t < T; ++t) rp.cpu[t] = 0;
             if (li >= 0 && li < (int) L.size()) {
@@ -7116,26 +7238,26 @@ struct Model::Impl : RequestHostState<strata::dsv41k::SpecList, kWin> {
                         ++pr[e];
                         l.heat[(size_t) e] += 1.0f;
                         if (fl != nullptr) {
-                            ++st.ahead_picks;
-                            st.ahead_hit_k += fl[e] & 1;
-                            st.ahead_hit += (fl[e] & 6) != 0;
-                            st.ahead_hit2 += (fl[e] >> 2) & 1;
+                            ++lane_stats.ahead_picks;
+                            lane_stats.ahead_hit_k += fl[e] & 1;
+                            lane_stats.ahead_hit += (fl[e] & 6) != 0;
+                            lane_stats.ahead_hit2 += (fl[e] >> 2) & 1;
                         }
                         if (l.slot[(size_t) e] < 0) {
                             l.cpu_hits.push_back(e);
                             if (T == 1 && !l.zc.empty() && l.zc[(size_t) e]) {   // the device computed it from the store's slot
                                 store->touch(li, e);
-                                ++st.store_zc;
+                                ++lane_stats.store_zc;
                                 continue;
                             }
                             if (dsk && r.w[t][i] < disk_skip_w * wsum && !in_ram(l, e)) {
-                                ++st.skipped;
+                                ++lane_stats.skipped;
                                 continue;
                             }
-                            if (!l.ram.empty() && l.ram[(size_t) e] >= 0) ++st.ram_experts;
+                            if (!l.ram.empty() && l.ram[(size_t) e] >= 0) ++lane_stats.ram_experts;
                             else if (fl != nullptr) {
-                                ++st.ahead_cold;
-                                st.ahead_cold_hit += (fl[e] >> 3) & 1;
+                                ++lane_stats.ahead_cold;
+                                lane_stats.ahead_cold_hit += (fl[e] >> 3) & 1;
                             }
                             picks.push_back({e, t * kPicks + i});
                         }
@@ -7147,11 +7269,11 @@ struct Model::Impl : RequestHostState<strata::dsv41k::SpecList, kWin> {
                         if (rk[e] == 0 || rk[e] > 16) continue;
                         bool hit = false;
                         for (int i = 0; i < l.k_exp; ++i) hit = hit || r.ids[0][i] == e;
-                        ++st.ahead_rank_n[rk[e] - 1];
-                        st.ahead_rank_hit[rk[e] - 1] += hit;
+                        ++lane_stats.ahead_rank_n[rk[e] - 1];
+                        lane_stats.ahead_rank_hit[rk[e] - 1] += hit;
                     }
                 }
-                if (ahead_mode > 0 && !ahead_for.empty()) ahead_ask(li, r, next, T);
+                if (ahead_mode > 0 && !ahead_for.empty()) ahead_ask(li, r, next, T, lane_stats);
                 std::sort(picks.begin(), picks.end());
                 for (size_t a = 0; a < picks.size();) {
                     Ent en;
@@ -7201,10 +7323,11 @@ struct Model::Impl : RequestHostState<strata::dsv41k::SpecList, kWin> {
                         }
                         rp.cpu[t] = 1;
                     }
-                    st.cpu_ms += now_ms() - tc;
-                    st.cpu_experts += nslots;
+                    lane_stats.cpu_ms += now_ms() - tc;
+                    lane_stats.cpu_experts += nslots;
                 }
             }
+            if(shared_accounting) batch_execution_accounting.complete(task_stats);
             std::atomic_thread_fence(std::memory_order_release);
             *(volatile unsigned*) &rp.seq = next;
             ++next;
@@ -9513,6 +9636,10 @@ struct Model::Impl : RequestHostState<strata::dsv41k::SpecList, kWin> {
             cudaSetDevice(o2.id);
             CK(cudaStreamWaitEvent(o2.st, ev, 0));
             CK(cudaMemcpyAsync(copies[od] + at, stage, bytes, cudaMemcpyHostToDevice, o2.st));
+            // A shared source staging buffer cannot be overwritten by the next
+            // resident row before this consumer reads it. Conservative explicit
+            // acknowledgement; measured as part of the experimental pipeline.
+            if(packed_pipeline_live)CK(cudaStreamSynchronize(o2.st));
         }
         cudaSetDevice(d.id);
         return true;

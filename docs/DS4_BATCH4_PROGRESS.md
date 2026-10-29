@@ -201,3 +201,30 @@ decode_batch(B2) calls would still serialize and are not an implemented pipeline
 
 
 Window 9 restoration completed 2026-10-29 14:25:42 UTC: server 272070 / engine 272078, READY, health loaded, smoke 4. Binary path and original binary/config SHA256 independently verified. Candidate with resident restore bound compiled/linked at 14:17:51; SHA256 ff485c994eca01bdee3a1e356644c13883539fa22eb4abaab645dc6fdd7cdb65. No production deployment or push. Next prepared action: verify idle then run evidence/fair-prefill-driver.py (not started), which uses http_mixed_prefill_probe.py and restores production. True 2+2 and multi-request DSpark remain implementation work, not completed fallbacks.
+
+
+## Window 10 and pipeline preparation
+Staggered real HTTP admission passed: a 1456-token late prompt used 91 quanta
+of at most 16 tokens. Each of three already decoding requests emitted 92 tokens
+during its 29.5883-second prefill. Their p95 TPOT was approximately 0.333 seconds,
+maximum gap 0.402 seconds. Four logical requests delivered 800 model tokens in
+52.3675 seconds; this mixed workload is not comparable to the uniform AR4 rate.
+Evidence: fair-prefill-fairness.json, fair-prefill-driver.log. Original service
+restored with server 274717 / engine 274725 and smoke 4; hashes/health verified.
+
+The opt-in DS4_BATCH_PIPELINE22 path is now implemented but GPU validation is
+pending. It is restricted to four rows and verified 10/30 topology. Two frames
+own separate retained activations, row identities, plans and taps. CPU mailbox
+statistics have executor ownership, separate from movable request host state.
+Device-local binding barriers retain each scratch buffer's ownership. Source
+staging explicitly waits for the remote consumer before reuse; this conservative
+acknowledgement has a performance cost. Expert-cache changes wait for both frames.
+MTP seeding happens after a frame completes, with the other frame's activations
+retained separately. Cancellation is processed only after this bounded execution
+call retires; generation-tagged protocol completion still precedes reuse.
+
+HIP model, native main and separate long-parity/ABBA harness built successfully.
+Concurrent CPU accounting snapshot/completion passed ASan/UBSan. No 2+2 GPU
+correctness, overlap timeline or speed claim is made yet. The prepared benchmark
+uses 128 teacher-forced steps for four requests, modes B4/2+2/2+2/B4, matching saved
+initial states and comparing final state/logits. It is not emitted-token throughput.
