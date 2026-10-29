@@ -12,6 +12,7 @@ cpp=r"""
 #include <algorithm>
 #include <iostream>
 #include "ds4_yoco_pipeline.hpp"
+using strata::ds4::yoco_row_begin;
 RUN
 int main(){
  int dev[40],nm[40],grp[40];

@@ -609,6 +609,7 @@ struct Chunk {
     int spec_k = -1, spec_il = -1, n_spec = 0;   // the likely items queued last: (chunk, layer), how many, from where
     size_t spec_begin = 0;
     std::vector<int> fl_layers, fl_T;        // the device's trunk layers in order; the run's chunk sizes
+    bool fl_cone = false;
     int fl_yoco = -1, fl_cut_k = 0, fl_cut_r = 0;   // Run::yoco / cut_k / cut_r: what a layer's chunk streams for
     int bc_n = 0, bc_w = 0;                  // a batch's compacted bounds: bc_n regions of bc_w, by batch count
     int *bc_pin = nullptr, *bc_dev = nullptr;
@@ -3632,7 +3633,7 @@ struct Model::Impl {
     // the rows chunk k runs layer il on (a long prompt's skip: the cut chunk's from cut_r on, from the yoco layer on)
     static int fl_rows(const Chunk& c, int k, int il) {
         const int T = c.fl_T[(size_t) k];
-        return c.fl_yoco >= 0 && k == c.fl_cut_k && il >= c.fl_yoco ? T - c.fl_cut_r : T;
+        return T - yoco_row_begin(c.fl_yoco, c.fl_cut_k, c.fl_cut_r, c.fl_cone, k, il);
     }
     bool flow_next1(const Chunk& c, int k, int il, int& k2, int& il2) const {
         const auto it = std::find(c.fl_layers.begin(), c.fl_layers.end(), il);
@@ -7816,10 +7817,11 @@ struct Model::Impl {
         // a long prompt's skip (forward_chunks): the cut at row cut_r of chunk cut_k - the chunks before it go through
         // the layers before `yoco`, that layer as layer_chunk's kv_only and none after it; chunk cut_k's rows before
         // cut_r the same, its rows from cut_r on and the chunks after it through every layer (yoco -1: no skip)
+        bool cone = false;
         int yoco = -1, cut_k = 0, cut_r = 0;
         bool runs(int k, int il) const { return yoco < 0 || k >= cut_k || il <= yoco; }
         bool kv_only(int k, int il) const { return yoco >= 0 && k < cut_k && il == yoco; }
-        int r0(int k, int il) const { return yoco >= 0 && k == cut_k && il >= yoco ? cut_r : 0; }   // the first row
+        int r0(int k, int il) const { return yoco_row_begin(yoco, cut_k, cut_r, cone, k, il); }   // the first row
     };
     // layer L0 over chunk k per a long prompt's skip (Run): its kv_only, or its rows from Run::r0 on - the chunk's
     // buffers seen from that row (the yoco layer: its kv_only over the rows before it first)
@@ -7836,6 +7838,14 @@ struct Model::Impl {
         Chunk& c = *chunks[(size_t) member(L0, mi).dev];
         float* const h0 = c.h;
         float* const pre0 = c.pre;
+        int* const topk0 = c.topk;
+        int* const cand0 = c.cand;
+        // Query selections retain original chunk coordinates, including the
+        // source20 writer. Values remain absolute compressed-key IDs.
+        if (run.cone) {
+            c.topk += (size_t) r0 * topk_stride();
+            c.cand += (size_t) r0 * cand_stride();
+        }
         c.h += (size_t) r0 * g.hc * g.dim;
         c.pre += (size_t) r0 * 8;
         WinPlan w1 = wp;
@@ -7843,6 +7853,8 @@ struct Model::Impl {
         const bool ok = layer_chunk(L0, mi, p0 + r0, T - r0, w1, S, err);
         c.h = h0;
         c.pre = pre0;
+        c.topk = topk0;
+        c.cand = cand0;
         return ok;
     }
 
@@ -7980,6 +7992,7 @@ struct Model::Impl {
             c.fl_yoco = run.yoco;
             c.fl_cut_k = run.cut_k;
             c.fl_cut_r = run.cut_r;
+            c.fl_cone = run.cone;
             c.spec_k = c.spec_il = -1;
             c.wait_ms = 0;
             c.it_file = c.it_ram = c.it_spec = c.it_spec_unused = c.it_lc = 0;
@@ -8536,7 +8549,33 @@ struct Model::Impl {
         for (int il = 0; il < g.nl && yl < 0; ++il)
             if (g.ratios[(size_t) il] == 1) yl = il;
         if (yl <= 0 || !L[(size_t) yl].kv_src) return -1;
-        bool pipeline15 = false;
+        bool pipeline15 = false, pipeline10 = false;
+        const char* p10=std::getenv("DS4_YOCO_PIPELINE10");
+        if(p10 && std::atoi(p10)==1) {
+            const char* p15=std::getenv("DS4_YOCO_PIPELINE15");
+            if((p15 && std::atoi(p15)==1) || yoco_mode()!=1 || std::getenv("DS4_YOCO_KEEP") ||
+               g.win!=128 || devs.size()!=2 || groups.size()!=2 || chunk!=8192) return -1;
+            std::vector<int> dv(g.nl),nm(g.nl),gr(g.nl),src(g.nl),ratio(g.nl),kv(g.nl),ix(g.nl),eg(g.nl),md(g.n_mtp);
+            for(int il=0;il<g.nl;++il) {
+                const Layer& l=L[il];dv[il]=l.dev;nm[il]=l.nm;gr[il]=l.grp;
+                src[il]=l.src<0?-1:srcs[l.src].layer;ratio[il]=l.ratio;
+                kv[il]=l.kv_src;ix[il]=l.ix_src;eg[il]=l.eg;
+            }
+            for(int i=0;i<g.n_mtp;++i) {md[i]=L[g.nl+i].dev;if(L[g.nl+i].nm!=1 || L[g.nl+i].grp!=0) return -1;}
+            pipeline10=yoco_pipeline10_layout(g.nl,yl,dv.data(),nm.data(),gr.data(),src.data(),ratio.data(),
+                kv.data(),ix.data(),eg.data(),head_dev,d_dev,g.n_mtp,md.data());
+            if(!pipeline10) return -1;
+            const Src& s8=srcs[L[8].src];const Src& s14=srcs[L[14].src];const Src& s20=srcs[L[20].src];
+            if(!s8.remote || !s8.ckv[0] || !s8.ik[0] || !s8.ckv[1] || s8.ik[1] ||
+               s14.remote || s14.ckv[0] || s14.ik[0] || !s14.ckv[1] || !s14.ik[1] ||
+               s20.remote || s20.ckv[0] || s20.ik[0] || !s20.ckv[1] || !s20.ik[1]) return -1;
+            for(int di=0;di<2;++di) {
+                if(di>=(int)chunks.size() || !chunks[di] || chunks[di]->C!=8192 ||
+                   chunks[di]->A!=256 || chunks[di]->AI!=32) return -1;
+            }
+            const Chunk& ec=*chunks[1];
+            if(!ec.eg_rows || !ec.eg_x || !ec.eg_x16 || !ec.eg_kv || !ec.eg_host[0] || !ec.eg_host[1] || !s8.x_stage || !s8.x_stage1 || !s8.x_ack) return -1;
+        }
         if (const char* flag = std::getenv("DS4_YOCO_PIPELINE15"); flag && std::atoi(flag)==1) {
             // No approximate keep override is admitted by this prototype.
             const char* keep_override = std::getenv("DS4_YOCO_KEEP");
@@ -8554,7 +8593,7 @@ struct Model::Impl {
         }
         for (int il = 0; il < g.nl; ++il) {
             const Layer& l = L[(size_t) il];
-            if (l.nm != 1 || (!pipeline15 && l.dev != L[0].dev)) return -1;
+            if (l.nm != 1 || (!pipeline15 && !pipeline10 && l.dev != L[0].dev)) return -1;
             if (il > yl && (g.ratios[(size_t) il] != 1 || l.kv_src)) return -1;
         }
         return yl;
@@ -8602,6 +8641,28 @@ struct Model::Impl {
             run.yoco = yl;
             run.cut_k = a / per;
             run.cut_r = a - run.cut_k * per;
+        }
+        // Narrow opt-in: preserve the already tested pipeline, source schedule,
+        // last-chunk taps and checkpoint contract. Unsupported runs fall back.
+        if (const char* flag = std::getenv("DS4_YOCO_CONE"); flag && std::atoi(flag)==1) {
+            const char* pipe15 = std::getenv("DS4_YOCO_PIPELINE15");
+            const char* pipe10 = std::getenv("DS4_YOCO_PIPELINE10");
+            // run.yoco was admitted by yoco_layer's full topology/allocation guard.
+            // Both splits consume every early chunk before source20 on GPU1.
+            bool safe = yoco_cone_pipeline_admitted(run.yoco,
+                pipe15 && std::atoi(pipe15)==1, pipe10 && std::atoi(pipe10)==1) && yoco_mode()==1 &&
+                !std::getenv("DS4_YOCO_KEEP") && g.win==128 && g.nl==40 &&
+                logits_rows<=kWin &&
+                yoco_cone_last_chunk(run.yoco,run.cut_k,nc,run.T.back(),run.cut_r);
+            for (int il=20; il<g.nl && safe; ++il) {
+                const Layer& l = L[(size_t)il];
+                safe = l.nm==1 && l.eg<0 && l.ratio==1 && l.src==L[20].src &&
+                    (il==20 || !l.kv_src);
+            }
+            for (int target : g.d_targets) safe = safe && target>=37 && target<=39;
+            run.cone = safe;
+            std::fprintf(stderr,"YOCO_CONE active=%d n=%d cut_k=%d cut_r=%d last_rows=%d\n",
+                         int(run.cone),n,run.cut_k,run.cut_r,run.T.back());
         }
         if (std::getenv("DS4_YOCO_PIPELINE_DIAG")) {
             std::fprintf(stderr,"YOCO15_RUN n=%d pos=%lld chunks=%d per=%d yoco=%d keep=%d cut_k=%d cut_r=%d snap=%lld\n",
