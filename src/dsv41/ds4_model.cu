@@ -8844,6 +8844,7 @@ struct Model::Impl : RequestHostState<strata::dsv41k::SpecList, kWin> {
 
     // n tokens at positions pos .. in chunks of equal size (at most `chunk`), pipelined over the groups; the logits of
     // the last min(logits_rows, 16) rows (logits_rows > 16: a run of one chunk, every row's into chunk_logits)
+    std::vector<uint32_t> batch_test_prefill_profile;
     bool forward_chunks(const int* tk, int n, int logits_rows, std::string& err, int snap_slot = -1) {
         if (n < 1) return true;
         flow_used.store(true);
@@ -8916,6 +8917,18 @@ struct Model::Impl : RequestHostState<strata::dsv41k::SpecList, kWin> {
         for (int t = 0; t < n; ++t) {
             toks.push_back(tk[t]);
             ctoks.push_back(ctok(pos + t, tk[t]));
+        }
+        // Diagnostic-only: compare identical prefills without the process's
+        // learned routing profile changing streamed expert order between runs.
+        // This does not change weights/precision and is not a production policy.
+        if(const char* fixed=std::getenv("DS4_BATCH_TEST_FIXED_FLOW"); fixed && std::atoi(fixed)==1) {
+            if(o.expert_cache) {err="fixed-flow diagnostic requires expert cache disabled";return false;}
+            if(batch_test_prefill_profile.empty()) batch_test_prefill_profile=prof;
+            else prof=batch_test_prefill_profile;
+            uint64_t hash=1469598103934665603ull;
+            for(uint32_t x:prof) {hash^=x;hash*=1099511628211ull;}
+            std::fprintf(stderr,"DS4_FIXED_PREFILL_PROFILE slot=%u pos=%lld n=%d hash=%016llx\n",
+                         active_request,(long long)pos,n,(unsigned long long)hash);
         }
         plan_streams();
         if (snap_slot >= 0) {   // feed_mark: the state before the run's last row, kept by its layers on the way

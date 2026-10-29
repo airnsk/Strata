@@ -110,6 +110,15 @@ inline int packed_long_test(Model& m) {
         }
         std::fprintf(stderr,"PACKED_LONG_B1_CONTROL comparisons=%d non_bit_equal=%d worst_abs=%.9g\n",comparisons,bad,worst_abs);
         require(bad==0,"B1 fixed-input control is not deterministic");
+        // The short control does not cover chunked prefill: repeat each long
+        // prefix in the base arena before attributing differences to residency.
+        for(int q=1;q<4;++q) {
+            require(m.request_select(0,err),"prefill control base");m.reset();
+            require(m.feed(prompts[q].data(),lengths[q],1,err),"prefill control");
+            compare(prefill_ref[q],q,-2);
+            std::fprintf(stderr,"PACKED_PREFILL_B1_CONTROL request=%d non_bit_equal=%d\n",q,bad);
+            require(bad==0,"B1 chunked prefill control is not deterministic");
+        }
         comparisons=0;worst_abs=worst_rms=worst_kl=0;
         std::array<uint64_t,4> ids{};
         for(int q=0;q<4;++q)require(m.request_create(512,ids[q],err),"create resident");
