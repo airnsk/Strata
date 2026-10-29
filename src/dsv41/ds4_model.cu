@@ -855,18 +855,13 @@ struct Model::Impl : RequestHostState<strata::dsv41k::SpecList, kWin> {
     size_t eg_cap = kWin;             // tokens h_eg holds
     int tap_cap = kWin;               // rows h_taps holds (a chunk seeds the drafter with its last 128)
     static constexpr int kYocoMin = 1024;   // a long prompt's skip (forward_chunks): the fewest rows worth skipping
-    bool logits_all = false;          // the last feed was a chunk with logits for every row (chunk_logits)
-    std::vector<float> chunk_logits;
-    std::function<void(int64_t)> progress;   // a run of chunks: the tokens done so far (the main thread, while it waits)
     // a Stop while a run of chunks goes through the layers (Model::set_cancel, asked while forward_chunks waits): one
     // GPU stops after the layer (or the layer's chunk) it is on (halt); several stop at a chunk every one of them
     // reaches - none starts chunk halt_k or later, halt_k one past the latest any started - so no device waits on a
     // hand-off that never comes (Project Maya v1.1.20)
-    std::function<bool()> cancel;
     std::atomic<bool> halt{false};
     std::mutex halt_mu;
     int halt_k = INT_MAX, halt_seen = -1;
-    bool halted = false;                      // the last run ended early on a Stop
     static constexpr const char* kHalted = "stopped";
     bool chunk_go(int k) {   // chunk k may start on this device (several GPUs)
         std::lock_guard<std::mutex> lk(halt_mu);
@@ -5184,7 +5179,7 @@ struct Model::Impl : RequestHostState<strata::dsv41k::SpecList, kWin> {
         float* logits = nullptr;
         int64_t capacity = 0;
         uint64_t generation = 0;
-        bool live = false;
+        bool live = false, poisoned = false;
     };
     std::array<Resident,5> resident;
     unsigned active_request = 0;
@@ -5202,7 +5197,7 @@ struct Model::Impl : RequestHostState<strata::dsv41k::SpecList, kWin> {
     void resident_free(Resident& r) {
         for(auto [di,p]:r.allocations) {cudaSetDevice(devs[di].id);cudaFree(p);}
         r.allocations.clear();r.layers.clear();r.sources.clear();r.host=HostRequest{};
-        r.logits=nullptr;r.capacity=0;r.live=false;
+        r.logits=nullptr;r.capacity=0;r.live=false;r.poisoned=false;
     }
     bool resident_init(std::string& err) {
         if(resident_initialized) return true;
@@ -5271,7 +5266,7 @@ struct Model::Impl : RequestHostState<strata::dsv41k::SpecList, kWin> {
     bool request_select(uint64_t id,std::string& err) {
         if(!resident_init(err)) return false;
         const unsigned slot=(unsigned)(id&255);
-        if(slot>=resident.size() || !resident[slot].live ||
+        if(slot>=resident.size() || !resident[slot].live || resident[slot].poisoned ||
             (slot==0 ? id!=0 : resident[slot].generation!=(id>>8))) {
             err="stale or invalid request handle";return false;
         }
@@ -5301,6 +5296,156 @@ struct Model::Impl : RequestHostState<strata::dsv41k::SpecList, kWin> {
     bool request_room(int64_t n,std::string& err) const {
         const int64_t cap=active_request?resident[active_request].capacity:o.max_context;
         if(n<0 || pos<0 || pos>cap || n>cap-pos) {err="request context capacity exceeded";return false;}
+        return true;
+    }
+
+    struct PackedRows {
+        float *h=nullptr,*pre=nullptr,*a_pre=nullptr;
+        int *topk=nullptr,*cand=nullptr;
+    };
+    std::vector<PackedRows> packed;
+    bool packed_failed=false;
+    uint64_t packed_steps=0,packed_rows=0;
+    bool packed_init(std::string& err) {
+        if(packed_failed) {err="packed workspace unavailable after allocation failure";return false;}
+        if(packed.size()==devs.size()) return true;
+        packed_failed=true;packed.resize(devs.size());
+        for(size_t di=0;di<devs.size();++di) {
+            auto& d=devs[di];auto& p=packed[di];
+            if(!dalloc(d,p.h,(size_t)4*g.hc*g.dim,err) ||
+               !dalloc(d,p.pre,32,err) || !dalloc(d,p.a_pre,32,err) ||
+               !dalloc(d,p.topk,4*topk_stride(),err) ||
+               !dalloc(d,p.cand,4*cand_stride(),err)) return false;
+        }
+        packed_failed=false;return true;
+    }
+    // A real common MoE/shared-expert/head pass over independent rows. Attention
+    // remains segmented and uses the unchanged single-request kernels. This
+    // correctness-first path is deliberately serialized at binding boundaries;
+    // it is not the later overlapping 2+2 pipeline.
+    bool decode_batch(const std::vector<uint64_t>& ids,const std::vector<int>& tk,std::string& err) {
+        const int B=(int)ids.size(),D=g.dim,H=g.hc;
+        if(B<1 || B>4 || tk.size()!=ids.size() || !resident_initialized) {
+            err="packed decode needs 1..4 resident rows";return false;
+        }
+        std::array<unsigned,4> slots{};
+        std::array<int64_t,4> positions{};
+        std::array<WinPlan,4> plans;
+        std::array<std::vector<float>,4> taps;
+        // Validate the entire batch before mutating any history.
+        for(int q=0;q<B;++q) {
+            const unsigned sl=(unsigned)(ids[q]&255);slots[q]=sl;
+            if(sl==0 || sl>=resident.size() || !resident[sl].live || resident[sl].poisoned ||
+               resident[sl].generation!=(ids[q]>>8) ||
+               std::find(ids.begin(),ids.begin()+q,ids[q])!=ids.begin()+q ||
+               tk[q]<0 || tk[q]>=g.vocab) {err="invalid, duplicate or stale packed row";return false;}
+            const HostRequest& h=sl==active_request?static_cast<const HostRequest&>(*this):resident[sl].host;
+            if(!h.imgs.empty() || h.spec_win || h.drafts_q || h.pos<0 ||
+               h.pos>=resident[sl].capacity) {err="packed row state/capacity unsupported";return false;}
+            positions[q]=h.pos;
+            taps[q].resize((size_t)g.d_targets.size()*D);
+        }
+        if(!packed_init(err)) return false;
+        bool completed=false;
+        struct FailBatch {
+            Impl& owner;const std::array<unsigned,4>& slots;int n;bool& completed;
+            ~FailBatch(){if(!completed)for(int i=0;i<n;++i)owner.resident[slots[i]].poisoned=true;}
+        } fail{*this,slots,B,completed};
+        prof_window=false;
+        const size_t nh=(size_t)H*D*4,np=8*4,nk=topk_stride()*4,nc=cand_stride()*4;
+        int cur=L[0].dev;
+        for(int q=0;q<B;++q) {
+            if(!request_select(ids[q],err)) return false;
+            slot_held=false;logits_all=false;chunk_logits.clear();
+            toks.push_back(tk[q]);ctoks.push_back(ctok(pos,tk[q]));
+            plan_window(pos,1,plans[q],false); // no unused CPU mailbox sequences
+            auto& d=devs[cur];auto& p=packed[cur];cudaSetDevice(d.id);
+            std::memcpy(h_emb,emb_row(pos,tk[q]),(size_t)D*2);
+            CK(cudaMemcpyAsync(d.emb_rows,h_emb,(size_t)D*2,cudaMemcpyHostToDevice,d.st));
+            embed(d.emb_rows,1,d.h,D,H,d.st);init_pre(d.pre,1,d.st);
+            CK(cudaMemcpyAsync(p.h+(size_t)q*H*D,d.h,nh,cudaMemcpyDeviceToDevice,d.st));
+            CK(cudaMemcpyAsync(p.pre+(size_t)q*8,d.pre,np,cudaMemcpyDeviceToDevice,d.st));
+            CK(cudaMemsetAsync(p.topk+(size_t)q*topk_stride(),0,nk,d.st));
+            CK(cudaMemsetAsync(p.cand+(size_t)q*cand_stride(),0,nc,d.st));
+        }
+        for(int il=0;il<g.nl;++il) {
+            const int di=L[il].dev;
+            if(di!=cur) {
+                auto& a=devs[cur];auto& b=devs[di];auto& x=packed[cur];auto& y=packed[di];
+                cudaSetDevice(a.id);auto* bb=a.bounce;
+                CK(cudaMemcpyAsync(bb,x.h,B*nh,cudaMemcpyDeviceToHost,a.st));
+                CK(cudaMemcpyAsync(bb+B*nh,x.pre,B*np,cudaMemcpyDeviceToHost,a.st));
+                CK(cudaMemcpyAsync(bb+B*(nh+np),x.topk,B*nk,cudaMemcpyDeviceToHost,a.st));
+                CK(cudaMemcpyAsync(bb+B*(nh+np+nk),x.cand,B*nc,cudaMemcpyDeviceToHost,a.st));
+                CK(cudaEventRecord(a.ev_out,a.st));cudaSetDevice(b.id);
+                CK(cudaStreamWaitEvent(b.st,a.ev_out,0));
+                CK(cudaMemcpyAsync(y.h,bb,B*nh,cudaMemcpyHostToDevice,b.st));
+                CK(cudaMemcpyAsync(y.pre,bb+B*nh,B*np,cudaMemcpyHostToDevice,b.st));
+                CK(cudaMemcpyAsync(y.topk,bb+B*(nh+np),B*nk,cudaMemcpyHostToDevice,b.st));
+                CK(cudaMemcpyAsync(y.cand,bb+B*(nh+np+nk),B*nc,cudaMemcpyHostToDevice,b.st));
+                cur=di;
+            }
+            auto& d=devs[di];auto& p=packed[di];
+            for(int q=0;q<B;++q) {
+                if(!request_select(ids[q],err)) return false;
+                cudaSetDevice(d.id);
+                CK(cudaMemcpyAsync(d.h,p.h+(size_t)q*H*D,nh,cudaMemcpyDeviceToDevice,d.st));
+                CK(cudaMemcpyAsync(d.pre,p.pre+(size_t)q*8,np,cudaMemcpyDeviceToDevice,d.st));
+                CK(cudaMemcpyAsync(d.topk,p.topk+(size_t)q*topk_stride(),nk,cudaMemcpyDeviceToDevice,d.st));
+                CK(cudaMemcpyAsync(d.cand,p.cand+(size_t)q*cand_stride(),nc,cudaMemcpyDeviceToDevice,d.st));
+                if(L[il].eg>=0) {
+                    auto& b=*eg_win[(size_t)L[il].eg];if(b.live)eg_finish(b);
+                    eg_issue(positions[q],1,L[il].eg,nullptr,b);
+                }
+                const bool capture=std::find(g.d_targets.begin(),g.d_targets.end(),il)!=g.d_targets.end();
+                if(capture) {
+                    std::copy(taps[q].begin(),taps[q].end(),h_taps);
+                    if(!tap(d,il,1,err))return false;
+                }
+                if(!layer(L[il],0,positions[q],1,plans[q],err,true)) return false;
+                CK(cudaMemcpyAsync(p.h+(size_t)q*H*D,d.h,nh,cudaMemcpyDeviceToDevice,d.st));
+                CK(cudaMemcpyAsync(p.a_pre+(size_t)q*8,d.a_pre,np,cudaMemcpyDeviceToDevice,d.st));
+                CK(cudaMemcpyAsync(p.topk+(size_t)q*topk_stride(),d.topk,nk,cudaMemcpyDeviceToDevice,d.st));
+                CK(cudaMemcpyAsync(p.cand+(size_t)q*cand_stride(),d.cand,nc,cudaMemcpyDeviceToDevice,d.st));
+                if(capture) {
+                    CK(cudaStreamSynchronize(d.st));
+                    std::copy(h_taps,h_taps+taps[q].size(),taps[q].begin());
+                }
+            }
+            cudaSetDevice(d.id);
+            CK(cudaMemcpyAsync(d.h,p.h,B*nh,cudaMemcpyDeviceToDevice,d.st));
+            CK(cudaMemcpyAsync(d.a_pre,p.a_pre,B*np,cudaMemcpyDeviceToDevice,d.st));
+            WinPlan common;common.async=!sync_decode && B<=async_max_t;
+            if(common.async) {
+                common.seq[il]=++seq_issued;
+                layer_of[seq_issued%kRing].store(il,std::memory_order_release);
+            }
+            if(!layer_moe(L[il],0,B,common,err)) return false;
+            CK(cudaMemcpyAsync(p.h,d.h,B*nh,cudaMemcpyDeviceToDevice,d.st));
+            CK(cudaMemcpyAsync(p.pre,d.pre,B*np,cudaMemcpyDeviceToDevice,d.st));
+        }
+        auto& d=devs[head_dev];cudaSetDevice(d.id);
+        // Shared head reads all B rows; scatter into each arena before rebinding.
+        n_logits=B;
+        if(!head_rows_dev(head_dev,B,err)) return false;
+        float* output=d.logits;
+        for(int q=0;q<B;++q)
+            CK(cudaMemcpyAsync(resident[slots[q]].logits,output+(size_t)q*g.vocab,
+                               (size_t)g.vocab*4,cudaMemcpyDeviceToDevice,d.st));
+        CK(cudaStreamSynchronize(d.st));
+        for(int q=0;q<B;++q) {
+            if(!request_select(ids[q],err))return false;
+            ++pos;++st.tokens;n_logits=1;
+            if(g.n_mtp>0) {
+                std::copy(taps[q].begin(),taps[q].end(),h_taps);
+                if(!seed_drafter(positions[q],1,0,err))return false;
+            }
+        }
+        if(!request_sync(err))return false;
+        cache_tick(B);++packed_steps;packed_rows+=B;completed=true;
+        if(std::getenv("DS4_BATCH_DIAG"))
+            std::fprintf(stderr,"DS4_PACKED_AR rows=%d steps=%llu total_rows=%llu\n",B,
+                         (unsigned long long)packed_steps,(unsigned long long)packed_rows);
         return true;
     }
 
@@ -9011,9 +9156,9 @@ struct Model::Impl : RequestHostState<strata::dsv41k::SpecList, kWin> {
     }
 
     // the window's plan, in window order (the indexer's and the candidate source's sizes carry from window to window)
-    void plan_window(int64_t p0, int T, WinPlan& wp) {
-        wp.par = par;
-        wp.async = par || (!sync_decode && T <= async_max_t);
+    void plan_window(int64_t p0, int T, WinPlan& wp, bool route_work = true) {
+        wp.par = route_work && par;
+        wp.async = route_work && (par || (!sync_decode && T <= async_max_t));
         wp.vl = 0;
         for (int t = 0; t < T && !imgs.empty(); ++t)
             if (in_image(p0 + t)) wp.vl |= 1u << t;
@@ -9361,7 +9506,7 @@ struct Model::Impl : RequestHostState<strata::dsv41k::SpecList, kWin> {
 
     // layer L0 for the window, as group member mi (its share of the heads, of the output projection and of the FFNs;
     // the partial sums all-reduced across the group)
-    bool layer(Layer& L0, int mi, int64_t p0, int T, const WinPlan& wp, std::string& err) {
+    bool layer(Layer& L0, int mi, int64_t p0, int T, const WinPlan& wp, std::string& err, bool attention_only = false) {
         Layer& l = member(L0, mi);
         Dev& d = devs[(size_t) l.dev];
         cudaSetDevice(d.id);
@@ -9602,6 +9747,17 @@ struct Model::Impl : RequestHostState<strata::dsv41k::SpecList, kWin> {
         std::swap(d.h, d.h2);
         if (dump_l != nullptr && mi == 0) dump_layer(d, d.h, 1000 + l.il, p0, T);   // (DS4_DUMP_L: after the attention)
         prof_mark(d, 1);
+        if (attention_only) return true;
+        return layer_moe(L0,mi,T,wp,err);
+    }
+
+    // Row-local FFN/routing and grouped experts: shared by ordinary windows and
+    // packed independent requests after their segmented stateful attention.
+    bool layer_moe(Layer& L0,int mi,int T,const WinPlan& wp,std::string& err) {
+        Layer& l=member(L0,mi);Dev& d=devs[(size_t)l.dev];
+        cudaSetDevice(d.id);cudaStream_t s=d.st;
+        const int nm=L0.nm,D=g.dim,H=g.hc,FF=l.ffn;
+        const ArGroup& ag=groups[(size_t)L0.grp].ar;
         // the MoE
         hc_mix_split(d.h, l.hcf_fn, H * D, (2 + H) * H, T, g.eps, d.mix, d.hccnt, l.hcf_scale, l.hcf_base, H, g.sinkhorn, g.hc_eps,
                      d.f_pre, d.f_post, d.f_comb, s);
@@ -9916,6 +10072,9 @@ bool Model::step(int token, bool logits, std::string& err) {
 bool Model::request_create(int64_t capacity, uint64_t& id, std::string& err) { return p_->request_create(capacity,id,err); }
 bool Model::request_select(uint64_t id, std::string& err) { return p_->request_select(id,err); }
 bool Model::request_release(uint64_t id, std::string& err) { return p_->request_release(id,err); }
+bool Model::decode_batch(const std::vector<uint64_t>& requests, const std::vector<int>& tokens, std::string& err) {
+    return p_->decode_batch(requests,tokens,err);
+}
 bool Model::feed(const int* tokens, int n, int logits_rows, std::string& err) {
     if(!p_->request_room(n,err)) return false;
     Impl& p = *p_;

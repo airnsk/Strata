@@ -1161,7 +1161,13 @@ class StrataEngine:
         groups_run = int(self.info.get("batch_groups") or groups)
         self.slot_gs = gs if groups > 1 and groups_run > 1 else 0
         self.slot_q = [queue.Queue() for _ in range(self.batch)]
-        self.slot_busy = [False] * self.batch
+        self.batch_wire = None
+        if self.info.get("batch_protocol") == "ds4-v2":
+            from .ds4_batch_protocol import BatchWire
+            if self.info.get("batch_migration") not in ("0", 0) or self.info.get("batch_spec") not in ("0", 0):
+                raise ValueError("unsupported DS4 batch capability")
+            self.batch_wire = BatchWire(self.batch, int(self.info["batch_context"]))
+        self.slot_busy = self.batch_wire.active if self.batch_wire is not None else [False] * self.batch
         # #1603: who owns a busy flag.  slot_claims: slots a request of this server picked or reserved and has not
         # given back; slot_releasing: slots handed to the background BDONE wait.  A busy slot in neither has no owner
         # (its flag leaked) and would keep every later request waiting for a slot that nothing will free.
@@ -1194,6 +1200,7 @@ class StrataEngine:
     def _pump(self):
         proc, lines = self.proc, self.lines             # this process's: a restart replaces both (#344)
         slot_q = self.slot_q
+        batch_wire = getattr(self, "batch_wire", None)
         line = None
         for line in proc.stdout:
             # checked before batch routing: a fatal line is never a slot's own
@@ -1208,6 +1215,11 @@ class StrataEngine:
                 except OSError:
                     pass
                 break                           # publish EOF, never the trailing DONE
+            if batch_wire is not None and batch_wire.route(line):
+                if batch_wire.closed:
+                    proc.terminate()
+                    break
+                continue
             if line.startswith("BSTAT"):
                 sample = parse_batch_window_sample(line)
                 if sample is not None and self.proc is proc:
@@ -1220,7 +1232,9 @@ class StrataEngine:
                 continue
             if line.startswith(("BT ", "BDONE ")) and slot_q:   # --batch: a batch slot's own lines
                 try:
-                    slot_q[int(line.split()[1])].put(line)
+                    slot = int(line.split()[1])
+                    if 0 <= slot < len(slot_q):
+                        slot_q[slot].put(line)
                     continue
                 except (IndexError, ValueError):
                     pass
@@ -1229,6 +1243,8 @@ class StrataEngine:
             self.ended = True                           # its output closed: it is gone, even before the OS says so
             if line and line.startswith("ERR"):         # #997 #890: why it exited, though no request may read it
                 self.last_err = line[4:].strip()        # (a failed batch window: every request reads its slot)
+        if batch_wire is not None:
+            batch_wire.close()
         lines.put(None)
         for q in slot_q:
             q.put(None)
@@ -1813,6 +1829,10 @@ class StrataEngine:
         admission to its BADM, a slot is BSTOPped and freed at its BDONE."""
         if not self.alive():
             raise EngineDied("the engine is unavailable; this request was not sent")
+        if getattr(self, "batch_wire", None) is not None:
+            from .ds4_batch_protocol import stream_request
+            yield from stream_request(self, ids, max_new, sampling, cancel, embeddings, EngineDied)
+            return
         self.progress, self.progress_ms, self.reused = None, 0, 0
         born = self.gen                                 # the engine process this request is sent to
         keys = self.sampling_keys(sampling or {})

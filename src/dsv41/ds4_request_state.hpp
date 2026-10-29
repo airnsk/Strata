@@ -41,6 +41,11 @@ struct RequestHostState {
     Stats st;
     int cur_topk_n[Window] = {}, cur_cand_n[Window] = {};
     int n_logits = 0;
+    bool logits_all = false;
+    std::vector<float> chunk_logits;
+    std::function<void(int64_t)> progress;
+    std::function<bool()> cancel;
+    bool halted = false;
     std::vector<Image> imgs;
     bool spec_win = false;
     std::vector<SpecList> h_specq = std::vector<SpecList>(Window);

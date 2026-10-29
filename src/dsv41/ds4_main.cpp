@@ -19,6 +19,8 @@
 // read stops there for a checkpoint, so a request behind the same start - another agent - goes back to it instead of
 // reading it again (also without slots).  STRATA_DS4_REUSE=0 turns every reuse off (each request reads its whole prompt).
 #include "ds4_model.hpp"
+#include "ds4_batch_request.hpp"
+#include <array>
 #include "ds4_experts_rule.hpp"
 #include "ds4_os.hpp"
 #include "ds4_packinfo.hpp"
@@ -101,8 +103,8 @@ struct Lines {
     std::deque<std::string> q;
     bool eof = false;
     std::atomic<bool> stop{false};
-    void start() {
-        std::thread([this] {
+    void start(std::shared_ptr<Lines> lifetime = {}) {
+        std::thread([this, lifetime] {
             std::string l;
             while (std::getline(std::cin, l)) {
                 if (!l.empty() && l.back() == '\r') l.pop_back();
@@ -114,6 +116,7 @@ struct Lines {
                 if (l == "QUIT") stop.store(true);
                 q.push_back(l);
                 cv.notify_all();
+                if (l == "QUIT" && lifetime) break;
             }
             std::lock_guard<std::mutex> lk(mu);
             eof = true;
@@ -316,6 +319,8 @@ bool parse_gen(const std::string& line, Req& r, bool geni) {
     }
     return !r.ids.empty() && (!geni || !r.file.empty());
 }
+
+#include "ds4_batch_serve.inc"
 
 int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float conf_min, const std::string& pack) {
     std::vector<int> eos = parse_ids(eos_list);
@@ -1300,6 +1305,8 @@ int main(int argc, char** argv) {
     }
     if (!o.vision_only) std::fprintf(stderr, "%s", m.describe().c_str());
     if (const char* idle = std::getenv("DS4_TEST_IDLE_MS")) std::this_thread::sleep_for(std::chrono::milliseconds(std::atoi(idle)));   // (tests: a person typing)
+    if (serve_mode && std::getenv("DS4_BATCH4") && std::atoi(std::getenv("DS4_BATCH4"))==1)
+        return serve_batch4(m,eos);
     if (serve_mode) return serve(m, eos, spec, o.dspark_conf, o.pack);
     const int window_given = window;
     if (window == 0) window = 16;   // (the scoring / profiling runs; the plain run below takes the model's feed unit)

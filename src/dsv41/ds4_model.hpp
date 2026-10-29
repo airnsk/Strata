@@ -107,12 +107,16 @@ public:
     ~Model();
     bool load(const Options& o, std::string& err);
     // Experimental single-execution-owner resident AR handles. Capacity includes
-    // prompt+output. No protocol capability is advertised; not packed batching.
+    // prompt+output. Allocation does not itself advertise protocol capability.
     // Handle0 selects the original request. A released handle never aliases a
     // new generation. Selection waits for shared workspace/IO completion.
     bool request_create(int64_t capacity, uint64_t& id, std::string& err);
     bool request_select(uint64_t id, std::string& err);
     bool request_release(uint64_t id, std::string& err);
+    // Packed AR: one token per independent resident handle; shared FFN/MoE/head,
+    // segmented attention. No speculative rows or images in this prototype.
+    bool decode_batch(const std::vector<uint64_t>& requests, const std::vector<int>& tokens, std::string& err);
+
 
 
     /// Feeds `token` at position pos(); with logits, the next token's logits are left on the head's device.
