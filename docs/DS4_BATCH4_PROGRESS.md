@@ -52,7 +52,7 @@ shared CPU/expert phase counters are not yet attributed per request.
   This is a short fixed-profile test, not all-composition/long-context validation.
 - batch_client_test.py: actual StrataEngine client/pump with actual native scheduler
   and CPU model stub: four concurrent streams, per-thread statistics and
-  cancellation/reuse PASS. Actual HTTP/GPU integration is still pending.
+  cancellation/reuse PASS. Actual HTTP/GPU integration is described below.
 
 ## Remaining release gates
 
@@ -67,3 +67,35 @@ No new build is installed in the production launch configuration. Production
 YOCO10/30+cone is restored after each exclusive test window. No push is authorized.
 
 Local raw evidence (not committed): /var/tmp/strata-batch4-1029-evidence/.
+
+## Actual HTTP window (one run, 2026-10-29)
+
+All use the same synthetic chat prompt (62 tokens, cache0) and an output cap128.
+These are client wall times, including prefill and server thinking/recovery.
+
+| Mode | Completed output tokens | Client wall seconds |
+|---|---:|---:|
+| Working single DSpark |128|5.211200698|
+| Candidate single AR |128|7.846159648|
+| Candidate four AR streams |512 total|25.556360745|
+
+Four streams overlapped; common GPU batch4 steps were logged. Aggregate wall
+throughput20.034 tokens/s is a measured concurrency result, not proof of a
+steady-decode speedup. A fifth waiting request plus cancellation of one active
+request completed without killing its neighbors. Default thinking budget caused
+extra wrap-up/prefill and approximately7-second text-event gaps.
+
+Real-model texts differed among same-prompt/seed requests and versus AR1; the
+first difference occurred before wrap-up. Adaptive expert placement was enabled.
+This remains an unresolved numerical-policy issue, not a proven quality loss
+and not a passing release gate. Do not attribute it solely to HTTP recovery.
+
+A subsequent fixed-placement diagnostic executed a B1/B1 control and128 packed
+steps, but returned nonzero before HTTP service startup. Its diagnostic stdout
+was discarded by the startup reader; therefore no numerical bound can be claimed
+from that attempt. Reporting now uses persisted stderr for a targeted repeat.
+No failing gate was bypassed. The working production server was restored.
+
+A further protocol issue is tracked: one logical HTTP request may have multiple
+native legs after thinking wrap-up. Its sampling counter must continue across
+legs, rather than resetting for each BGEN. Greedy tests do not validate this.

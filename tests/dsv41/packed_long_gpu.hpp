@@ -48,8 +48,29 @@ inline int packed_long_test(Model& m) {
         worst_abs=std::max(worst_abs,mx);worst_rms=std::max(worst_rms,rms);worst_kl=std::max(worst_kl,kl);
         top1_changes+=ri!=si;draw_changes+=s.draw!=r.draw;state_changes+=!bytes;
         if(changed || !bytes || s.draw!=r.draw) {
-            if(bad++==0) std::printf("PACKED_LONG_FIRST_DIFF request=%d stage=%d changed=%zu max=%.9g rms=%.9g KL=%.9g state_equal=%d top1_equal=%d draw_equal=%d\n",
+            if(bad++==0) {
+                if(!bytes && r.state.size()==s.state.size()) {
+                    const auto u64=[&](size_t at){uint64_t v=0;if(at+8<=r.state.size())std::memcpy(&v,r.state.data()+at,8);return v;};
+                    size_t at=16+(size_t)u64(8);
+                    const auto n=u64(at);at+=8+(size_t)n*4;
+                    for(int layer=0;layer<43 && at+8<=r.state.size();++layer) {
+                        const size_t wb=(size_t)u64(at);at+=8;
+                        if(at+wb>r.state.size())break;
+                        if(std::memcmp(r.state.data()+at,s.state.data()+at,wb)!=0) {
+                            std::fprintf(stderr,"PACKED_LONG_FIRST_STATE layer=%d field=window\n",layer);break;
+                        }
+                        at+=wb;if(at+8>r.state.size())break;
+                        const size_t cb=(size_t)u64(at)*8;at+=8;
+                        if(at+cb>r.state.size())break;
+                        if(std::memcmp(r.state.data()+at,s.state.data()+at,cb)!=0) {
+                            std::fprintf(stderr,"PACKED_LONG_FIRST_STATE layer=%d field=compressor\n",layer);break;
+                        }
+                        at+=cb;
+                    }
+                }
+                std::fprintf(stderr,"PACKED_LONG_FIRST_DIFF request=%d stage=%d changed=%zu max=%.9g rms=%.9g KL=%.9g state_equal=%d top1_equal=%d draw_equal=%d\n",
                 q,stage,changed,mx,rms,kl,int(bytes),int(ri==si),int(s.draw==r.draw));
+            }
         }
         ++comparisons;
     };
@@ -71,7 +92,7 @@ inline int packed_long_test(Model& m) {
         for(int i=0;i<128;++i){
             require(m.step(1300+i,true,err),"control step");compare(ref[0][i],0,i);
         }
-        std::printf("PACKED_LONG_B1_CONTROL comparisons=%d non_bit_equal=%d worst_abs=%.9g\n",comparisons,bad,worst_abs);
+        std::fprintf(stderr,"PACKED_LONG_B1_CONTROL comparisons=%d non_bit_equal=%d worst_abs=%.9g\n",comparisons,bad,worst_abs);
         require(bad==0,"B1 fixed-input control is not deterministic");
         comparisons=0;worst_abs=worst_rms=worst_kl=0;
         std::array<uint64_t,4> ids{};
@@ -104,10 +125,10 @@ inline int packed_long_test(Model& m) {
         require(m.request_select(ids[0],err)&&m.pos()==0,"fresh reused state");
         for(auto id:ids)require(m.request_release(id,err),"release all");
         require(m.request_select(0,err),"restore base binding");
-        std::printf("PACKED_LONG_SUMMARY comparisons=%d non_bit_equal=%d top1_changes=%d draw_changes=%d state_changes=%d worst_abs=%.9g worst_rms=%.9g worst_KL=%.9g\n",
+        std::fprintf(stderr,"PACKED_LONG_SUMMARY comparisons=%d non_bit_equal=%d top1_changes=%d draw_changes=%d state_changes=%d worst_abs=%.9g worst_rms=%.9g worst_KL=%.9g\n",
             comparisons,bad,top1_changes,draw_changes,state_changes,worst_abs,worst_rms,worst_kl);
-        if(bad){std::puts("PACKED_LONG_NUMERICAL_GATE_FAIL");return 1;}
-        std::printf("PACKED_LONG_PASS comparisons=%d sampled_rng_equal=1\n",comparisons);return 0;
+        if(bad){std::fputs("PACKED_LONG_NUMERICAL_GATE_FAIL\n",stderr);return 1;}
+        std::fprintf(stderr,"PACKED_LONG_PASS comparisons=%d sampled_rng_equal=1\n",comparisons);return 0;
     } catch(const std::exception& x) {
         std::fprintf(stderr,"PACKED_LONG_FAIL %s\n",x.what());return 1;
     }
