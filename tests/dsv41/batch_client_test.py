@@ -48,6 +48,17 @@ with tempfile.TemporaryDirectory() as td:
             cancel.set()
             list(stream)
         assert not any(engine.batch_wire.active)
+        assert engine.info["batch_counter"] == 1  # INFO parser normalizes numeric fields.
+        def draws(ctx,n,ids):
+            return [v for v in engine.generate_batched(ids,n,{"seed":13},ctx) if v is not None]
+        whole=draws(threading.Event(),8,[1,2])
+        context=threading.Event()
+        segmented=draws(context,3,[1,2])
+        draws(threading.Event(),4,[9,8])
+        segmented+=draws(context,5,[1,2,99,98])
+        assert whole==segmented,(whole,segmented)
+        assert context._strata_ds4_rng["next"]==8
+        print("REAL_CLIENT_SEGMENTED_COUNTER_PASS integer capability; 3+5 draws; inserted prompt; neighbor")
         print("REAL_CLIENT_NATIVE_MOCK_PASS 4 concurrent streams; request-local last; cancel/reuse; fifth waiter; no legacy migration")
     finally:
         engine.close()

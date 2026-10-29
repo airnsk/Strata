@@ -5,7 +5,7 @@ from pathlib import Path
 sys.path.insert(0,str(Path(__file__).resolve().parents[2]))
 from serve.ds4_batch_protocol import BatchWire, stream_request
 class Engine:
-    info={"batch_context":"128","batch_counter":"1"}
+    info={"batch_context":"128","batch_counter":1}
     def __init__(self):
         self.batch_wire=BatchWire(4,128); self.wlock=threading.Lock()
         self.last={}; self.commands=[]

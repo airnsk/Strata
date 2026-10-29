@@ -17,7 +17,7 @@ int serve_batch4(strata::ds4::Model& m,const std::string& eos_list) {
     }
     for(const auto& l:m.info_lines())std::printf("%s\n",l.c_str());
     std::printf("INFO batch_slots=4 batch_groups=1 batch_protocol=ds4-v2 batch_migration=0 batch_spec=0 batch_counter=1 batch_context=%lld\n",(long long)capacity);
-    std::printf("READY %lld stop\n",(long long)m.max_context());std::fflush(stdout);
+    std::printf("READY %lld stop\n",(long long)capacity);std::fflush(stdout);
     auto reader=std::make_shared<Lines>();
     Lines& in=*reader;in.start(reader);
     const auto eos=parse_ids(eos_list);

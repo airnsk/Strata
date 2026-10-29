@@ -1,8 +1,20 @@
 """Versioned DS4 AR slot mailboxes. No GPU or model state is owned here."""
 import math
+import os
+import json
+import time
 import queue
 import threading
 from collections import deque
+
+_trace_lock = threading.Lock()
+def _segment_trace(event, rng, **fields):
+    path = os.environ.get("STRATA_DS4_TEST_WIRE_LOG")
+    if path:
+        record = {"event":event, "time":time.monotonic(), "logical":rng["logical"],
+                  "seed":rng["seed"], "counter":rng["next"], **fields}
+        with _trace_lock, open(path+".segments.jsonl","a",encoding="utf-8") as f:
+            f.write(json.dumps(record)+"\n")
 
 
 class BatchWire:
@@ -153,14 +165,14 @@ def stream_request(engine, ids, max_new, sampling, cancel, embeddings, error_typ
     rng = getattr(cancel, "_strata_ds4_rng", None)
     effective_seed = 0 if seed is None else seed
     if rng is None:
-        rng = {"seed": effective_seed, "next": 0}
+        rng = {"seed": effective_seed, "next": 0, "logical": str(time.monotonic_ns())}
         cancel._strata_ds4_rng = rng
     elif rng["seed"] != effective_seed:
         raise ValueError("DS4 logical request seed changed between segments")
     counter = rng["next"]
     if not 0 <= counter <= (2**64 - 1) - max_new:
         raise ValueError("DS4 logical request RNG counter overflow")
-    if engine.info.get("batch_counter") == "1":
+    if engine.info.get("batch_counter") in ("1", 1):
         keys += f" counter={counter}"
     elif counter:
         raise ValueError("DS4 engine cannot preserve segmented RNG counter")
@@ -194,6 +206,7 @@ def stream_request(engine, ids, max_new, sampling, cancel, embeddings, error_typ
         slot, epoch, q = lease
         engine.last = {"generated": 0, "prompt_tokens": len(ids), "prompt_ms": 0,
                        "decode_ms": 0, "finish": "", "reused": 0}
+        _segment_trace("begin",rng,slot=slot,epoch=epoch,prompt_n=len(ids),max_new=max_new)
         send(f"BGEN2 {slot} {epoch} {max_new}{keys} spec=0 " + ",".join(map(str, ids)))
         sent = True
         stopped = False
@@ -215,6 +228,7 @@ def stream_request(engine, ids, max_new, sampling, cancel, embeddings, error_typ
                 engine.last = {**engine.last, "generated": engine.last["generated"] + 1}
                 if not stopped:
                     rng["next"] += 1
+                    _segment_trace("token",rng,slot=slot,epoch=epoch)
                     yield int(fields[3])
             elif fields[0] == "BPP2":
                 cancel._strata_batch_progress = (int(fields[3]), int(fields[4]))
@@ -227,6 +241,8 @@ def stream_request(engine, ids, max_new, sampling, cancel, embeddings, error_typ
                     raise error_type("nonfinite batch logits")
                 return
     finally:
+        if sent:
+            _segment_trace("end",rng,slot=slot,epoch=epoch,delivered=rng["next"]-counter)
         wire.abandon(ticket)
         if lease is not None:
             slot, epoch, q = lease
