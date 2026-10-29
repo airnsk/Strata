@@ -1164,7 +1164,7 @@ class StrataEngine:
         self.batch_wire = None
         if self.info.get("batch_protocol") == "ds4-v2":
             from .ds4_batch_protocol import BatchWire
-            if self.info.get("batch_migration") not in ("0", 0) or self.info.get("batch_spec") not in ("0", 0):
+            if self.info.get("batch_migration") not in ("0", 0) or self.info.get("batch_spec") not in ("0", 0, "1", 1):
                 raise ValueError("unsupported DS4 batch capability")
             self.batch_wire = BatchWire(self.batch, int(self.info["batch_context"]))
         self.slot_busy = self.batch_wire.active if self.batch_wire is not None else [False] * self.batch

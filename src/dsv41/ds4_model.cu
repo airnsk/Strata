@@ -7757,7 +7757,9 @@ struct Model::Impl : RequestHostState<strata::dsv41k::SpecList, kWin> {
         Dev& hd = devs[(size_t) head_dev];
         cudaSetDevice(hd.id);
         int m = 0;
-        if (temperature <= 0.0f) {
+        if(n==0) {
+            next=sample_row(0,temperature,top_p,top_k,min_p,seed,counter,nullptr);
+        } else if (temperature <= 0.0f) {
             strata::dsv41k::SamplerParams sp;
             sp.greedy = true;
             sp.temperature = 0.0f;
@@ -10391,12 +10393,12 @@ int Model::draft_block() const { return p_->g.n_mtp > 0 ? p_->g.d_block : 0; }
 bool Model::gpus_are_gfx12() const { return p_->rdna4(); }
 bool Model::draft(int y, std::vector<int>& d, std::vector<float>& c, std::string& err, float t, float tp, int tk,
                   float mp, uint64_t seed, uint64_t counter) {
-    if(p_->active_request && !std::getenv("DS4_BATCH_SPEC_TEST")) {err="resident DSpark requires experimental validation gate";return false;}
+    if(p_->active_request && !std::getenv("DS4_BATCH_SPEC_TEST") && !(std::getenv("DS4_BATCH_SPEC") && std::atoi(std::getenv("DS4_BATCH_SPEC"))==1)) {err="resident DSpark requires experimental validation gate";return false;}
     return p_->draft(y, d, c, err, t, tp, tk, mp, seed, counter);
 }
 bool Model::verify(int y, const std::vector<int>& d, float t, float tp, int tk, float mp, uint64_t seed, uint64_t counter,
                    int& accepted, int& next, std::string& err) {
-    if(p_->active_request && !std::getenv("DS4_BATCH_SPEC_TEST")) {err="resident DSpark requires experimental validation gate";return false;}
+    if(p_->active_request && !std::getenv("DS4_BATCH_SPEC_TEST") && !(std::getenv("DS4_BATCH_SPEC") && std::atoi(std::getenv("DS4_BATCH_SPEC"))==1)) {err="resident DSpark requires experimental validation gate";return false;}
     return p_->verify(y, d, t, tp, tk, mp, seed, counter, accepted, next, err);
 }
 int64_t Model::pos() const { return p_->pos; }

@@ -2,6 +2,8 @@
 """Executes the actual native scheduler with a deterministic CPU model stub."""
 from pathlib import Path
 import os
+import sys
+spec_mode = "--spec" in sys.argv
 import queue
 import subprocess
 import tempfile
@@ -15,7 +17,7 @@ with tempfile.TemporaryDirectory() as d:
                     "-I"+str(root/"src/dsv41"),str(root/"tests/dsv41/batch_scheduler_mock.cpp"),
                     "-o",str(exe)],check=True)
     proc=subprocess.Popen([str(exe)],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,
-                           text=True,env={**os.environ,"DS4_BATCH_CAP":"128"})
+                           text=True,env={**os.environ,"DS4_BATCH_CAP":"128", "DS4_BATCH_SPEC":str(int(spec_mode))})
     q=queue.Queue()
     def pump():
         for line in proc.stdout:q.put(line.strip())
@@ -31,7 +33,7 @@ with tempfile.TemporaryDirectory() as d:
         raise AssertionError(result)
     take_until(lambda xs:xs[-1].startswith("READY"))
     # One write makes all admissions visible together; no sequential GEN path.
-    proc.stdin.write("".join(f"BGEN2 {b} 1 8 seed={b} spec=0 1,2,3\n" for b in range(4)))
+    proc.stdin.write("".join(f"BGEN2 {b} 1 8 seed={b} spec={int(spec_mode)} 1,2,3\n" for b in range(4)))
     proc.stdin.flush()
     result=take_until(lambda xs:sum(x.startswith("BDONE2") for x in xs)==4)
     for b in range(4):
@@ -80,5 +82,5 @@ with tempfile.TemporaryDirectory() as d:
     proc.wait(timeout=10)
     err=proc.stderr.read()
     assert proc.returncode==0,err
-    assert "MOCK_PACKED 4" in err,err
+    assert ("MOCK_SPEC 4" if spec_mode else "MOCK_PACKED 4") in err,err
     print("ACTUAL_NATIVE_SCHEDULER_MOCK_PASS four streams; shared batch4; seeded output; stale cancel; reuse; malformed admission")

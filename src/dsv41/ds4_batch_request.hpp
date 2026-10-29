@@ -22,7 +22,7 @@ inline bool batch_float(const std::string& s,float& v) {
 }
 // Strict, bounded text-only AR grammar. Validate before allocating/mutating state.
 template<class Request>
-bool parse_batch_request(const std::string& text,int vocab,int64_t capacity,Request& r) {
+bool parse_batch_request(const std::string& text,int vocab,int64_t capacity,Request& r,bool allow_spec=false) {
     std::istringstream in(text);std::string field;uint64_t count=0;
     if(!(in>>field)||!batch_u64(field,count)||count==0||count>(uint64_t)capacity)return false;
     r.max_new=(int64_t)count;r.spec=false;r.ids.clear();r.rng_counter=0;
@@ -37,7 +37,7 @@ bool parse_batch_request(const std::string& text,int vocab,int64_t capacity,Requ
             uint64_t n=0;float f=0;
             if(k=="seed"){if(!batch_u64(v,n))return false;r.seed=n;}
             else if(k=="counter"){if(!batch_u64(v,n))return false;r.rng_counter=n;}
-            else if(k=="spec"){if(v!="0")return false;}
+            else if(k=="spec"){if(v!="0" && !(allow_spec && v=="1"))return false;r.spec=(v=="1");}
             else if(k=="top_k"){if(!batch_u64(v,n)||n>64)return false;r.top_k=(int)n;}
             else if(k=="temperature"){if(!batch_float(v,f)||f<0)return false;r.temperature=f;}
             else if(k=="top_p"){if(!batch_float(v,f)||f<=0||f>1)return false;r.top_p=f;}

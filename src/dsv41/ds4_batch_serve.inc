@@ -1,13 +1,14 @@
-// Included by ds4_main.cpp after its request parser. Experimental AR-only,
+// Included by ds4_main.cpp after its request parser. Experimental request-isolated AR/speculative scheduler,
 // one execution owner. Versioned wire events never alias a reused slot.
-int serve_batch4(strata::ds4::Model& m,const std::string& eos_list) {
+int serve_batch4(strata::ds4::Model& m,const std::string& eos_list,float conf_min=0.0f) {
+    const bool spec_enabled=std::getenv("DS4_BATCH_SPEC") && std::atoi(std::getenv("DS4_BATCH_SPEC"))==1 && m.draft_block()>0;
     const int64_t capacity=std::getenv("DS4_BATCH_CAP")?std::atoll(std::getenv("DS4_BATCH_CAP")):32768;
     if(capacity<=0 || capacity>m.max_context()) {std::fprintf(stderr,"invalid batch capacity\n");return 1;}
     struct Slot {
         uint64_t handle=0,epoch=0,counter=0;
         Req req;
         int read=0,generated=0,next=-1;
-        bool busy=false,decode=false,cancel=false;
+        bool busy=false,decode=false,cancel=false,cool=false;
         double born=0,first=0,prompt_ms=0;
     };
     std::array<Slot,4> slots;
@@ -16,7 +17,7 @@ int serve_batch4(strata::ds4::Model& m,const std::string& eos_list) {
         std::fprintf(stderr,"batch allocation: %s\n",err.c_str());return 1;
     }
     for(const auto& l:m.info_lines())std::printf("%s\n",l.c_str());
-    std::printf("INFO batch_slots=4 batch_groups=1 batch_protocol=ds4-v2 batch_migration=0 batch_spec=0 batch_counter=1 batch_context=%lld\n",(long long)capacity);
+    std::printf("INFO batch_slots=4 batch_groups=1 batch_protocol=ds4-v2 batch_migration=0 batch_spec=%d batch_counter=1 batch_context=%lld\n",int(spec_enabled),(long long)capacity);
     std::printf("READY %lld stop\n",(long long)capacity);std::fflush(stdout);
     auto reader=std::make_shared<Lines>();
     Lines& in=*reader;in.start(reader);
@@ -33,6 +34,16 @@ int serve_batch4(strata::ds4::Model& m,const std::string& eos_list) {
         s.busy=false;s.decode=false;s.cancel=false;
         return true;
     };
+    auto emit=[&](int b,int token)->bool {
+        auto& s=slots[b];
+        if(token<0 || token>=m.vocab())return terminal(b,"nonfinite");
+        ++s.counter;++s.generated;s.next=token;
+        if(!s.first)s.first=now_ms();
+        std::printf("BT2 %d %llu %d\n",b,(unsigned long long)s.epoch,token);std::fflush(stdout);
+        if(std::find(eos.begin(),eos.end(),token)!=eos.end())return terminal(b,"stop");
+        if(s.generated>=s.req.max_new)return terminal(b,"length");
+        s.decode=true;return true;
+    };
     std::vector<float> checked_logits; // correctness gate; explicit cost in prototype timings
     auto output=[&](int b)->bool {
         auto& s=slots[b];
@@ -41,13 +52,7 @@ int serve_batch4(strata::ds4::Model& m,const std::string& eos_list) {
         if(checked_logits.empty() || std::any_of(checked_logits.begin(),checked_logits.end(),
                 [](float value){return !std::isfinite(value);})) return terminal(b,"nonfinite");
         const int token=m.sample(s.req.temperature,s.req.top_p,s.req.top_k,s.req.min_p,s.req.seed,s.counter);
-        if(token<0 || token>=m.vocab()) return terminal(b,"nonfinite");
-        ++s.counter;++s.generated;s.next=token;
-        if(!s.first)s.first=now_ms();
-        std::printf("BT2 %d %llu %d\n",b,(unsigned long long)s.epoch,token);std::fflush(stdout);
-        if(std::find(eos.begin(),eos.end(),token)!=eos.end())return terminal(b,"stop");
-        if(s.generated>=s.req.max_new)return terminal(b,"length");
-        s.decode=true;return true;
+        return emit(b,token);
     };
     while(!quit) {
         std::deque<std::string> commands;
@@ -84,14 +89,14 @@ int serve_batch4(strata::ds4::Model& m,const std::string& eos_list) {
                 std::printf("BERR2 %d %llu occupied_or_stale\n",b,(unsigned long long)epoch);std::fflush(stdout);continue;
             }
             std::string rest;std::getline(parser,rest);Req request;
-            if(!strata::ds4::parse_batch_request(rest,m.vocab(),capacity,request)) {
+            if(!strata::ds4::parse_batch_request(rest,m.vocab(),capacity,request,spec_enabled)) {
                 std::printf("BERR2 %d %llu invalid_or_unsupported_request\n",b,(unsigned long long)epoch);std::fflush(stdout);continue;
             }
             if(!s.handle&&!m.request_create(capacity,s.handle,err)) {
                 std::printf("BERR2 %d %llu capacity_unavailable\n",b,(unsigned long long)epoch);std::fflush(stdout);err.clear();continue;
             }
-            s.epoch=epoch;s.req=std::move(request);s.req.spec=false;s.counter=s.req.rng_counter;
-            s.read=s.generated=0;s.next=-1;s.busy=true;s.decode=s.cancel=false;
+            s.epoch=epoch;s.req=std::move(request);s.counter=s.req.rng_counter;
+            s.read=s.generated=0;s.next=-1;s.busy=true;s.decode=s.cancel=s.cool=false;
             s.born=now_ms();s.first=s.prompt_ms=0;
         }
         if(quit)break;
@@ -105,8 +110,55 @@ int serve_batch4(strata::ds4::Model& m,const std::string& eos_list) {
             handles.push_back(slots[b].handle);tokens.push_back(slots[b].next);owners.push_back(b);
         }
         if(!handles.empty()) {
-            if(!m.decode_batch(handles,tokens,err)){quit=true;break;}
-            for(int b:owners)if(!output(b)){quit=true;break;}
+            if(spec_enabled) {
+                std::vector<strata::ds4::SpecBatchRequest> requests;
+                for(int b:owners) {
+                    auto& s=slots[b];
+                    if(!m.request_select(s.handle,err)){quit=true;break;}
+                    m.checkpoint(1);
+                    strata::ds4::SpecBatchRequest r;
+                    r.request=s.handle;r.token=s.next;r.temperature=s.req.temperature;
+                    r.top_p=s.req.top_p;r.top_k=s.req.top_k;r.min_p=s.req.min_p;
+                    r.seed=s.req.seed;r.counter=s.counter;
+                    const int room=(int)(s.req.max_new-s.generated);
+                    const bool attempt=s.req.spec && !s.cool && room>1;
+                    if(attempt) {
+                        std::vector<float> confidence;
+                        if(!m.draft(s.next,r.drafts,confidence,err,r.temperature,r.top_p,r.top_k,r.min_p,r.seed,r.counter)){quit=true;break;}
+                        int keep=0;float cumulative=1;
+                        const float threshold=s.req.conf>=0?s.req.conf:conf_min;
+                        const float cum_min=s.req.cum>=0?s.req.cum:dspark_cum_default(m);
+                        while(keep<(int)r.drafts.size() && keep<room-1 && confidence[keep]>=threshold &&
+                              (cumulative*=confidence[keep])>=cum_min)++keep;
+                        r.drafts.resize(keep);
+                    }
+                    s.cool=attempt && r.drafts.empty();
+                    requests.push_back(std::move(r));
+                }
+                if(quit)break;
+                std::vector<strata::ds4::SpecBatchResult> results;
+                if(!m.verify_batch(requests,results,err)){quit=true;break;}
+                for(size_t i=0;i<owners.size();++i) {
+                    const int b=owners[i];const auto& result=results[i];
+                    if(!m.request_select(slots[b].handle,err)||!m.logits(checked_logits)){quit=true;break;}
+                    if(checked_logits.empty()||std::any_of(checked_logits.begin(),checked_logits.end(),
+                        [](float value){return !std::isfinite(value);})) {
+                        if(!terminal(b,"nonfinite")){quit=true;break;}
+                        continue;
+                    }
+                    if(std::getenv("DS4_BATCH_DIAG"))
+                        std::fprintf(stderr,"DS4_BATCH_ROUND slot=%d epoch=%llu offered=%zu accepted=%d\n",
+                            b,(unsigned long long)slots[b].epoch,requests[i].drafts.size(),result.accepted);
+                    for(int j=0;j<=result.accepted && slots[b].busy;++j) {
+                        const int token=j<result.accepted?requests[i].drafts[j]:result.next;
+                        if(!emit(b,token)){quit=true;break;}
+                    }
+                    if(quit)break;
+                }
+            } else {
+                if(!m.decode_batch(handles,tokens,err)){quit=true;break;}
+                for(int b:owners)if(!output(b)){quit=true;break;}
+            }
         }
         if(quit)break;
         bool prefilled=false;

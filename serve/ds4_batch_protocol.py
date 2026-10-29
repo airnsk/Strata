@@ -207,7 +207,8 @@ def stream_request(engine, ids, max_new, sampling, cancel, embeddings, error_typ
         engine.last = {"generated": 0, "prompt_tokens": len(ids), "prompt_ms": 0,
                        "decode_ms": 0, "finish": "", "reused": 0}
         _segment_trace("begin",rng,slot=slot,epoch=epoch,prompt_n=len(ids),max_new=max_new)
-        send(f"BGEN2 {slot} {epoch} {max_new}{keys} spec=0 " + ",".join(map(str, ids)))
+        spec = int(engine.info.get("batch_spec") in ("1", 1))
+        send(f"BGEN2 {slot} {epoch} {max_new}{keys} spec={spec} " + ",".join(map(str, ids)))
         sent = True
         stopped = False
         while True:

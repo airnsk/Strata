@@ -299,3 +299,28 @@ accepted counts and saved states. No throughput or quality claim follows from
 these compilation and CPU results.
 
 17:11 UTC: final isolated HIP model/native/oracle build PASS after extracting the partition helper. The binary is build-spec-batch/segmented-spec-http-test. No GPU segmented-verify result yet.
+
+
+### 2026-10-29 17:19 UTC — opt-in HTTP speculative scheduler preparation
+
+The new HTTP/native path is compiled behind DS4_BATCH_SPEC=1, with request-local
+draft distributions, sampling parameters and committed counters. Each ready
+request drafts independently; target segments share verify_batch and are split
+without splitting a request when the aggregate exceeds 16 rows. Accepted tokens
+and the replacement/bonus token are emitted per request; EOS/length release only
+that request. Requests with no offered drafts use a one-row target segment and
+one sampler draw. This path has not yet passed its GPU/HTTP release gate.
+The default remains AR and the running window 13 still uses the frozen
+07c19327 oracle binary.
+
+Changed parser accepts spec=1 only when explicitly enabled. Python negotiates
+batch_spec=1 and keeps the existing generation-tagged lifecycle and logical RNG
+carry. Public resident draft/verify are gated; the sampled kernel/precision and
+target sampler remain unchanged. CPU protocol, real scheduler mock (AR and spec
+modes), client lifecycle and RNG checks PASS after these changes. HIP model and
+native binary build-batch-final/strata-dsv41 compile/link PASS.
+No repeat of unchanged long GPU composition/fairness matrices is planned, per
+the user's request to shorten validation. Window 13 correctness plus a bounded
+HTTP four-stream/cancel check and one comparable measurement remain release
+conditions. Adaptive-profile arithmetic uncertainty remains a documented limit,
+not a claimed production correction.
