@@ -13,6 +13,7 @@
 //   h = post * moe + comb^T h;  pre = f_pre
 // and after the last layer logits = head(rmsnorm(sum_s pre[s] h[s])).
 #include "ds4_model.hpp"
+#include "ds4_request_state.hpp"
 #include "ds4_pick_rule.hpp"
 #include "ds4_yoco_pipeline.hpp"
 #include "ds4_experts_rule.hpp"
@@ -636,7 +637,7 @@ struct Chunk {
     uint64_t it_lc = 0;                      // items taken from the layer cache
 };
 
-struct Layer {
+struct Layer : LayerRequestViews {
     int il = 0, dev = 0, ratio = 0;
     // its group (tensor parallel: nm members, each a copy of the device state in mates, member mi's share of the
     // heads, of wo_a's groups, of wo_b's rows and of the FFNs: gate / up columns, down rows; its part of an expert
@@ -669,11 +670,6 @@ struct Layer {
           *gate_bias_vl = nullptr;   // (the image tokens' routing bias, with the vision tower)
     uint16_t* i_wproj = nullptr;
     float* gate_w = nullptr;   // the router's weights, F32 (DeepSeek's inference computes the gate in F32)
-    uint8_t* win = nullptr;                     // [win] rows of kKvFp8 (kv_row_bytes)
-    float *c_kv = nullptr, *c_score = nullptr;  // the compressor's partial group (ratio > 1)
-    // a run of chunks' mid-run checkpoint (feed_mark): the ring and the partial group as they were before a row
-    uint8_t* snap_win = nullptr;
-    float *snap_kv = nullptr, *snap_sc = nullptr;
     // routed experts
     x3::ExpertLayout lay;
     size_t blob = 0;                            // bytes of one expert's blob
@@ -700,8 +696,6 @@ struct Layer {
     unsigned long long* tab_pin = nullptr;      // pinned: the table entries a swap writes
     // a speculative window's backups (trunk layers): the ring rows it replaced, and a compressor's state before it and
     // the window's raw rows (kv, then score) to replay the accepted ones
-    uint8_t* ring_bak = nullptr;
-    float *c_snap = nullptr, *c_rows = nullptr;
     unsigned long long* vram_tab = nullptr;     // device [n_exp]
     std::vector<uint8_t> zc;                    // (the RAM store) expert -> 1: its store slot is GPU-visible, the device computes it over PCIe
     unsigned long long* zc_tab = nullptr;       // device [n_exp]: those slots' device addresses (0: none) - the decode token's zc_stage reads it
@@ -718,11 +712,8 @@ struct Layer {
     uint64_t mx_off[3] = {0, 0, 0}, mx_stride[3] = {0, 0, 0};
 };
 
-struct Src {
+struct Src : SourceRequestViews {
     int layer = 0, ratio = 1;
-    int64_t cap = 0;
-    // per device (nullptr where no layer reads it): rows of kKvFp4 (the compressed KV), kKvFp4p (the index keys)
-    std::vector<uint8_t*> ckv, ik;
     uint8_t *h_ckv = nullptr, *h_ik = nullptr;   // pinned: a window's new rows, on their way to the other devices
     cudaEvent_t ev_ckv = nullptr, ev_ik = nullptr;
     // threads: whether devices outside the source's group read it, and the host-mapped hand-off of a window's new rows
@@ -821,7 +812,7 @@ struct WinPlan {
 }  // namespace
 
 // ------------------------------------------------------------------ the model
-struct Model::Impl {
+struct Model::Impl : RequestHostState<strata::dsv41k::SpecList, kWin> {
     Options o;
     Pack pk;
     Geo g;
@@ -937,7 +928,6 @@ struct Model::Impl {
     unsigned* mk_slots = nullptr;
     unsigned mk_seq = 0;
     int d_dev = 0;                    // the drafter's first block's device
-    bool spec_win = false;            // the window being run is a draft's verification (layer() keeps backups)
     float* h_taps = nullptr;          // pinned [kWin][targets][dim]: the last window's taps
     cudaEvent_t ev_seed = nullptr;    // the drafter's seeding read h_taps: the next window's taps wait for it
     float* d_confv = nullptr;         // on the head device
@@ -947,11 +937,6 @@ struct Model::Impl {
     // verify()'s rule - a point at the draft for the drafter's argmax; and the chain they were drawn with (verify()
     // checks it is its own)
     strata::dsv41k::SpecList* d_specq = nullptr;
-    std::vector<strata::dsv41k::SpecList> h_specq = std::vector<strata::dsv41k::SpecList>(kWin);
-    bool drafts_q = false;
-    float dq_temp = 0.0f, dq_top_p = 1.0f, dq_min_p = 0.0f;
-    int dq_top_k = 0;
-    uint64_t dq_seed = 0, dq_counter = 0;
     // (tests) DS4_DSPARK_SAMPLE=1: a sampled request's drafts drawn from the drafter's distribution through the
     // request's chain, as DeepSeek's reference does (else its argmax: the same acceptance on Uranus, 31-32% of 5
     // drafts a round either way); DS4_DSPARK_QTEMP=f: those draws at f x the request's temperature (any q keeps the
@@ -994,27 +979,9 @@ struct Model::Impl {
     std::atomic<int64_t> eg_rows_n{0}, eg_hits_n{0}, eg_reads_n{0}, eg_wait_ns{0}, eg_io_ns{0};
     uint16_t* h_emb = nullptr;        // the window's embedding rows
     std::vector<float> c_xh, c_xsb, c_acc, c_xhd, c_xsd, c_accd, c_yd;
-    // the state
-    int64_t pos = 0;
-    std::vector<int32_t> toks, ctoks;
-    struct Check {                    // the state at a position: every window ring, the compressors' partial groups
-        int64_t pos = -1;
-        std::vector<std::vector<uint8_t>> win;
-        std::vector<std::vector<float>> comp;
-    };
-    static constexpr int kChecks = 4;
-    Check ck[kChecks];                // the end of the last prompt, the position before it, the anchor (the position
-                                      // before the end of the first prompt of the run of prompts that each continued
-                                      // the last in place: a chat template that drops earlier turns' reasoning at a new
-                                      // user message re-renders the history from about there) and the prefix (where the
-                                      // server said the prompt's shared start - system prompt and tools - ends: another
-                                      // agent behind the same start goes back to it)
-    bool slot_held = false;           // slot_save took this state and nothing has changed it since
-    std::vector<uint32_t> prof;       // [nl][n_exp] routed-expert hits
-    Stats st;
-    int cur_topk_n[kWin] = {}, cur_cand_n[kWin] = {};   // what the latest indexer / candidate source left, per query
-                                                        // (plan_window's: the windows' plans are made in order)
-    int n_logits = 0;                 // the last forward's logit rows
+    // Active request host state is inherited from RequestHostState. Weight/cache
+    // policy remains shared. This refactor does not yet admit resident requests.
+    std::vector<uint32_t> prof;       // shared expert-placement statistics
     // the decode path (windows of one): the device publishes each layer's routing into reqs, the service thread
     // answers in resps with the CPU lane's part, and the device waits for the answer only before the expert sum
     Req* reqs = nullptr;
@@ -1324,6 +1291,7 @@ struct Model::Impl {
             if (ram_pinned) (void) cudaHostUnregister(ram_chunks[i]);
             os::anon_free(ram_chunks[i], ram_chunk_bytes[i]);
         }
+        for (size_t i=1;i<resident.size();++i) resident_free(resident[i]);
         for (Dev& d : devs) {
             cudaSetDevice(d.id);
             for (void* p : d.allocs) cudaFree(p);
@@ -5205,6 +5173,137 @@ struct Model::Impl {
         }
     }
 
+    // Experimental resident AR request API. Default request0 keeps the original
+    // allocation. Four additional bounded arenas share weights/workspace.
+    using HostRequest = RequestHostState<strata::dsv41k::SpecList, kWin>;
+    struct Resident {
+        HostRequest host;
+        std::vector<LayerRequestViews> layers;
+        std::vector<SourceRequestViews> sources;
+        std::vector<std::pair<int,void*>> allocations;
+        float* logits = nullptr;
+        int64_t capacity = 0;
+        uint64_t generation = 0;
+        bool live = false;
+    };
+    std::array<Resident,5> resident;
+    unsigned active_request = 0;
+    bool resident_initialized = false;
+    bool request_sync(std::string& err) {
+        for(auto& b:eg_win) if(b->live) eg_finish(*b);
+        for(auto& d:devs) {
+            cudaSetDevice(d.id);
+            if(cudaStreamSynchronize(d.st)!=cudaSuccess) {
+                err="resident request: stream completion failed";return false;
+            }
+        }
+        return true;
+    }
+    void resident_free(Resident& r) {
+        for(auto [di,p]:r.allocations) {cudaSetDevice(devs[di].id);cudaFree(p);}
+        r.allocations.clear();r.layers.clear();r.sources.clear();r.host=HostRequest{};
+        r.logits=nullptr;r.capacity=0;r.live=false;
+    }
+    bool resident_init(std::string& err) {
+        if(resident_initialized) return true;
+        if(devs.empty() || L.empty()) {err="model is not loaded";return false;}
+        for(const auto& l:L) if(l.nm!=1) {err="resident prototype requires nm=1";return false;}
+        if(!request_sync(err)) return false;
+        auto& base=resident[0];base.live=true;base.capacity=o.max_context;
+        for(const auto& l:L) base.layers.push_back(static_cast<const LayerRequestViews&>(l));
+        for(const auto& s:srcs) base.sources.push_back(static_cast<const SourceRequestViews&>(s));
+        base.logits=devs[head_dev].logits;
+        resident_initialized=true;return true;
+    }
+    template<class T>
+    bool resident_alloc(Resident& r,int di,T*& dst,size_t n,std::string& err) {
+        if(n==0) {dst=nullptr;return true;}
+        if(n>SIZE_MAX/sizeof(T)-256) {err="request allocation overflow";return false;}
+        const size_t bytes=align256(n*sizeof(T));
+        cudaSetDevice(devs[di].id);void* p=nullptr;
+        // Admission leaves a fixed allocator margin; no expert eviction here.
+        size_t free=0,total=0;
+        if(cudaMemGetInfo(&free,&total)!=cudaSuccess || free<bytes || free-bytes<(128ull<<20)) {
+            err="request arena exceeds free VRAM minus 128 MiB margin";return false;
+        }
+        if(cudaMalloc(&p,bytes)!=cudaSuccess) {err="request arena allocation failed";return false;}
+        r.allocations.emplace_back(di,p);dst=static_cast<T*>(p);
+        if(cudaMemset(p,0,bytes)!=cudaSuccess) {err="request arena zeroing failed";return false;}
+        return true;
+    }
+    bool request_create(int64_t capacity,uint64_t& id,std::string& err) {
+        id=0;
+        if(capacity<=0 || capacity>o.max_context) {err="invalid resident capacity";return false;}
+        if(!resident_init(err) || !request_sync(err)) return false;
+        unsigned slot=1;
+        for(;slot<resident.size();++slot) if(!resident[slot].live) break;
+        if(slot==resident.size()) {err="four resident requests already admitted";return false;}
+        auto& r=resident[slot];
+        if(r.generation>=((UINT64_MAX)>>8)) {err="request generation exhausted";return false;}
+        r.layers.resize(L.size());r.sources.resize(srcs.size());r.capacity=capacity;
+        const auto allocate=[&](){
+            for(size_t i=0;i<L.size();++i) {
+                const auto& l=L[i];auto& v=r.layers[i];const int di=l.dev;
+                if(!resident_alloc(r,di,v.win,(size_t)g.win*win_rb(),err)) return false;
+                if(l.c_kv && (!resident_alloc(r,di,v.c_kv,(size_t)l.ratio*g.hd,err) ||
+                    !resident_alloc(r,di,v.c_score,(size_t)l.ratio*g.hd,err))) return false;
+                if(!resident_alloc(r,di,v.snap_win,(size_t)g.win*win_rb(),err)) return false;
+                if(l.c_kv && (!resident_alloc(r,di,v.snap_kv,(size_t)l.ratio*g.hd,err) ||
+                    !resident_alloc(r,di,v.snap_sc,(size_t)l.ratio*g.hd,err))) return false;
+                if(l.ring_bak && !resident_alloc(r,di,v.ring_bak,(size_t)kWin*win_rb(),err)) return false;
+                if(l.c_snap && (!resident_alloc(r,di,v.c_snap,(size_t)2*l.ratio*g.hd,err) ||
+                    !resident_alloc(r,di,v.c_rows,(size_t)2*kWin*g.hd,err))) return false;
+            }
+            for(size_t i=0;i<srcs.size();++i) {
+                const auto& s=srcs[i];auto& v=r.sources[i];
+                v.cap=(capacity+s.ratio-1)/s.ratio+1;
+                v.ckv.resize(devs.size());v.ik.resize(devs.size());
+                for(size_t di=0;di<devs.size();++di) {
+                    if(s.ckv[di] && !resident_alloc(r,(int)di,v.ckv[di],(size_t)v.cap*ckv_rb(),err)) return false;
+                    if(s.ik[di] && !resident_alloc(r,(int)di,v.ik[di],(size_t)v.cap*ik_rb(),err)) return false;
+                }
+            }
+            return resident_alloc(r,head_dev,r.logits,(size_t)kWin*g.vocab,err);
+        };
+        if(!allocate()) {resident_free(r);return false;}
+        ++r.generation;r.live=true;id=(r.generation<<8)|slot;return true;
+    }
+    bool request_select(uint64_t id,std::string& err) {
+        if(!resident_init(err)) return false;
+        const unsigned slot=(unsigned)(id&255);
+        if(slot>=resident.size() || !resident[slot].live ||
+            (slot==0 ? id!=0 : resident[slot].generation!=(id>>8))) {
+            err="stale or invalid request handle";return false;
+        }
+        if(slot==active_request) return true;
+        if(spec_win || drafts_q) {err="cannot switch an unfinished speculative round";return false;}
+        if(!request_sync(err)) return false;
+        for(size_t i=0;i<L.size();++i) resident[active_request].layers[i]=static_cast<LayerRequestViews&>(L[i]);
+        for(size_t i=0;i<srcs.size();++i) resident[active_request].sources[i]=static_cast<SourceRequestViews&>(srcs[i]);
+        resident[active_request].host=std::move(static_cast<HostRequest&>(*this));
+        static_cast<HostRequest&>(*this)=std::move(resident[slot].host);
+        for(size_t i=0;i<L.size();++i) static_cast<LayerRequestViews&>(L[i])=resident[slot].layers[i];
+        for(size_t i=0;i<srcs.size();++i) static_cast<SourceRequestViews&>(srcs[i])=resident[slot].sources[i];
+        devs[head_dev].logits=resident[slot].logits;
+        active_request=slot;
+        return true;
+    }
+    bool request_release(uint64_t id,std::string& err) {
+        const unsigned slot=(unsigned)(id&255);
+        if(!resident_initialized || slot==0 || slot>=resident.size() ||
+            !resident[slot].live || resident[slot].generation!=(id>>8)) {
+            err="stale or invalid request release";return false;
+        }
+        if(active_request==slot && !request_select(0,err)) return false;
+        if(!request_sync(err)) return false;
+        resident_free(resident[slot]);return true;
+    }
+    bool request_room(int64_t n,std::string& err) const {
+        const int64_t cap=active_request?resident[active_request].capacity:o.max_context;
+        if(n<0 || pos<0 || pos>cap || n>cap-pos) {err="request context capacity exceeded";return false;}
+        return true;
+    }
+
     void reset() {
         pos = 0;
         toks.clear();
@@ -5686,7 +5785,6 @@ struct Model::Impl {
     int img_tok = -1;
     std::string vision_err;              // why the tower did not load (pictures off), or empty
     std::vector<uint16_t> img_mark[3];   // image_start, image_newline, image_end: BF16 [dim]
-    std::vector<Image> imgs;             // the pictures of the prompt being fed, by start
     // a BF16 (or, rounded to nearest even, F32) tensor of n values into dst
     bool read_bf16(const Tensor& t, size_t n, void* dst) {
         if (t.dtype == "BF16") return t.bytes == n * 2 && pk.read(t, dst);
@@ -9812,8 +9910,14 @@ struct Model::Impl {
 Model::Model() : p_(new Impl) {}
 Model::~Model() = default;
 bool Model::load(const Options& o, std::string& err) { return p_->load(o, err); }
-bool Model::step(int token, bool logits, std::string& err) { return p_->step(token, logits, err); }
+bool Model::step(int token, bool logits, std::string& err) {
+    return p_->request_room(1,err) && p_->step(token, logits, err);
+}
+bool Model::request_create(int64_t capacity, uint64_t& id, std::string& err) { return p_->request_create(capacity,id,err); }
+bool Model::request_select(uint64_t id, std::string& err) { return p_->request_select(id,err); }
+bool Model::request_release(uint64_t id, std::string& err) { return p_->request_release(id,err); }
 bool Model::feed(const int* tokens, int n, int logits_rows, std::string& err) {
+    if(!p_->request_room(n,err)) return false;
     Impl& p = *p_;
     p.pm.last = -1;
     p.halted = false;
@@ -9827,6 +9931,7 @@ bool Model::feed(const int* tokens, int n, int logits_rows, std::string& err) {
     return p.feed_windows(tokens, n, logits_rows, err);
 }
 bool Model::feed_mark(const int* tokens, int n, int logits_rows, int slot, std::string& err) {
+    if(!p_->request_room(n,err)) return false;
     Impl& p = *p_;
     p.pm.last = -1;
     p.halted = false;
@@ -9863,10 +9968,12 @@ int Model::draft_block() const { return p_->g.n_mtp > 0 ? p_->g.d_block : 0; }
 bool Model::gpus_are_gfx12() const { return p_->rdna4(); }
 bool Model::draft(int y, std::vector<int>& d, std::vector<float>& c, std::string& err, float t, float tp, int tk,
                   float mp, uint64_t seed, uint64_t counter) {
+    if(p_->active_request) {err="resident prototype is AR-only; DSpark not validated";return false;}
     return p_->draft(y, d, c, err, t, tp, tk, mp, seed, counter);
 }
 bool Model::verify(int y, const std::vector<int>& d, float t, float tp, int tk, float mp, uint64_t seed, uint64_t counter,
                    int& accepted, int& next, std::string& err) {
+    if(p_->active_request) {err="resident prototype is AR-only; DSpark not validated";return false;}
     return p_->verify(y, d, t, tp, tk, mp, seed, counter, accepted, next, err);
 }
 int64_t Model::pos() const { return p_->pos; }

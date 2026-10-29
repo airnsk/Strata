@@ -106,6 +106,14 @@ public:
     Model();
     ~Model();
     bool load(const Options& o, std::string& err);
+    // Experimental single-execution-owner resident AR handles. Capacity includes
+    // prompt+output. No protocol capability is advertised; not packed batching.
+    // Handle0 selects the original request. A released handle never aliases a
+    // new generation. Selection waits for shared workspace/IO completion.
+    bool request_create(int64_t capacity, uint64_t& id, std::string& err);
+    bool request_select(uint64_t id, std::string& err);
+    bool request_release(uint64_t id, std::string& err);
+
 
     /// Feeds `token` at position pos(); with logits, the next token's logits are left on the head's device.
     bool step(int token, bool logits, std::string& err);
