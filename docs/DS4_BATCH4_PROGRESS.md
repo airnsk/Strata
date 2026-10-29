@@ -46,7 +46,13 @@ shared CPU/expert phase counters are not yet attributed per request.
   four streams reach common B4; independent counters, malformed admission and
   stale cancellation/reuse PASS. This does not test GPU math.
 - HIP gfx906 model and separate packed GPU harness compiled/linked.
-- Packed GPU correctness run is pending; do not infer correctness from build success.
+- packed_state_gpu.hpp: actual B4, three common steps with changing row order,
+  mixed positions 3/127/128/129. All eight full logits/state comparisons against
+  B1 (including checkpoint alternate continuation) were bit-identical. PASS.
+  This is a short fixed-profile test, not all-composition/long-context validation.
+- batch_client_test.py: actual StrataEngine client/pump with actual native scheduler
+  and CPU model stub: four concurrent streams, per-thread statistics and
+  cancellation/reuse PASS. Actual HTTP/GPU integration is still pending.
 
 ## Remaining release gates
 

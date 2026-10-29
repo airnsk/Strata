@@ -43,6 +43,7 @@ public:
  bool feed(const int*,int n,int,std::string&){positions.at(active)+=n;return true;}
  bool decode_batch(const std::vector<uint64_t>& h,const std::vector<int>& t,std::string&) {
   assert(h.size()==t.size());
+  std::this_thread::sleep_for(std::chrono::milliseconds(1));
   for(auto id:h)++positions.at(id);
   std::fprintf(stderr,"MOCK_PACKED %zu\n",h.size());return true;
  }
