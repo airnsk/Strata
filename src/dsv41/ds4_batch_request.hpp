@@ -25,7 +25,7 @@ template<class Request>
 bool parse_batch_request(const std::string& text,int vocab,int64_t capacity,Request& r) {
     std::istringstream in(text);std::string field;uint64_t count=0;
     if(!(in>>field)||!batch_u64(field,count)||count==0||count>(uint64_t)capacity)return false;
-    r.max_new=(int64_t)count;r.spec=false;r.ids.clear();
+    r.max_new=(int64_t)count;r.spec=false;r.ids.clear();r.rng_counter=0;
     std::unordered_set<std::string> keys;
     bool ids=false;
     while(in>>field) {
@@ -36,6 +36,7 @@ bool parse_batch_request(const std::string& text,int vocab,int64_t capacity,Requ
             if(!keys.insert(k).second)return false;
             uint64_t n=0;float f=0;
             if(k=="seed"){if(!batch_u64(v,n))return false;r.seed=n;}
+            else if(k=="counter"){if(!batch_u64(v,n))return false;r.rng_counter=n;}
             else if(k=="spec"){if(v!="0")return false;}
             else if(k=="top_k"){if(!batch_u64(v,n)||n>64)return false;r.top_k=(int)n;}
             else if(k=="temperature"){if(!batch_float(v,f)||f<0)return false;r.temperature=f;}
@@ -56,6 +57,6 @@ bool parse_batch_request(const std::string& text,int vocab,int64_t capacity,Requ
             }
         }
     }
-    return ids&&!r.ids.empty();
+    return ids&&!r.ids.empty() && r.rng_counter <= std::numeric_limits<uint64_t>::max()-count;
 }
 }

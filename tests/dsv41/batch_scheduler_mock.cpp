@@ -16,7 +16,7 @@
 #include <unordered_map>
 #include <cassert>
 struct Req {int64_t max_new=0;bool spec=true;std::vector<int> ids;
-float temperature=0,top_p=1,min_p=0;int top_k=64;uint64_t seed=0;};
+float temperature=0,top_p=1,min_p=0;int top_k=64;uint64_t seed=0,rng_counter=0;};
 double now_ms(){return std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();}
 std::vector<int> parse_ids(const std::string&){return {};}
 struct Lines {

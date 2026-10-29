@@ -106,13 +106,13 @@ def native_parser():
 #include <cassert>
 #include <vector>
 struct Req {int64_t max_new=0;bool spec=true;std::vector<int> ids;
-float temperature=0,top_p=1,min_p=0;int top_k=64;uint64_t seed=0;};
+float temperature=0,top_p=1,min_p=0;int top_k=64;uint64_t seed=0,rng_counter=0;};
 int main(){
 Req r;using strata::ds4::parse_batch_request;
 assert(parse_batch_request("2 seed=0 temperature=0 top_p=1 spec=0 1,2",20,4,r));
 assert(r.ids.size()==2&&r.max_new==2&&!r.spec);
 for(auto s:{"0 1","2 1,","2 ,1","2 1x","2 20","2 -1","2 1 2","2 seed=-1 1",
-"2 seed=18446744073709551616 1","2 temperature=nan 1","2 temperature=inf 1",
+"2 counter=18446744073709551615 1","2 counter=-1 1","2 seed=18446744073709551616 1","2 temperature=nan 1","2 temperature=inf 1",
 "2 top_p=0 1","2 top_k=65 1","2 unknown=1 1","2 spec=1 1","2 seed=1 seed=2 1",
 "3 1,2","2 1,,2","2 temperature=1garbage 1"}) {
 Req v;assert(!parse_batch_request(s,20,4,v));

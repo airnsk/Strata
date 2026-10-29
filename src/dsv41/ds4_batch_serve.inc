@@ -16,7 +16,7 @@ int serve_batch4(strata::ds4::Model& m,const std::string& eos_list) {
         std::fprintf(stderr,"batch allocation: %s\n",err.c_str());return 1;
     }
     for(const auto& l:m.info_lines())std::printf("%s\n",l.c_str());
-    std::printf("INFO batch_slots=4 batch_groups=1 batch_protocol=ds4-v2 batch_migration=0 batch_spec=0 batch_context=%lld\n",(long long)capacity);
+    std::printf("INFO batch_slots=4 batch_groups=1 batch_protocol=ds4-v2 batch_migration=0 batch_spec=0 batch_counter=1 batch_context=%lld\n",(long long)capacity);
     std::printf("READY %lld stop\n",(long long)m.max_context());std::fflush(stdout);
     auto reader=std::make_shared<Lines>();
     Lines& in=*reader;in.start(reader);
@@ -90,7 +90,7 @@ int serve_batch4(strata::ds4::Model& m,const std::string& eos_list) {
             if(!s.handle&&!m.request_create(capacity,s.handle,err)) {
                 std::printf("BERR2 %d %llu capacity_unavailable\n",b,(unsigned long long)epoch);std::fflush(stdout);err.clear();continue;
             }
-            s.epoch=epoch;s.req=std::move(request);s.req.spec=false;s.counter=0;
+            s.epoch=epoch;s.req=std::move(request);s.req.spec=false;s.counter=s.req.rng_counter;
             s.read=s.generated=0;s.next=-1;s.busy=true;s.decode=s.cancel=false;
             s.born=now_ms();s.first=s.prompt_ms=0;
         }

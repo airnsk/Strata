@@ -44,6 +44,20 @@ with tempfile.TemporaryDirectory() as d:
     proc.stdin.write("BGEN2 1 2 2 temperature=nan 1\n");proc.stdin.flush()
     bad=take_until(lambda xs:xs[-1].startswith("BERR2"))
     assert bad[-1]=="BERR2 1 2 invalid_or_unsupported_request",bad
+
+    # Identical draw stream despite transport segmentation, inserted prompt and neighbors.
+    proc.stdin.write("BGEN2 0 3 8 seed=13 counter=0 1,2\n");proc.stdin.flush()
+    whole=take_until(lambda xs:any(x.startswith("BDONE2 0 3") for x in xs))
+    full=[int(x.split()[3]) for x in whole if x.startswith("BT2 0 3")]
+    segmented=[]
+    for epoch,offset,count in [(4,0,3),(5,3,5)]:
+        proc.stdin.write(f"BGEN2 0 {epoch} {count} seed=13 counter={offset} 1,2,99\n"
+                        +f"BGEN2 2 {epoch} 2 seed=37 counter=9 7\n")
+        proc.stdin.flush()
+        part=take_until(lambda xs:sum(x.startswith("BDONE2") for x in xs)==2)
+        segmented += [int(x.split()[3]) for x in part if x.startswith(f"BT2 0 {epoch} ")]
+    assert full==segmented,(full,segmented)
+    print("NATIVE_COUNTER_SEGMENTATION_PASS unchanged draws with inserted prompt and neighbor")
     proc.stdin.write("QUIT\n");proc.stdin.flush()
     proc.wait(timeout=10)
     err=proc.stderr.read()

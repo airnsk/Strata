@@ -106,3 +106,7 @@ f6db7a472bb534907a36ad68f365961b4964982790bbce5c586d23dea1b2e14b;
 original configuration SHA256
 6334a3bae5180a08bb3e3249175b64225fbafe0f1948d37125413657f0b27303.
 Diagnostic reporting fix is compiled, but its targeted repeat has not run yet.
+
+## 2026-10-29 12:40 UTC: explicit native RNG offset
+
+The native BGEN2 parser now accepts a bounded counter (next sampler draw index), advertises batch_counter=1, and initializes the slot from it. This is not a context position. Counter plus max_new must not overflow uint64. CPU strict-parser and actual scheduler/stub tests passed: 8 draws equal segmented 3+5 draws with the same seed, changed prompt length and a concurrent neighbor. HTTP carry-over is still pending; this source-only change is not in the running window-5 binary. Window 5 repeats the previously instrumented long numerical gate with exact synthetic inputs saved in evidence and both native stdout/stderr retained. No production switch.

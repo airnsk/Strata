@@ -213,6 +213,7 @@ struct Req {
     float temperature = 0.0f, top_p = 1.0f, min_p = 0.0f;
     int top_k = 64;
     unsigned long long seed = 0;
+    uint64_t rng_counter = 0; // batch logical-request draw index, not context position
     int spec = -1;          // spec=0|1: this request drafts or not (-1: as the engine was started)
     float conf = -1.0f;     // dspark_conf=F: the drafts' confidence floor for this request (-1: the engine's)
     long long pin = 0;      // pin=N: the first N prompt tokens are a start other requests share (a system prompt and its
