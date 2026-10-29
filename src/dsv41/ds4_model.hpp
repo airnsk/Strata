@@ -101,6 +101,17 @@ struct Stats {
     double draft_ms = 0.0, verify_ms = 0.0;   // the drafter's time, the verification windows' time
 };
 
+// Independent speculative segments sharing one target compute pass where they fit kWin.
+struct SpecBatchRequest {
+    uint64_t request=0;
+    int token=-1;
+    std::vector<int> drafts;
+    float temperature=0.0f,top_p=1.0f,min_p=0.0f;
+    int top_k=0;
+    uint64_t seed=0,counter=0;
+};
+struct SpecBatchResult {int accepted=0,next=-1;};
+
 class Model {
 public:
     Model();
@@ -116,6 +127,8 @@ public:
     // Packed AR: one token per independent resident handle; shared FFN/MoE/head,
     // segmented attention. No speculative rows or images in this prototype.
     bool decode_batch(const std::vector<uint64_t>& requests, const std::vector<int>& tokens, std::string& err);
+    bool verify_batch(const std::vector<SpecBatchRequest>& requests,
+                      std::vector<SpecBatchResult>& results,std::string& err);
 
 
 

@@ -271,3 +271,31 @@ this ownership repair has not run on GPU yet. A 32-round-comparison oracle for
 four pending sampled q distributions is compiled, not executed. Its target
 verification is intentionally serial as a state-isolation control. It must not
 be described as completed multi-request batched DSpark.
+
+
+### 2026-10-29 17:10 UTC — window 12 and segmented verify preparation
+
+Window 12 loaded the candidate but the request-owned-q oracle stopped at the
+public Model::draft AR-only guard before its resident comparisons. This is a
+capability-gate failure, not a numerical failure or a DSpark PASS. The driver
+started restoration at 17:02:49 UTC (server 280471); readiness remains pending
+at this checkpoint.
+
+The experimental resident draft/verify API now requires DS4_BATCH_SPEC_TEST.
+The HTTP server still advertises AR only. A segmented verify API retains each
+request's positions, attention, ring backups, taps and q distribution while
+sharing the target MoE rows. Whole segments are partitioned at kWin=16; four
+six-row segments become two groups. A separate head-output buffer avoids
+overlapping scatter when segment lengths differ. The prior AR and 2+2 paths
+use one row per request through the same helpers and require regression tests.
+
+CPU: spec_segments_test.py PASS (15/16/17/24 rows, invalid lengths, overflow,
+whole-segment order); batch_execution_test.py PASS; batch_rng_test.py PASS.
+The initial generalized HIP model and oracle linked successfully. A rebuild
+after extracting the production partition helper is in progress. GPU correctness
+of the new segmented target remains NOT RUN. The prepared oracle first repeats
+serial pending-q isolation, then compares segmented verify against solo outputs,
+accepted counts and saved states. No throughput or quality claim follows from
+these compilation and CPU results.
+
+17:11 UTC: final isolated HIP model/native/oracle build PASS after extracting the partition helper. The binary is build-spec-batch/segmented-spec-http-test. No GPU segmented-verify result yet.

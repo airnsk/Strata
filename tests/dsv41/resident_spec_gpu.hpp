@@ -6,8 +6,9 @@
 #include <cstdio>
 #include <stdexcept>
 namespace strata::ds4::test {
-// State isolation oracle only. Target verify is still serial here, not batched DSpark.
-inline int resident_spec_test(Model& m) {
+// Compare request-owned q and segmented target verification against the same solo oracle.
+inline int resident_spec_test(Model& m, bool batched=false) {
+    setenv("DS4_BATCH_SPEC_TEST","1",1);
     std::string err;
     auto need=[&](bool ok,const char* s){if(!ok)throw std::runtime_error(std::string(s)+": "+err);};
     struct Round {
@@ -62,10 +63,23 @@ inline int resident_spec_test(Model& m) {
                 need(m.draft(token[q],drafts[q],confidence,err,temperature,top_p,top_k,min_p,1001+q,counter[q]),"draft");
                 need(drafts[q]==refs[q][r].drafts,"draft differs under interleave");
             }
+            std::vector<SpecBatchResult> results;
+            if(batched) {
+                std::vector<SpecBatchRequest> requests;
+                for(int j=3;j>=0;--j) {
+                    const int q=(j+r)%4;
+                    SpecBatchRequest x;x.request=handles[q];x.token=token[q];x.drafts=drafts[q];
+                    x.temperature=temperature;x.top_p=top_p;x.top_k=top_k;x.min_p=min_p;
+                    x.seed=1001+q;x.counter=counter[q];requests.push_back(std::move(x));
+                }
+                need(m.verify_batch(requests,results,err),"segmented verify");
+                need(results.size()==4,"segmented result count");
+            }
             for(int j=3;j>=0;--j) {
                 int q=(j+r)%4,accepted=0,next=0;
                 need(m.request_select(handles[q],err),"verify select");
-                need(m.verify(token[q],drafts[q],temperature,top_p,top_k,min_p,1001+q,counter[q],accepted,next,err),"verify");
+                if(batched) {accepted=results[3-j].accepted;next=results[3-j].next;}
+                else need(m.verify(token[q],drafts[q],temperature,top_p,top_k,min_p,1001+q,counter[q],accepted,next,err),"verify");
                 std::vector<float> logits;std::vector<uint8_t> state;
                 need(m.logits(logits),"logits");need(m.slot_save(state,err)>0,"state");
                 const auto& ref=refs[q][r];
@@ -81,7 +95,7 @@ inline int resident_spec_test(Model& m) {
         }
         for(auto h:handles)need(m.request_release(h,err),"release");
         need(m.request_select(0,err),"base restore");
-        std::fprintf(stderr,"RESIDENT_SPEC_PASS comparisons=%d four_pending_q=1 serial_target_verify=1\n",comparisons);
+        std::fprintf(stderr,"RESIDENT_SPEC_PASS comparisons=%d four_pending_q=1 serial_target_verify=%d segmented_target_verify=%d\n",comparisons,int(!batched),int(batched));
         return 0;
     } catch(const std::exception& ex) {
         std::fprintf(stderr,"RESIDENT_SPEC_FAIL %s\n",ex.what());return 1;

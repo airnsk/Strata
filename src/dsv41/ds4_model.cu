@@ -15,6 +15,7 @@
 #include "ds4_model.hpp"
 #include "ds4_request_state.hpp"
 #include "ds4_batch_execution.hpp"
+#include "ds4_spec_segments.hpp"
 #include "ds4_pick_rule.hpp"
 #include "ds4_yoco_pipeline.hpp"
 #include "ds4_experts_rule.hpp"
@@ -5317,7 +5318,7 @@ struct Model::Impl : RequestHostState<strata::dsv41k::SpecList, kWin> {
     }
 
     struct PackedRows {
-        float *h=nullptr,*pre=nullptr,*a_pre=nullptr;
+        float *h=nullptr,*pre=nullptr,*a_pre=nullptr,*logits=nullptr;
         int *topk=nullptr,*cand=nullptr;
     };
     std::vector<PackedRows> packed,packed_other;
@@ -5332,10 +5333,11 @@ struct Model::Impl : RequestHostState<strata::dsv41k::SpecList, kWin> {
         packed_failed=true;packed.resize(devs.size());
         for(size_t di=0;di<devs.size();++di) {
             auto& d=devs[di];auto& p=packed[di];
-            if(!dalloc(d,p.h,(size_t)4*g.hc*g.dim,err) ||
-               !dalloc(d,p.pre,32,err) || !dalloc(d,p.a_pre,32,err) ||
-               !dalloc(d,p.topk,4*topk_stride(),err) ||
-               !dalloc(d,p.cand,4*cand_stride(),err)) return false;
+            if(!dalloc(d,p.h,(size_t)kWin*g.hc*g.dim,err) ||
+               !dalloc(d,p.pre,kWin*8,err) || !dalloc(d,p.a_pre,kWin*8,err) ||
+               !dalloc(d,p.topk,kWin*topk_stride(),err) ||
+               !dalloc(d,p.cand,kWin*cand_stride(),err)) return false;
+            if((int)di==head_dev && !dalloc(d,p.logits,(size_t)kWin*g.vocab,err))return false;
         }
         packed_failed=false;return true;
     }
@@ -5353,17 +5355,25 @@ struct Model::Impl : RequestHostState<strata::dsv41k::SpecList, kWin> {
         std::array<WinPlan,4> plans;
         std::array<std::vector<float>,4> taps;
         std::vector<PackedRows>* workspace=nullptr;
-        int cur=0;
-        bool started=false,completed=false;
+        std::array<int,4> counts{{1,1,1,1}},offsets{};
+        int cur=0,rows=0;
+        bool speculative=false,started=false,completed=false;
     };
     bool packed_prepare(PackedFrame& f,std::string& err) {
+        if(f.ids.empty() || f.ids.size()>4) {err="packed segment count";return false;}
+        f.rows=0;
+        for(size_t q=0;q<f.ids.size();++q) {
+            if(f.counts[q]<1 || f.counts[q]>kWin) {err="packed segment length";return false;}
+            f.offsets[q]=f.rows;f.rows+=f.counts[q];
+        }
+        if(f.rows>kWin) {err="packed segments exceed execution window";return false;}
         const auto& ids=f.ids; const auto& tk=f.tokens;
-        const int B=(int)ids.size(),D=g.dim,H=g.hc;
+        const int B=(int)ids.size(),R=f.rows,D=g.dim,H=g.hc;
         auto& slots=f.slots;auto& positions=f.positions;auto& plans=f.plans;auto& taps=f.taps;
         int& cur=f.cur;
         auto& packed=*f.workspace;
         const size_t nh=(size_t)H*D*4,np=8*4,nk=topk_stride()*4,nc=cand_stride()*4;
-        if(B<1 || B>4 || tk.size()!=ids.size() || !resident_initialized) {
+        if(B<1 || B>4 || tk.size()!=(size_t)R || !resident_initialized) {
             err="packed decode needs 1..4 resident rows";return false;
         }
         // Validate the entire batch before mutating any history.
@@ -5372,12 +5382,13 @@ struct Model::Impl : RequestHostState<strata::dsv41k::SpecList, kWin> {
             if(sl==0 || sl>=resident.size() || !resident[sl].live || resident[sl].poisoned ||
                resident[sl].generation!=(ids[q]>>8) ||
                std::find(ids.begin(),ids.begin()+q,ids[q])!=ids.begin()+q ||
-               tk[q]<0 || tk[q]>=g.vocab) {err="invalid, duplicate or stale packed row";return false;}
+               std::any_of(tk.begin()+f.offsets[q],tk.begin()+f.offsets[q]+f.counts[q],
+                    [&](int t){return t<0||t>=g.vocab;})) {err="invalid, duplicate or stale packed row";return false;}
             const HostRequest& h=sl==active_request?static_cast<const HostRequest&>(*this):resident[sl].host;
-            if(!h.imgs.empty() || h.spec_win || h.drafts_q || h.pos<0 ||
-               h.pos>=resident[sl].capacity) {err="packed row state/capacity unsupported";return false;}
+            if(!h.imgs.empty() || h.spec_win || (!f.speculative && h.drafts_q) || h.pos<0 ||
+               h.pos>resident[sl].capacity || f.counts[q]>resident[sl].capacity-h.pos) {err="packed row state/capacity unsupported";return false;}
             positions[q]=h.pos;
-            taps[q].resize((size_t)g.d_targets.size()*D);
+            taps[q].resize((size_t)f.counts[q]*g.d_targets.size()*D);
         }
         if(!packed_init(err,f.workspace==&packed_other?1:0)) return false;
         f.started=true;
@@ -5387,22 +5398,28 @@ struct Model::Impl : RequestHostState<strata::dsv41k::SpecList, kWin> {
         for(int q=0;q<B;++q) {
             if(!request_select(ids[q],err)) return false;
             slot_held=false;logits_all=false;chunk_logits.clear();
-            toks.push_back(tk[q]);ctoks.push_back(ctok(pos,tk[q]));
-            plan_window(pos,1,plans[q],false); // no unused CPU mailbox sequences
+            const int T=f.counts[q],off=f.offsets[q];
+            for(int t=0;t<T;++t) {
+                toks.push_back(tk[off+t]);ctoks.push_back(ctok(pos+t,tk[off+t]));
+            }
+            const bool previous_spec=spec_win;spec_win=f.speculative;
+            plan_window(pos,T,plans[q],false); // no unused CPU mailbox sequences
+            spec_win=previous_spec;
             auto& d=devs[cur];auto& p=packed[cur];cudaSetDevice(d.id);
-            std::memcpy(h_emb,emb_row(pos,tk[q]),(size_t)D*2);
-            CK(cudaMemcpyAsync(d.emb_rows,h_emb,(size_t)D*2,cudaMemcpyHostToDevice,d.st));
-            embed(d.emb_rows,1,d.h,D,H,d.st);init_pre(d.pre,1,d.st);
-            CK(cudaMemcpyAsync(p.h+(size_t)q*H*D,d.h,nh,cudaMemcpyDeviceToDevice,d.st));
-            CK(cudaMemcpyAsync(p.pre+(size_t)q*8,d.pre,np,cudaMemcpyDeviceToDevice,d.st));
-            CK(cudaMemsetAsync(p.topk+(size_t)q*topk_stride(),0,nk,d.st));
-            CK(cudaMemsetAsync(p.cand+(size_t)q*cand_stride(),0,nc,d.st));
+            for(int t=0;t<T;++t)
+                std::memcpy(h_emb+(size_t)t*D,emb_row(pos+t,tk[off+t]),(size_t)D*2);
+            CK(cudaMemcpyAsync(d.emb_rows,h_emb,(size_t)T*D*2,cudaMemcpyHostToDevice,d.st));
+            embed(d.emb_rows,T,d.h,D,H,d.st);init_pre(d.pre,T,d.st);
+            CK(cudaMemcpyAsync(p.h+(size_t)off*H*D,d.h,T*nh,cudaMemcpyDeviceToDevice,d.st));
+            CK(cudaMemcpyAsync(p.pre+(size_t)off*8,d.pre,T*np,cudaMemcpyDeviceToDevice,d.st));
+            CK(cudaMemsetAsync(p.topk+(size_t)off*topk_stride(),0,T*nk,d.st));
+            CK(cudaMemsetAsync(p.cand+(size_t)off*cand_stride(),0,T*nc,d.st));
         }
         return true;
     }
     bool packed_layer(PackedFrame& f,int il,std::string& err) {
         const auto& ids=f.ids; const auto& tk=f.tokens;
-        const int B=(int)ids.size(),D=g.dim,H=g.hc;
+        const int B=(int)ids.size(),R=f.rows,D=g.dim,H=g.hc;
         auto& slots=f.slots;auto& positions=f.positions;auto& plans=f.plans;auto& taps=f.taps;
         int& cur=f.cur;
         auto& packed=*f.workspace;
@@ -5412,89 +5429,163 @@ struct Model::Impl : RequestHostState<strata::dsv41k::SpecList, kWin> {
         if(di!=cur) {
             auto& a=devs[cur];auto& b=devs[di];auto& x=packed[cur];auto& y=packed[di];
             cudaSetDevice(a.id);auto* bb=a.bounce;
-            CK(cudaMemcpyAsync(bb,x.h,B*nh,cudaMemcpyDeviceToHost,a.st));
-            CK(cudaMemcpyAsync(bb+B*nh,x.pre,B*np,cudaMemcpyDeviceToHost,a.st));
-            CK(cudaMemcpyAsync(bb+B*(nh+np),x.topk,B*nk,cudaMemcpyDeviceToHost,a.st));
-            CK(cudaMemcpyAsync(bb+B*(nh+np+nk),x.cand,B*nc,cudaMemcpyDeviceToHost,a.st));
+            CK(cudaMemcpyAsync(bb,x.h,R*nh,cudaMemcpyDeviceToHost,a.st));
+            CK(cudaMemcpyAsync(bb+R*nh,x.pre,R*np,cudaMemcpyDeviceToHost,a.st));
+            CK(cudaMemcpyAsync(bb+R*(nh+np),x.topk,R*nk,cudaMemcpyDeviceToHost,a.st));
+            CK(cudaMemcpyAsync(bb+R*(nh+np+nk),x.cand,R*nc,cudaMemcpyDeviceToHost,a.st));
             CK(cudaEventRecord(a.ev_out,a.st));cudaSetDevice(b.id);
             CK(cudaStreamWaitEvent(b.st,a.ev_out,0));
-            CK(cudaMemcpyAsync(y.h,bb,B*nh,cudaMemcpyHostToDevice,b.st));
-            CK(cudaMemcpyAsync(y.pre,bb+B*nh,B*np,cudaMemcpyHostToDevice,b.st));
-            CK(cudaMemcpyAsync(y.topk,bb+B*(nh+np),B*nk,cudaMemcpyHostToDevice,b.st));
-            CK(cudaMemcpyAsync(y.cand,bb+B*(nh+np+nk),B*nc,cudaMemcpyHostToDevice,b.st));
+            CK(cudaMemcpyAsync(y.h,bb,R*nh,cudaMemcpyHostToDevice,b.st));
+            CK(cudaMemcpyAsync(y.pre,bb+R*nh,R*np,cudaMemcpyHostToDevice,b.st));
+            CK(cudaMemcpyAsync(y.topk,bb+R*(nh+np),R*nk,cudaMemcpyHostToDevice,b.st));
+            CK(cudaMemcpyAsync(y.cand,bb+R*(nh+np+nk),R*nc,cudaMemcpyHostToDevice,b.st));
             cur=di;
         }
         auto& d=devs[di];auto& p=packed[di];
         for(int q=0;q<B;++q) {
+            const int T=f.counts[q],off=f.offsets[q];
             if(!request_select(ids[q],err)) return false;
             cudaSetDevice(d.id);
-            CK(cudaMemcpyAsync(d.h,p.h+(size_t)q*H*D,nh,cudaMemcpyDeviceToDevice,d.st));
-            CK(cudaMemcpyAsync(d.pre,p.pre+(size_t)q*8,np,cudaMemcpyDeviceToDevice,d.st));
-            CK(cudaMemcpyAsync(d.topk,p.topk+(size_t)q*topk_stride(),nk,cudaMemcpyDeviceToDevice,d.st));
-            CK(cudaMemcpyAsync(d.cand,p.cand+(size_t)q*cand_stride(),nc,cudaMemcpyDeviceToDevice,d.st));
+            CK(cudaMemcpyAsync(d.h,p.h+(size_t)off*H*D,T*nh,cudaMemcpyDeviceToDevice,d.st));
+            CK(cudaMemcpyAsync(d.pre,p.pre+(size_t)off*8,T*np,cudaMemcpyDeviceToDevice,d.st));
+            CK(cudaMemcpyAsync(d.topk,p.topk+(size_t)off*topk_stride(),T*nk,cudaMemcpyDeviceToDevice,d.st));
+            CK(cudaMemcpyAsync(d.cand,p.cand+(size_t)off*cand_stride(),T*nc,cudaMemcpyDeviceToDevice,d.st));
             if(L[il].eg>=0) {
                 auto& b=*eg_win[(size_t)L[il].eg];if(b.live)eg_finish(b);
-                eg_issue(positions[q],1,L[il].eg,nullptr,b);
+                eg_issue(positions[q],T,L[il].eg,nullptr,b);
             }
             const bool capture=std::find(g.d_targets.begin(),g.d_targets.end(),il)!=g.d_targets.end();
             if(capture) {
                 std::copy(taps[q].begin(),taps[q].end(),h_taps);
-                if(!tap(d,il,1,err))return false;
+                if(!tap(d,il,T,err))return false;
             }
-            if(!layer(L[il],0,positions[q],1,plans[q],err,true)) return false;
-            CK(cudaMemcpyAsync(p.h+(size_t)q*H*D,d.h,nh,cudaMemcpyDeviceToDevice,d.st));
-            CK(cudaMemcpyAsync(p.a_pre+(size_t)q*8,d.a_pre,np,cudaMemcpyDeviceToDevice,d.st));
-            CK(cudaMemcpyAsync(p.topk+(size_t)q*topk_stride(),d.topk,nk,cudaMemcpyDeviceToDevice,d.st));
-            CK(cudaMemcpyAsync(p.cand+(size_t)q*cand_stride(),d.cand,nc,cudaMemcpyDeviceToDevice,d.st));
+            const bool previous_spec=spec_win;spec_win=f.speculative;
+            const bool layer_ok=layer(L[il],0,positions[q],T,plans[q],err,true);
+            spec_win=previous_spec;
+            if(!layer_ok)return false;
+            CK(cudaMemcpyAsync(p.h+(size_t)off*H*D,d.h,T*nh,cudaMemcpyDeviceToDevice,d.st));
+            CK(cudaMemcpyAsync(p.a_pre+(size_t)off*8,d.a_pre,T*np,cudaMemcpyDeviceToDevice,d.st));
+            CK(cudaMemcpyAsync(p.topk+(size_t)off*topk_stride(),d.topk,T*nk,cudaMemcpyDeviceToDevice,d.st));
+            CK(cudaMemcpyAsync(p.cand+(size_t)off*cand_stride(),d.cand,T*nc,cudaMemcpyDeviceToDevice,d.st));
             if(capture) {
                 CK(cudaStreamSynchronize(d.st));
                 std::copy(h_taps,h_taps+taps[q].size(),taps[q].begin());
             }
         }
         cudaSetDevice(d.id);
-        CK(cudaMemcpyAsync(d.h,p.h,B*nh,cudaMemcpyDeviceToDevice,d.st));
-        CK(cudaMemcpyAsync(d.a_pre,p.a_pre,B*np,cudaMemcpyDeviceToDevice,d.st));
-        WinPlan common;common.async=!sync_decode && B<=async_max_t;
+        CK(cudaMemcpyAsync(d.h,p.h,R*nh,cudaMemcpyDeviceToDevice,d.st));
+        CK(cudaMemcpyAsync(d.a_pre,p.a_pre,R*np,cudaMemcpyDeviceToDevice,d.st));
+        WinPlan common;common.async=!sync_decode && R<=async_max_t;
         if(common.async) {
             common.seq[il]=++seq_issued;
             layer_of[seq_issued%kRing].store(il,std::memory_order_release);
         }
-        if(!layer_moe(L[il],0,B,common,err)) return false;
-        CK(cudaMemcpyAsync(p.h,d.h,B*nh,cudaMemcpyDeviceToDevice,d.st));
-        CK(cudaMemcpyAsync(p.pre,d.pre,B*np,cudaMemcpyDeviceToDevice,d.st));
+        if(!layer_moe(L[il],0,R,common,err)) return false;
+        CK(cudaMemcpyAsync(p.h,d.h,R*nh,cudaMemcpyDeviceToDevice,d.st));
+        CK(cudaMemcpyAsync(p.pre,d.pre,R*np,cudaMemcpyDeviceToDevice,d.st));
         return true;
     }
     bool packed_finish(PackedFrame& f,std::string& err,bool retire_cache=true) {
         request_binding_device=-1;
         const auto& ids=f.ids; const auto& tk=f.tokens;
-        const int B=(int)ids.size(),D=g.dim,H=g.hc;
+        const int B=(int)ids.size(),R=f.rows,D=g.dim,H=g.hc;
         auto& slots=f.slots;auto& positions=f.positions;auto& plans=f.plans;auto& taps=f.taps;
         int& cur=f.cur;
         auto& packed=*f.workspace;
         const size_t nh=(size_t)H*D*4,np=8*4,nk=topk_stride()*4,nc=cand_stride()*4;
         auto& d=devs[head_dev];cudaSetDevice(d.id);
         // Shared head reads all B rows; scatter into each arena before rebinding.
-        n_logits=B;
-        if(!head_rows_dev(head_dev,B,err)) return false;
-        float* output=d.logits;
+        n_logits=R;
+        float* bound_logits=d.logits;
+        d.logits=packed[head_dev].logits;
+        const bool head_ok=head_rows_dev(head_dev,R,err);
+        float* output=d.logits;d.logits=bound_logits;
+        if(!head_ok)return false;
         for(int q=0;q<B;++q)
-            CK(cudaMemcpyAsync(resident[slots[q]].logits,output+(size_t)q*g.vocab,
-                               (size_t)g.vocab*4,cudaMemcpyDeviceToDevice,d.st));
+            CK(cudaMemcpyAsync(resident[slots[q]].logits,output+(size_t)f.offsets[q]*g.vocab,
+                               (size_t)f.counts[q]*g.vocab*4,cudaMemcpyDeviceToDevice,d.st));
         CK(cudaStreamSynchronize(d.st));
         for(int q=0;q<B;++q) {
             if(!request_select(ids[q],err))return false;
-            ++pos;++st.tokens;n_logits=1;
-            if(g.n_mtp>0) {
+            pos+=f.counts[q];st.tokens+=f.counts[q];n_logits=f.counts[q];
+            if(g.n_mtp>0 && !f.speculative) {
                 std::copy(taps[q].begin(),taps[q].end(),h_taps);
-                if(!seed_drafter(positions[q],1,0,err))return false;
+                if(!seed_drafter(positions[q],f.counts[q],0,err))return false;
             }
         }
         if(!request_sync(err))return false;
-        if(retire_cache)cache_tick(B);
-        ++packed_steps;packed_rows+=B;f.completed=true;
-        if(std::getenv("DS4_BATCH_DIAG"))
+        if(retire_cache)cache_tick(R);
+        ++packed_steps;packed_rows+=R;f.completed=true;
+        if(std::getenv("DS4_BATCH_DIAG") && !f.speculative)
             std::fprintf(stderr,"DS4_PACKED_AR rows=%d steps=%llu total_rows=%llu\n",B,
                          (unsigned long long)packed_steps,(unsigned long long)packed_rows);
+        return true;
+    }
+    bool verify_batch(const std::vector<SpecBatchRequest>& requests,std::vector<SpecBatchResult>& results,
+                      std::string& err) {
+        results.clear();
+        if(requests.empty()||requests.size()>4||!resident_initialized) {err="speculative request count";return false;}
+        // Validate all segments before any request is advanced.
+        for(size_t i=0;i<requests.size();++i) {
+            const auto& r=requests[i];const unsigned slot=(unsigned)(r.request&255);
+            if(slot==0||slot>=resident.size()||!resident[slot].live||resident[slot].poisoned||
+               resident[slot].generation!=(r.request>>8)||r.drafts.size()>=(size_t)kWin||
+               r.token<0||r.token>=g.vocab||
+               std::any_of(r.drafts.begin(),r.drafts.end(),[&](int t){return t<0||t>=g.vocab;})) {
+                err="invalid speculative segment";return false;
+            }
+            for(size_t j=0;j<i;++j)if(requests[j].request==r.request) {err="duplicate speculative request";return false;}
+            const auto& h=slot==active_request?static_cast<const HostRequest&>(*this):resident[slot].host;
+            const int T=(int)r.drafts.size()+1;
+            if(h.spec_win||!h.imgs.empty()||h.pos<0||h.pos>resident[slot].capacity||
+               T>resident[slot].capacity-h.pos||
+               !std::isfinite(r.temperature)||r.temperature<0||!std::isfinite(r.top_p)||r.top_p<=0||r.top_p>1||
+               !std::isfinite(r.min_p)||r.min_p<0||r.min_p>1||r.top_k<0||r.top_k>64||
+               r.counter>UINT64_MAX-(uint64_t)T) {err="unsupported speculative state or sampling";return false;}
+        }
+        std::vector<int> lengths;
+        for(const auto& r:requests)lengths.push_back((int)r.drafts.size()+1);
+        std::vector<size_t> ends;
+        if(!spec_segment_ends(lengths,kWin,ends)) {err="invalid speculative partition";return false;}
+        results.resize(requests.size());
+        size_t first=0;
+        for(size_t end:ends) {
+            int total=0;for(size_t i=first;i<end;++i)total+=lengths[i];
+            PackedFrame f;f.workspace=&packed;f.speculative=true;
+            for(size_t i=first;i<end;++i) {
+                const auto& r=requests[i];f.ids.push_back(r.request);
+                f.counts[i-first]=(int)r.drafts.size()+1;
+                f.tokens.push_back(r.token);f.tokens.insert(f.tokens.end(),r.drafts.begin(),r.drafts.end());
+            }
+            struct VerifyGuard {
+                Impl& owner;PackedFrame& f;
+                ~VerifyGuard() {
+                    if(f.started&&!f.completed) {
+                        std::string ignored;owner.request_sync(ignored);
+                        for(size_t q=0;q<f.ids.size();++q)owner.resident[f.slots[q]].poisoned=true;
+                    }
+                }
+            } guard{*this,f};
+            const double begin=now_ms();
+            if(!packed_prepare(f,err))return false;
+            for(int il=0;il<g.nl;++il)if(!packed_layer(f,il,err))return false;
+            if(!packed_finish(f,err))return false;
+            f.completed=false; // target rows are not committed until each rejection/rollback finishes.
+            const double target_ms=now_ms()-begin;
+            for(size_t i=first;i<end;++i) {
+                const size_t q=i-first;const auto& r=requests[i];
+                if(!request_select(r.request,err))return false;
+                st.verify_ms+=target_ms; // per-request elapsed group latency, not additive device work
+                std::copy(f.taps[q].begin(),f.taps[q].end(),h_taps);
+                if(!verify_result(f.positions[q],r.drafts,r.temperature,r.top_p,r.top_k,r.min_p,
+                                  r.seed,r.counter,results[i].accepted,results[i].next,err))return false;
+            }
+            if(!request_sync(err))return false;
+            f.completed=true;
+            if(std::getenv("DS4_BATCH_DIAG"))
+                std::fprintf(stderr,"DS4_PACKED_VERIFY requests=%zu rows=%d completed\n",end-first,total);
+            first=end;
+        }
         return true;
     }
     bool decode_pipeline22(const std::vector<uint64_t>& ids,const std::vector<int>& tk,std::string& err) {
@@ -7645,7 +7736,7 @@ struct Model::Impl : RequestHostState<strata::dsv41k::SpecList, kWin> {
     bool verify(int y, const std::vector<int>& drafts, float temperature, float top_p, int top_k, float min_p,
                 uint64_t seed, uint64_t counter, int& accepted, int& next, std::string& err) {
         const int n = (int) std::min<size_t>(drafts.size(), (size_t) kWin - 1);
-        const int T = n + 1, V = g.vocab;
+        const int T = n + 1;
         if(!request_room(T,err))return false;
         const int64_t p0 = pos;
         int tk[kWin];
@@ -7657,6 +7748,12 @@ struct Model::Impl : RequestHostState<strata::dsv41k::SpecList, kWin> {
         st.verify_ms += now_ms() - tv;
         spec_win = false;
         if (!ok) return false;
+        return verify_result(p0,drafts,temperature,top_p,top_k,min_p,seed,counter,accepted,next,err);
+    }
+    bool verify_result(int64_t p0,const std::vector<int>& drafts,float temperature,float top_p,int top_k,float min_p,
+                       uint64_t seed,uint64_t counter,int& accepted,int& next,std::string& err) {
+        const int n=(int)std::min<size_t>(drafts.size(),(size_t)kWin-1);
+        const int T=n+1,V=g.vocab;
         Dev& hd = devs[(size_t) head_dev];
         cudaSetDevice(hd.id);
         int m = 0;
@@ -10237,6 +10334,11 @@ bool Model::request_release(uint64_t id, std::string& err) { return p_->request_
 bool Model::decode_batch(const std::vector<uint64_t>& requests, const std::vector<int>& tokens, std::string& err) {
     return p_->decode_batch(requests,tokens,err);
 }
+bool Model::verify_batch(const std::vector<SpecBatchRequest>& requests,std::vector<SpecBatchResult>& results,
+                         std::string& err) {
+    return p_->verify_batch(requests,results,err);
+}
+
 bool Model::feed(const int* tokens, int n, int logits_rows, std::string& err) {
     if(!p_->request_room(n,err)) return false;
     Impl& p = *p_;
@@ -10289,12 +10391,12 @@ int Model::draft_block() const { return p_->g.n_mtp > 0 ? p_->g.d_block : 0; }
 bool Model::gpus_are_gfx12() const { return p_->rdna4(); }
 bool Model::draft(int y, std::vector<int>& d, std::vector<float>& c, std::string& err, float t, float tp, int tk,
                   float mp, uint64_t seed, uint64_t counter) {
-    if(p_->active_request) {err="resident prototype is AR-only; DSpark not validated";return false;}
+    if(p_->active_request && !std::getenv("DS4_BATCH_SPEC_TEST")) {err="resident DSpark requires experimental validation gate";return false;}
     return p_->draft(y, d, c, err, t, tp, tk, mp, seed, counter);
 }
 bool Model::verify(int y, const std::vector<int>& d, float t, float tp, int tk, float mp, uint64_t seed, uint64_t counter,
                    int& accepted, int& next, std::string& err) {
-    if(p_->active_request) {err="resident prototype is AR-only; DSpark not validated";return false;}
+    if(p_->active_request && !std::getenv("DS4_BATCH_SPEC_TEST")) {err="resident DSpark requires experimental validation gate";return false;}
     return p_->verify(y, d, t, tp, tk, mp, seed, counter, accepted, next, err);
 }
 int64_t Model::pos() const { return p_->pos; }
