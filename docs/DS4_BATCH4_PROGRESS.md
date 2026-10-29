@@ -228,3 +228,20 @@ Concurrent CPU accounting snapshot/completion passed ASan/UBSan. No 2+2 GPU
 correctness, overlap timeline or speed claim is made yet. The prepared benchmark
 uses 128 teacher-forced steps for four requests, modes B4/2+2/2+2/B4, matching saved
 initial states and comparing final state/logits. It is not emitted-token throughput.
+
+
+### Next speculative-state boundary (inspection only)
+The existing draft path keeps sampled q distributions in shared d_specq; the
+request-owned h_specq is not automatically populated for that path. Allowing a
+request switch merely because host seed/counter fields are separate would be
+incorrect. A resident speculative path must copy valid draft distributions into
+their request-owned host storage and restore them before verification, including
+the matching sampler parameters/counter. The current unfinished-round guard
+remains in place; batch_spec remains zero.
+
+Target verification needs packed causal segments, not one flattened sequence.
+Two requests with up to six verify rows each fit kWin=16; four such segments do
+not. Per-segment attention/plans/ring backups/partials/taps and final logits must
+be kept with the corresponding request. Shared MoE/head may process the packed
+rows, but rollback and seeding use only that request's accepted prefix. These
+changes are not implemented by the AR two-frame patch.
