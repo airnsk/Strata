@@ -54,17 +54,25 @@ shared CPU/expert phase counters are not yet attributed per request.
   and CPU model stub: four concurrent streams, per-thread statistics and
   cancellation/reuse PASS. Actual HTTP/GPU integration is described below.
 
-## Remaining release gates
+## Current checkpoint and remaining release gates
 
-Actual packed logits/state and composition/permutation checks; HTTP four-stream
-integration, mixed arrivals/cancellation and capacity failure; finite memory and
-latency/per-request throughput measurements against B1 AR and original DSpark.
-Larger/mixed ring/compressor boundaries, image rejection, independent sampler tests,
-restore continuation and failure paths remain to be extended.
+Windows 7–9 below supersede the earlier failed/confounded comparisons: controlled
+long packed-state parity, real four-stream HTTP, segmented RNG carry, and mixed
+prefill/decode state parity passed. The adaptive-profile numerical policy still
+needs an explicit B1/B1 control; fixed-profile diagnostics are not a production fix.
+Actual staggered HTTP prefill latency and cancellation under that load remain to
+be measured. The original DSpark service with four concurrent clients, repeat
+measurements and per-request latency are still required for the final comparison.
 
-2+2 GPU overlap and independent multi-request DSpark are not implemented.
-No new build is installed in the production launch configuration. Production
-YOCO10/30+cone is restored after each exclusive test window. No push is authorized.
+True overlapping 2+2 and independent multi-request DSpark are not implemented.
+Do not advertise either capability or call sequential B2 rounds a pipeline.
+Current 16-token admission does not retain large-chunk YOCO/cone prefill speed.
+
+The user authorized publishing this separate branch and leaving a successful
+candidate running only after the required gates. Neither action has happened.
+During diagnostic windows the published YOCO10/30+cone service is restored.
+The chronological entries below preserve what was known at each earlier window;
+their pending-status sentences are historical, not the current checkpoint.
 
 Local raw evidence (not committed): /var/tmp/strata-batch4-1029-evidence/.
 
@@ -177,3 +185,19 @@ A staggered HTTP prefill/decode probe is prepared but has not run.
 
 
 Window 9 GPU gate PASS at 2026-10-29 14:16:25 UTC: 480 bitwise full-logit/state comparisons; 32 partial prefill states; 96 common B4 steps. Three existing requests decode while a fourth prefills 512 tokens in 16-token quanta. Both reference and mixed execution use identical prefill partitions. Restoration began 14:16:27, server PID 272070; READY pending at this checkpoint. Evidence: /var/tmp/strata-batch4-1029-evidence/window9-summary.json and mixed-prefill-driver.log.
+
+
+### 2+2 implementation boundary (code audit, not a benchmark)
+The current global request_select barrier is necessary, not merely an accidental
+performance cost. CPU serve_lane updates the active HostRequest's Stats while
+processing its mailbox; moving HostRequest before that work retires would race.
+A true two-frame implementation must first separate shared execution accounting
+from request-owned state (and attribute it at completion), then use per-device
+bindings, independent live packed activations and an acknowledged handoff buffer.
+CPU mailbox sequences must remain globally ordered; expert-cache mutation must
+wait for both frames. Device0 MTP seeding must not overwrite an unfinished second
+frame's scratch. No barrier has been removed in this checkpoint. Two consecutive
+decode_batch(B2) calls would still serialize and are not an implemented pipeline.
+
+
+Window 9 restoration completed 2026-10-29 14:25:42 UTC: server 272070 / engine 272078, READY, health loaded, smoke 4. Binary path and original binary/config SHA256 independently verified. Candidate with resident restore bound compiled/linked at 14:17:51; SHA256 ff485c994eca01bdee3a1e356644c13883539fa22eb4abaab645dc6fdd7cdb65. No production deployment or push. Next prepared action: verify idle then run evidence/fair-prefill-driver.py (not started), which uses http_mixed_prefill_probe.py and restores production. True 2+2 and multi-request DSpark remain implementation work, not completed fallbacks.
