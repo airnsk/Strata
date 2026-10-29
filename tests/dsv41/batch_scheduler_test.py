@@ -58,6 +58,24 @@ with tempfile.TemporaryDirectory() as d:
         segmented += [int(x.split()[3]) for x in part if x.startswith(f"BT2 0 {epoch} ")]
     assert full==segmented,(full,segmented)
     print("NATIVE_COUNTER_SEGMENTATION_PASS unchanged draws with inserted prompt and neighbor")
+
+    # Actual scheduler: a long admission cannot monopolize ready decode.
+    lengths=[1,96,80,47]
+    proc.stdin.write("".join(f"BGEN2 {b} 10 {12 if b==0 else 8} seed={b} "
+                            + ",".join(["1"]*lengths[b])+"\n" for b in range(4)))
+    proc.stdin.flush()
+    fair=take_until(lambda xs:sum(x.startswith("BDONE2") for x in xs)==4)
+    for b in range(4):
+        progress=[int(x.split()[3]) for x in fair if x.startswith(f"BPP2 {b} 10 ")]
+        assert progress and progress[-1]==lengths[b],(b,progress)
+        assert all(0<end-start<=16 for start,end in zip([0]+progress,progress)),progress
+    a_done=next(i for i,x in enumerate(fair) if x.startswith("BDONE2 0 10 "))
+    b_filled=next(i for i,x in enumerate(fair) if x.startswith("BPP2 1 10 96 "))
+    assert a_done<b_filled,fair
+    a_tokens=[i for i,x in enumerate(fair) if x.startswith("BT2 0 10 ")]
+    busy_prefills=[i for i,x in enumerate(fair) if x.startswith(("BPP2 1 10 ","BPP2 2 10 ","BPP2 3 10 "))]
+    assert any(a_tokens[0]<i<a_tokens[-1] for i in busy_prefills),fair
+    print("ACTUAL_SCHEDULER_FAIR_PREFILL_PASS max16 rows; decode interleaves; long admission progresses")
     proc.stdin.write("QUIT\n");proc.stdin.flush()
     proc.wait(timeout=10)
     err=proc.stderr.read()
