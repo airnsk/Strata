@@ -54,6 +54,7 @@ struct RequestHostState {
     bool spec_win = false;
     std::vector<SpecList> h_specq = std::vector<SpecList>(Window);
     bool drafts_q = false;
+    int draft_q_rows = 0; // valid request-owned h_specq entries
     float dq_temp = 0.0f, dq_top_p = 1.0f, dq_min_p = 0.0f;
     int dq_top_k = 0;
     uint64_t dq_seed = 0, dq_counter = 0;

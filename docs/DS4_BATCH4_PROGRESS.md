@@ -64,7 +64,7 @@ Actual staggered HTTP prefill latency and cancellation under that load remain to
 be measured. The original DSpark service with four concurrent clients, repeat
 measurements and per-request latency are still required for the final comparison.
 
-True overlapping 2+2 and independent multi-request DSpark are not implemented.
+The opt-in two-frame 2+2 implementation passed the window 11 numerical and HTTP gates below; its completion timeline remains to be measured. Independent multi-request batched DSpark is not implemented.
 Do not advertise either capability or call sequential B2 rounds a pipeline.
 Current 16-token admission does not retain large-chunk YOCO/cone prefill speed.
 
@@ -245,3 +245,29 @@ not. Per-segment attention/plans/ring backups/partials/taps and final logits mus
 be kept with the corresponding request. Shared MoE/head may process the packed
 rows, but rollback and seeding use only that request's accepted prefix. These
 changes are not implemented by the AR two-frame patch.
+
+
+## Window 11: opt-in 2+2 numerical and HTTP gate
+The two-frame path passed 520 bitwise full-logit/state comparisons including
+permutations and restore. ABBA, identical saved initial states and 128 steps
+(512 teacher-forced rows per run): B4 19.510999811 / 19.578356554 seconds;
+2+2 18.619047187 / 18.666130876 seconds. Mean compute throughput increased
+4.8389%. All final comparisons were bitwise equal. These are two measurements
+per mode, not a broad performance claim or emitted-token rate. GPU completion
+timeline evidence remains to be recorded separately.
+
+Four real HTTP streams each delivered 64 model tokens, total wall 11.9149 seconds,
+21.4857 model tokens/s including admission; p95 TPOT 0.159–0.161 seconds.
+A cancellation run completed the other three requests. The HTTP64 run cannot be
+compared directly to the earlier HTTP128 run. Evidence: window11-summary.json
+and pipeline22-*. Original service restoration started 15:02:38 UTC, PID 277195.
+
+Resident sampled draft distributions now have an explicit valid-row count and
+are copied from shared device workspace to request-owned h_specq before switching;
+verification restores the matching q to device workspace. An unfinished target
+verify still cannot switch. Draft and verify capacity use the resident bound.
+Reset invalidates pending q. CPU ownership tests and HIP compilation passed;
+this ownership repair has not run on GPU yet. A 32-round-comparison oracle for
+four pending sampled q distributions is compiled, not executed. Its target
+verification is intentionally serial as a state-isolation control. It must not
+be described as completed multi-request batched DSpark.

@@ -23,7 +23,7 @@ int main() {
     a.pos=129;a.toks={7,8};a.ctoks={70,80};a.ck[0].pos=128;
     a.ck[0].win={{1,2}};a.ck[0].comp={{3.0f}};
     a.cur_topk_n[0]=7;a.cur_cand_n[0]=9;a.n_logits=1;
-    a.dq_seed=11;a.dq_counter=29;a.h_specq[0].n=5;a.drafts_q=true;
+    a.dq_seed=11;a.dq_counter=29;a.draft_q_rows=5;a.h_specq[0].n=5;a.drafts_q=true;
     a.st.tokens=129;a.logits_all=true;a.chunk_logits={3.5f};a.halted=true;
     a.cancel=[](){return true;};
     a.imgs.push_back(Image{3,std::make_shared<const std::vector<uint16_t>>(4,19)});
@@ -32,7 +32,7 @@ int main() {
     assert(a.pos==256&&a.toks[0]==99&&a.dq_seed==22&&a.dq_counter==3);
     assert(b.pos==129&&b.ck[0].pos==128&&b.ck[0].win[0][1]==2);
     assert(b.cur_topk_n[0]==7&&b.cur_cand_n[0]==9&&b.h_specq[0].n==5);
-    assert(b.imgs[0].start==3&&b.st.tokens==129&&b.drafts_q);
+    assert(b.imgs[0].start==3&&b.st.tokens==129&&b.drafts_q&&b.draft_q_rows==5);
     assert(b.logits_all&&b.chunk_logits[0]==3.5f&&b.halted&&b.cancel());
     assert(!a.cancel&&!a.logits_all);
     a=State{};

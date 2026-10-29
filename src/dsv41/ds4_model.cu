@@ -5275,7 +5275,9 @@ struct Model::Impl : RequestHostState<strata::dsv41k::SpecList, kWin> {
             err="stale or invalid request handle";return false;
         }
         if(slot==active_request) return true;
-        if(spec_win || drafts_q) {err="cannot switch an unfinished speculative round";return false;}
+        if(spec_win || (drafts_q && draft_q_rows<=0)) {
+            err="cannot switch an unfinished speculative round without owned q";return false;
+        }
         if(request_binding_device<0) {
             if(!request_sync(err)) return false;
         } else {
@@ -5569,6 +5571,7 @@ struct Model::Impl : RequestHostState<strata::dsv41k::SpecList, kWin> {
     }
 
     void reset() {
+        drafts_q=false;draft_q_rows=0;spec_win=false;
         pos = 0;
         toks.clear();
         ctoks.clear();
@@ -7450,6 +7453,16 @@ struct Model::Impl : RequestHostState<strata::dsv41k::SpecList, kWin> {
             out.resize((size_t) max_drafts);
             conf.resize((size_t) max_drafts);
         }
+        draft_q_rows=0;
+        if(ok && resident_initialized && drafts_q && !out.empty()) {
+            Dev& hd=devs[(size_t)head_dev];cudaSetDevice(hd.id);
+            const size_t count=std::min(out.size(),h_specq.size());
+            CK(cudaMemcpyAsync(h_specq.data(),d_specq,count*sizeof(strata::dsv41k::SpecList),
+                               cudaMemcpyDeviceToHost,hd.st));
+            CK(cudaStreamSynchronize(hd.st));
+            draft_q_rows=(int)count;
+        }
+        if(out.empty())drafts_q=false;
         st.draft_ms += now_ms() - t0;
         ++st.drafts_rounds;
         return ok;
@@ -7459,7 +7472,9 @@ struct Model::Impl : RequestHostState<strata::dsv41k::SpecList, kWin> {
         conf.clear();
         const int T = g.d_block, D = g.dim, H = g.hc, V = g.vocab, R = g.d_rank;
         const int64_t p0 = pos;
-        if (g.n_mtp == 0 || T < 1 || T > kWin || p0 + T > o.max_context) return true;
+        const int64_t draft_capacity=active_request?resident[active_request].capacity:o.max_context;
+        if (g.n_mtp == 0 || T < 1 || T > kWin || p0<0 ||
+            p0>draft_capacity || T>draft_capacity-p0) return true;
         int tk[kWin];
         tk[0] = y;
         for (int t = 1; t < T; ++t) tk[t] = g.d_noise;
@@ -7631,6 +7646,7 @@ struct Model::Impl : RequestHostState<strata::dsv41k::SpecList, kWin> {
                 uint64_t seed, uint64_t counter, int& accepted, int& next, std::string& err) {
         const int n = (int) std::min<size_t>(drafts.size(), (size_t) kWin - 1);
         const int T = n + 1, V = g.vocab;
+        if(!request_room(T,err))return false;
         const int64_t p0 = pos;
         int tk[kWin];
         tk[0] = y;
@@ -7669,6 +7685,11 @@ struct Model::Impl : RequestHostState<strata::dsv41k::SpecList, kWin> {
                 CK(cudaMemcpyAsync(d_specq, h_specq.data(), (size_t) n * sizeof(strata::dsv41k::SpecList),
                                    cudaMemcpyHostToDevice, hd.st));
             }
+            if(own && resident_initialized) {
+                if(draft_q_rows<n) {err="resident draft distribution is incomplete";return false;}
+                CK(cudaMemcpyAsync(d_specq,h_specq.data(),(size_t)n*sizeof(strata::dsv41k::SpecList),
+                                   cudaMemcpyHostToDevice,hd.st));
+            }
             for (int i = 0; i < n; ++i) h_idx[i] = drafts[(size_t) i];
             CK(cudaMemcpyAsync(d_ints + 32, h_idx, (size_t) n * 4, cudaMemcpyHostToDevice, hd.st));
             strata::dsv41k::SamplerParams sp;
@@ -7685,7 +7706,7 @@ struct Model::Impl : RequestHostState<strata::dsv41k::SpecList, kWin> {
             while (m < n && h_idx[m] == drafts[(size_t) m]) ++m;
             next = m < n ? h_idx[m] : sample_row(n, temperature, top_p, top_k, min_p, seed, counter + (uint64_t) n, nullptr);
         }
-        drafts_q = false;
+        drafts_q = false;draft_q_rows=0;
         rollback(p0, T, m + 1);
         if (!seed_drafter(p0, m + 1, 0, err)) return false;
         accepted = m;
