@@ -73,15 +73,15 @@ Local raw evidence (not committed): /var/tmp/strata-batch4-1029-evidence/.
 All use the same synthetic chat prompt (62 tokens, cache0) and an output cap128.
 These are client wall times, including prefill and server thinking/recovery.
 
-| Mode | Completed output tokens | Client wall seconds |
+| Mode | API-accounted completion tokens | Client wall seconds |
 |---|---:|---:|
 | Working single DSpark |128|5.211200698|
 | Candidate single AR |128|7.846159648|
 | Candidate four AR streams |512 total|25.556360745|
 
-Four streams overlapped; common GPU batch4 steps were logged. Aggregate wall
-throughput20.034 tokens/s is a measured concurrency result, not proof of a
-steady-decode speedup. A fifth waiting request plus cancellation of one active
+Four streams overlapped; common GPU batch4 steps were logged. The ratio20.034 API-accounted tokens/s is NOT a model generation throughput:
+the server counts injected thinking wrap-up tokens in completion_tokens. A
+clean native-token benchmark is still required. A fifth waiting request plus cancellation of one active
 request completed without killing its neighbors. Default thinking budget caused
 extra wrap-up/prefill and approximately7-second text-event gaps.
 
@@ -99,3 +99,10 @@ No failing gate was bypassed. The working production server was restored.
 A further protocol issue is tracked: one logical HTTP request may have multiple
 native legs after thinking wrap-up. Its sampling counter must continue across
 legs, rather than resetting for each BGEN. Greedy tests do not validate this.
+
+Window4 restored production at2026-10-29T12:23:25UTC, server258571/engine258579,
+health200 and smoke4. Original binary SHA256
+f6db7a472bb534907a36ad68f365961b4964982790bbce5c586d23dea1b2e14b;
+original configuration SHA256
+6334a3bae5180a08bb3e3249175b64225fbafe0f1948d37125413657f0b27303.
+Diagnostic reporting fix is compiled, but its targeted repeat has not run yet.
