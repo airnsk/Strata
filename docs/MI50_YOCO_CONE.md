@@ -1,3 +1,5 @@
+> Historical standalone cone experiment. For the later combined deployment and its numerical limitations, see [the campaign report](MI50_OPTIMIZATION_REPORT_RU_2026_10.md).
+
 # Experimental shrinking YOCO tail
 
 Opt in with DS4_YOCO_CONE=1 in addition to the guarded YOCO15/25 settings.

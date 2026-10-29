@@ -6,4 +6,4 @@ Source8 CKV crosses GPU0->GPU1; no IK8 on GPU1. Source14/20 and Engram14 are loc
 For20160 tokens: three6720 chunks, finalcut4052, late rows2668,2541,...,255. Shared helper governs execution and streaming row counts.
 CPU tests: pipeline15, pipeline10, cone dependency oracle and combined topology/cut/ack tests PASS.
 Numerical limitation: reduced row groups and changed expert residency can change backend dispatch and floating-point trajectories. This combination is not proven bit-exact or quality-equivalent. User explicitly requested deployment with that limitation. No intentional new quantization or routing change is introduced.
-Validation/deployment evidence: /var/tmp/strata-yoco10-cone-1029-evidence. Retain published15/25 binary/config/profile for rollback. No push.
+Validation/deployment evidence: /var/tmp/strata-yoco10-cone-1029-evidence. Retain published15/25 binary/config/profile for rollback. See MI50_OPTIMIZATION_REPORT_RU_2026_10.md for measured results, deployment, rollback and publication status.
