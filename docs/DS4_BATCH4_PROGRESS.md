@@ -348,3 +348,26 @@ The final window combines that gate with four HTTP streams, cancellation/reuse
 and one small matched original-service observation. Per-request native terminal
 summaries count rounds/offered/accepted/emitted tokens. HTTP chunk gaps are
 reported as such and not mislabeled token TPOT.
+
+### 2026-10-29 17:45 UTC — joint GPU correctness PASS; admission blocker
+
+The corrected async dispatch passed 32 bitwise comparisons of full saved state,
+logits, acceptance and next token against the solo oracle. The same process then
+refused 4x32768 HTTP arenas at the 128 MiB VRAM margin after late allocations.
+No HTTP request ran in this window. Restoration began 17:44:51 (server 287444).
+The next HTTP-only window uses explicit cap8192, unchanged experts and margin;
+it does not repeat the successful oracle or original four-client observation.
+Original queued four-client result: 256 API completion tokens / 8.467906 s,
+30.231795 tokens/s, TTFT 0.577–6.582 s, reasoning disabled. This is a single
+short observation and uses the original service configuration.
+
+### 2026-10-29 18:04–18:06 UTC — final HTTP PASS and running service
+
+Restoration before the final window: 17:54:06, PID287444/287452, smoke4.
+HTTP-only release window started 17:55:19, server288741. Four overlapping
+64-token requests PASS; cancel-one/complete-three and slot reuse PASS.
+Deployment retained after PASS at18:04:35. Engine288749 actual executable,
+config/binary hashes and health/parallel4 verified. cap8192, spec1, no fixed-flow,
+selftest or diagnostic flags. Aggregate26.850112 modeltokens/s versus original
+queued30.231795 API tokens/s in one short pair: -11.19%, not a speedup claim.
+TTFT2.010–2.642s vs original0.577–6.582s. Full details: DS4_BATCH4.md.
